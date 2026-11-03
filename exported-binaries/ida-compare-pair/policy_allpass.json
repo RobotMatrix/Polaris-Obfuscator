@@ -1,0 +1,7 @@
+{
+    "passes": ["alias", "gvenc", "indcall", "indbr", "mba", "sub", "bcf", "fla"],
+    "targets_mangled": [
+        "__ZN4WBAES7encryptEPKhPh",
+        "__ZN4WBAES8decryptEPKhPh"
+    ]
+}

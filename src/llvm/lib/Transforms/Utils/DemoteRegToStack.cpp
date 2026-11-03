@@ -42,14 +42,31 @@ AllocaInst *llvm::DemoteRegToStack(Instruction &I, bool VolatileLoads,
   // We cannot demote invoke instructions to the stack if their normal edge
   // is critical. Therefore, split the critical edge and create a basic block
   // into which the store can be inserted.
+  // [FIX] Split the normal edge UNCONDITIONALLY (not only when critical).
+  // Downstream CFG rewrites (e.g. obfuscation flattening) add new edges to
+  // the normal destination. If the store lives in that shared block, a
+  // bypassing edge reaches the store with the invoke result undefined =>
+  // invalid SSA. A dedicated split block keeps the store on the invoke-only
+  // edge, and since the split block is created after any caller's block
+  // collection, later rewrites never add edges to it.
   if (InvokeInst *II = dyn_cast<InvokeInst>(&I)) {
-    if (!II->getNormalDest()->getSinglePredecessor()) {
-      unsigned SuccNum = GetSuccessorNumber(II->getParent(), II->getNormalDest());
-      assert(isCriticalEdge(II, SuccNum) && "Expected a critical edge!");
-      BasicBlock *BB = SplitCriticalEdge(II, SuccNum);
-      assert(BB && "Unable to split critical edge.");
-      (void)BB;
-    }
+    // [FIX] Dedicate a fresh block on the invoke's normal edge so the store
+    // lands on the invoke-only path. Downstream CFG rewrites (e.g. obfuscation
+    // flattening) add bypass edges to the original normal destination; a
+    // store placed there would then execute with the invoke result undefined
+    // (invalid SSA). The new block is invisible to such rewrites because it
+    // is created after their block collection.
+    BasicBlock *SrcBB = II->getParent();
+    BasicBlock *OrigDest = II->getNormalDest();
+    BasicBlock *StoreBB = BasicBlock::Create(
+        SrcBB->getContext(), "invoke.demote.store", SrcBB->getParent(),
+        OrigDest->getNextNode());
+    II->setNormalDest(StoreBB);
+    // Reconnect PHIs: the incoming edge for this invoke now goes via StoreBB.
+    for (PHINode &PN : OrigDest->phis())
+      PN.replaceIncomingBlockWith(SrcBB, StoreBB);
+    new StoreInst(&I, Slot, StoreBB);
+    BranchInst::Create(OrigDest, StoreBB);
   }
 
   // Change all of the users of the instruction to read from the stack slot.
@@ -135,12 +152,27 @@ AllocaInst *llvm::DemotePHIToStack(PHINode *P, Instruction *AllocaPoint) {
 
   // Iterate over each operand inserting a store in each predecessor.
   for (unsigned i = 0, e = P->getNumIncomingValues(); i < e; ++i) {
-    if (InvokeInst *II = dyn_cast<InvokeInst>(P->getIncomingValue(i))) {
-      assert(II->getParent() != P->getIncomingBlock(i) &&
-             "Invoke edge not supported yet"); (void)II;
+    Value *Incoming = P->getIncomingValue(i);
+    BasicBlock *IncomingBB = P->getIncomingBlock(i);
+    if (auto *II = dyn_cast<InvokeInst>(Incoming)) {
+      // [FIX] The incoming value is the result of the invoke that terminates
+      // IncomingBB. A store inserted before the invoke would read its own
+      // result before definition (invalid SSA). Route the store through a
+      // dedicated block on the invoke's normal edge instead.
+      BasicBlock *SrcBB = II->getParent();
+      BasicBlock *OrigDest = II->getNormalDest();
+      BasicBlock *StoreBB = BasicBlock::Create(
+          SrcBB->getContext(), "invoke.phi.store", SrcBB->getParent(),
+          OrigDest->getNextNode());
+      II->setNormalDest(StoreBB);
+      for (PHINode &OtherPN : OrigDest->phis())
+        if (&OtherPN != P)
+          OtherPN.replaceIncomingBlockWith(SrcBB, StoreBB);
+      new StoreInst(Incoming, Slot, StoreBB);
+      BranchInst::Create(OrigDest, StoreBB);
+      continue;
     }
-    new StoreInst(P->getIncomingValue(i), Slot,
-                  P->getIncomingBlock(i)->getTerminator());
+    new StoreInst(Incoming, Slot, IncomingBB->getTerminator());
   }
 
   // Insert a load in place of the PHI and replace all uses.

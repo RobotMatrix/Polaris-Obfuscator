@@ -1,6 +1,7 @@
 
 
 #include "llvm/Transforms/Obfuscation/Pipeline.h"
+#include "llvm/Transforms/Obfuscation/Utils.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Transforms/Obfuscation/AliasAccess.h"
@@ -19,6 +20,8 @@ using namespace polaris;
 
 static cl::list<std::string> Passes("passes", cl::CommaSeparated, cl::Hidden,
                                     cl::desc("Obfuscation passes"));
+static cl::opt<std::string> PolicyFile("policy-file", cl::Hidden,
+                                       cl::desc("JSON policy file for no-marking obfuscation"));
 
 struct LowerSwitchWrapper : LowerSwitchPass {
   static bool isRequired() { return true; }
@@ -26,6 +29,10 @@ struct LowerSwitchWrapper : LowerSwitchPass {
 
 ModulePassManager buildObfuscationPipeline() {
   ModulePassManager MPM;
+  // JSON 策略文件: 无源码标记 → 从文件读 pass 列表 + 目标函数
+  if (!PolicyFile.empty()) {
+    polaris::loadPolicyFile(PolicyFile);
+  }
 
   for (auto pass : Passes) {
     errs() << pass << "\n";

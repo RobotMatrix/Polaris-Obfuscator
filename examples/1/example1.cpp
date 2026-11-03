@@ -5,7 +5,7 @@
 
 __attribute((__annotate__(("flatten,boguscfg,substitution"))))
 void encoder(char *data, char *enc) {
-#ifdef BACKEND_OBFU 
+#ifdef BACKEND_OBFU
 	asm("backend-obfu");
 #endif
 	int len = strlen(data);
@@ -20,10 +20,11 @@ void encoder(char *data, char *enc) {
 			enc[i] = '\0';
 		}
 	}
+	enc[len] = '\0';
 }
 int main() {
 	char data[100], result[100];
-	scanf("%s", &data);
+	scanf("%99s", data);
 	encoder(data, result);
 	printf("%s\n", result);
 	return 0;

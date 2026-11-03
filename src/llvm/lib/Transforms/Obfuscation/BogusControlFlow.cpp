@@ -104,7 +104,7 @@ const uint64_t primes[1061] = {
     9931, 9941, 9949, 9967, 9973};
 PreservedAnalyses BogusControlFlow::run(Function &F,
                                         FunctionAnalysisManager &AM) {
-  if (readAnnotate(F).find("boguscfg") != std::string::npos) {
+  if (readAnnotate(F).find("boguscfg") != std::string::npos || (readPolicyMatch(F) && policyHasPass("bcf"))) {
     process(F);
     return PreservedAnalyses::none();
   }

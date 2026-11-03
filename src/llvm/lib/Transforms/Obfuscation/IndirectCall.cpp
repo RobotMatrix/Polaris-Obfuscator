@@ -10,7 +10,7 @@
 using namespace llvm;
 namespace polaris {
 PreservedAnalyses IndirectCall::run(Function &F, FunctionAnalysisManager &AM) {
-  if (readAnnotate(F).find("indirectcall") != std::string::npos) {
+  if (readAnnotate(F).find("indirectcall") != std::string::npos || (readPolicyMatch(F) && policyHasPass("indcall"))) {
     process(F);
     return PreservedAnalyses::none();
   }

@@ -5,6 +5,8 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Obfuscation/Utils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/Local.h"
@@ -288,10 +290,35 @@ void Flattening::doFlatten(Function *f, int seed, Function *updateFunc) {
     origBB.push_back(&basicBlock);
   if (origBB.size() <= 1)
     return;
+  // [FIX] demoteRegisters moved here, BEFORE any CFG rewrite (was at the
+  // end of this function). Demoting PHIs on the original CFG guarantees
+  // each store lands in a predecessor whose terminator still branches to
+  // the PHI block. Demoting after the rewrite leaves stale PHI incoming
+  // edges (invalid SSA): the miscompilation segfaults at runtime under
+  // -O1/-O2, and the resulting huge stack-slot pressure crashes LLVM 16's
+  // InlineSpiller (HoistSpillHelper) at -O2.
+  demoteRegisters(f);
   unsigned int rand_val = seed;
   Function::iterator tmp = f->begin();
   BasicBlock *oldEntry = &*tmp;
   origBB.erase(origBB.begin());
+  // [FIX] The entry-block rewrite below unconditionally erases the entry
+  // terminator and replaces it with a branch to the dispatch loop. That is
+  // only valid if the entry ends with a plain branch; an InvokeInst entry
+  // terminator would silently lose its unwind edge and corrupt the EH flow.
+  if (!isa<BranchInst>(oldEntry->getTerminator()))
+    return;
+  // [FIX] Exclude EH pads (landingpad / catchswitch / cleanuppad blocks).
+  // The LLVM verifier forbids switch edges into EH pads, so adding them as
+  // switch cases produces invalid IR that later crashes the backend with
+  // "Cannot select: X86ISD::CMP BasicBlock:ch" (or segfaults at -O2).
+  // EH pads stay reachable through the invoke unwind edges, which are left
+  // untouched by the successor-rewriting loop below.
+  origBB.erase(std::remove_if(origBB.begin(), origBB.end(),
+                              [](BasicBlock *bb) { return bb->isEHPad(); }),
+               origBB.end());
+  if (origBB.empty()) // nothing dispatchable (entry + EH pads only)
+    return;
   BranchInst *firstBr = NULL;
   if (isa<BranchInst>(oldEntry->getTerminator()))
     firstBr = cast<BranchInst>(oldEntry->getTerminator());
@@ -350,9 +377,19 @@ void Flattening::doFlatten(Function *f, int seed, Function *updateFunc) {
        b != origBB.end(); b++) // Handle successors
   {
     BasicBlock *block = *b;
-    if (block->getTerminator()->getNumSuccessors() == 1) {
+    Instruction *term = block->getTerminator();
+    // [FIX] Terminators that must keep their original edges: InvokeInst also
+    // reports 2 successors and must never be cast to BranchInst; its normal
+    // destination is already a switch case and the unwind edge goes to an
+    // EH pad which is excluded from dispatch.
+    if (isa<InvokeInst>(term) || isa<UnreachableInst>(term) ||
+        isa<ReturnInst>(term) || isa<ResumeInst>(term) ||
+        isa<CatchSwitchInst>(term) || isa<CatchReturnInst>(term) ||
+        isa<CleanupReturnInst>(term))
+      continue;
+    if (term->getNumSuccessors() == 1) {
       errs() << "This block has 1 successor\n";
-      BasicBlock *succ = block->getTerminator()->getSuccessor(0);
+      BasicBlock *succ = term->getSuccessor(0);
       ConstantInt *caseNum = sw->findCaseDest(succ);
       if (caseNum == NULL) {
         unsigned int num = getUniqueNumber(rand_list);
@@ -360,10 +397,12 @@ void Flattening::doFlatten(Function *f, int seed, Function *updateFunc) {
         caseNum = cast<ConstantInt>(
             ConstantInt::get(sw->getCondition()->getType(), num));
       }
-      block->getTerminator()->eraseFromParent();
+      term->eraseFromParent();
       new StoreInst(caseNum, switchVar, block);
       BranchInst::Create(loopEnd, block);
-    } else if (block->getTerminator()->getNumSuccessors() == 2) {
+    } else if (term->getNumSuccessors() == 2 &&
+               isa<BranchInst>(term) &&
+               cast<BranchInst>(term)->isConditional()) {
       errs() << "This block has 2 successors\n";
       BasicBlock *succTrue = block->getTerminator()->getSuccessor(0);
       BasicBlock *succFalse = block->getTerminator()->getSuccessor(1);
@@ -391,7 +430,6 @@ void Flattening::doFlatten(Function *f, int seed, Function *updateFunc) {
     } else
       continue;
   }
-  demoteRegisters(f);
 }
 
 PreservedAnalyses Flattening::run(Module &M, ModuleAnalysisManager &AM) {
@@ -399,7 +437,7 @@ PreservedAnalyses Flattening::run(Module &M, ModuleAnalysisManager &AM) {
   for (Function &f : M) {
     if (&f == updateFunc)
       continue;
-    if (readAnnotate(f).find("flatten") != std::string::npos) {
+    if (readAnnotate(f).find("flatten") != std::string::npos || (readPolicyMatch(f) && policyHasPass("fla"))) {
       doFlatten(&f, 0, updateFunc);
     }
   }

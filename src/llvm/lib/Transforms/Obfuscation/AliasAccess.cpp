@@ -18,7 +18,7 @@ PreservedAnalyses AliasAccess::run(Module &M, ModuleAnalysisManager &AM) {
     WorkList.push_back(&F);
   }
   for (Function *F : WorkList) {
-    if (readAnnotate(*F).find("aliasaccess") != std::string::npos) {
+    if (readAnnotate(*F).find("aliasaccess") != std::string::npos || (readPolicyMatch(*F) && policyHasPass("alias"))) {
       process(*F);
     }
   }
