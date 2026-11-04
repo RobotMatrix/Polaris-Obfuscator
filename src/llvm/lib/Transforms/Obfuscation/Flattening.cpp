@@ -63,7 +63,7 @@ Function *Flattening::buildUpdateKeyFunc(Module *m) {
   return func;
 }
 
-void Flattening::doFlatten(Function *f, int seed, Function *updateFunc) {
+void Flattening::doFlatten(Function *f) {
 
   /*srand(seed);
   std::vector<BasicBlock *> origBB;
@@ -284,7 +284,6 @@ void Flattening::doFlatten(Function *f, int seed, Function *updateFunc) {
   }
   demoteRegisters(f);*/
 
-  srand(seed);
   std::vector<BasicBlock *> origBB;
   for (BasicBlock &basicBlock : *f)
     origBB.push_back(&basicBlock);
@@ -298,7 +297,6 @@ void Flattening::doFlatten(Function *f, int seed, Function *updateFunc) {
   // -O1/-O2, and the resulting huge stack-slot pressure crashes LLVM 16's
   // InlineSpiller (HoistSpillHelper) at -O2.
   demoteRegisters(f);
-  unsigned int rand_val = seed;
   Function::iterator tmp = f->begin();
   BasicBlock *oldEntry = &*tmp;
   origBB.erase(origBB.begin());
@@ -433,12 +431,11 @@ void Flattening::doFlatten(Function *f, int seed, Function *updateFunc) {
 }
 
 PreservedAnalyses Flattening::run(Module &M, ModuleAnalysisManager &AM) {
-  Function *updateFunc = buildUpdateKeyFunc(&M);
+  // The keyed dispatcher (buildUpdateKeyFunc, symbol "ollvm") is not used.
+  // Emitting it only leaves a stable fingerprint in every flattened binary.
   for (Function &f : M) {
-    if (&f == updateFunc)
-      continue;
     if (readAnnotate(f).find("flatten") != std::string::npos || (readPolicyMatch(f) && policyHasPass("fla"))) {
-      doFlatten(&f, 0, updateFunc);
+      doFlatten(&f);
     }
   }
 

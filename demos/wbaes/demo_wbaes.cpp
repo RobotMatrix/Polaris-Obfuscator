@@ -29,6 +29,9 @@
 // 自验: pycryptodome 预计算向量 (见 wbaes_key.h) + 加解密回环
 //
 // Polaris 混淆: 查表热路径 sub/bcf/fla + MIR (asm 标记)
+//
+// 烘焙发布路径 (WBAES_BAKED)：首尾两轮逐字节吸收份额，中间轮只查表。
+// 表输出的编码烤在下一张表的下标里。密钥不放成对份额，也不拼成 16 字节。
 // =============================================================================
 
 #include <cstdio>
@@ -37,9 +40,29 @@
 #include <cstddef>
 #include <cstdlib>
 
+#ifndef WBAES_BAKED
 #define AES128 1
 #include "aes.h"        // kokke/tiny-AES-c (MIT): 仅用 KeyExpansion
 #include "wbaes_key.h"  // 密钥唯一来源 (编译期烘焙进表)
+#else
+// 发布二进制不链接密钥分片和密钥扩展。测试向量不是密钥。
+#include <ctime>
+#include "wbaes_hybrid.h"
+namespace wbaes_key {
+static uint32_t g_key_tampered = 0;
+static const uint8_t test_pt[16] = {
+    0x6b,0xc1,0xbe,0xe2,0x2e,0x40,0x9f,0x96,
+    0xe9,0x3d,0x7e,0x11,0x73,0x93,0x17,0x2a};
+static const uint8_t test_ct[16] = {
+    0xde,0x23,0x99,0x2a,0xa3,0xc7,0x42,0x7f,
+    0x3a,0xd4,0x0f,0xda,0x83,0x73,0x0d,0x07};
+}
+extern "C" {
+extern const uint32_t kMidEnc[];
+extern const uint32_t kMidDec[];
+extern const uint32_t kSharePool[];
+}
+#endif
 
 // ---- S 盒打散存储 (消除 AES 指纹) ----
 // 标准 AES SBox/InvSBox 是最著名的数据段指纹 (yara/strings 秒识别).
@@ -202,6 +225,35 @@ static uint8_t daff_minv[9][8];   // 逆矩阵
 static uint8_t daff_c[9];         // 常量
 static uint8_t g_kk_order[4];     // 会话随机 kk 遍历序 (查表顺序随机化, XOR 可交换)
 
+// 每个表一套非线性下标置换。线性异或会被拟合成 S盒(明文字节⊕密钥字节) 的仿射像。
+static inline uint8_t nl_byte(uint8_t x, unsigned tag) {
+    uint8_t k = (uint8_t)(tag * 0x9Du + 0x3Cu);
+    x = (uint8_t)(x * 0xB5u + k);
+    x = (uint8_t)((x << 3) | (x >> 5));
+    x ^= (uint8_t)(x >> 4);
+    x = (uint8_t)(x * 0x6Bu + (uint8_t)(k ^ 0x3Du));
+    x = (uint8_t)((x << 1) | (x >> 7));
+    x = (uint8_t)(x * 0xD3u);
+    x ^= (uint8_t)(tag >> 8);
+    return x;
+}
+static inline uint8_t wb_store_idx(uint8_t z, int kk, int j, int kind, int slot) {
+    unsigned tag = (unsigned)kk | ((unsigned)j << 4) | ((unsigned)kind << 8) |
+                   ((unsigned)slot << 16);
+    return nl_byte(z, tag);
+}
+static inline uint8_t wb_idx(uint8_t z, int kk, int j, int kind, int slot) {
+#ifdef WBAES_BAKED
+    return wb_store_idx(z, kk, j, kind, slot);
+#else
+    (void)kk;
+    (void)j;
+    (void)kind;
+    (void)slot;
+    return z;
+#endif
+}
+
 // ---------------- 白盒表 ----------------
 #include <pthread.h>
 static uint32_t g_tls_half_b;      // halfB 全局 (单实例语义)
@@ -249,10 +301,16 @@ struct WBAES {
     void init();
     void encrypt(const uint8_t in[16], uint8_t out[16]) const;
     void decrypt(const uint8_t in[16], uint8_t out[16]) const;
+#ifdef WBAES_DUMP_TABLES
+    int dump_tables(const char *path) const;
+#endif
 private:
     // 单轨核心 (门面内部): 用指定表集算加密/解密
     static int enc_core(const WBAESTables &t1, const WBAESTables &t2, const uint8_t in[16], uint8_t out[16]);
     static int dec_core(const WBAESTables &t1, const WBAESTables &t2, const uint8_t in[16], uint8_t out[16]);
+public:
+    static const uint8_t *enc_gate();
+private:
 };
 
 #ifdef WBAES_DYNAMIC_KEY
@@ -294,20 +352,17 @@ static uint64_t plan_next() {
     return z ^ (z >> 31);
 }
 static void build_block_plan(uint64_t seed) {
-    fprintf(stderr, "B0\n");
     plan_identity();
-    fprintf(stderr, "B1\n");
     g_plan_rng = seed;
-    fprintf(stderr, "B2\n");
     for (int i = 8; i > 0; i--) {
         int j = (int)(plan_next() % (uint64_t)(i + 1));
-        fprintf(stderr, "B3 i=%d j=%d\n", i, j);
         uint8_t t = WB_PLAN[i]; WB_PLAN[i] = WB_PLAN[j]; WB_PLAN[j] = t;
         j = (int)(plan_next() % (uint64_t)(i + 1));
         t = DWB_PLAN[i]; DWB_PLAN[i] = DWB_PLAN[j]; DWB_PLAN[j] = t;
     }
 }
 
+#ifndef WBAES_BAKED
 // 轮密钥滑动窗口 (流式 KeyExpansion, FIPS-197 5.2):
 //   窗口 = 最近 4 个扩展字 (16B = 1 轮密钥); rk_next() 递推下一字并滑动.
 //   w[i] = w[i-4] ^ g(w[i-1]) — 窗口 [w_{i-4},w_{i-3},w_{i-2},w_{i-1}],
@@ -351,9 +406,11 @@ static void rk_next_round(uint8_t w[16]) {
 
 static void init_tables(WBAESTables &t, uint64_t prng_seed, uint32_t sk, uint32_t half_b);
 static uint64_t prng_seed_from(int lane);
+#endif // WBAES_BAKED
 #if defined(__APPLE__)
 #include <sys/types.h>
 #include <sys/sysctl.h>
+#include <sys/ptrace.h>
 #include <unistd.h>
 // 反调试 v2 (静默降级): 检测到调试器 → 置污染位走错误分支, 不退出进程.
 // 攻击者 attach 后看到"正常运行", 但密钥派生已污染 → 表失真 → 输出乱码,
@@ -376,7 +433,324 @@ static void anti_debug_check(int) {}
 #endif
 
 
+// Round-0 tables are indexed by a plaintext pair. Other tables stay 288 words.
+// Two lanes are stored with different mix tags. kBakeN is the logical word count.
+static const uint32_t kMeta = 16;
+static const uint32_t kPair = 65536;
+static const uint32_t kSmall = 288;
+static const uint32_t kBakeN = 2281488;
+static int g_round0_slot = 0;
+static uint32_t g_poison = 0;
+static int g_s5_ready = 0;
+static uint32_t g_env = 0;
+static uint32_t g_s0 = 0, g_s1 = 0, g_s2 = 0;
+static uint32_t *g_pool = nullptr;
+static uint32_t g_live_sample = 0;
+static const uint32_t kSliceOff[4] = {64u, 320u, 704u, 1280u};
+#ifdef WBAES_BAKED
+extern "C" {
+extern const uint32_t kCodeExp[4];
+}
+#else
+extern "C" const uint32_t kCodeExp[4] = {0, 0, 0, 0};
+#endif
+
+static uint8_t rotl8(uint8_t w, unsigned r) {
+    r &= 7u;
+    if (r == 0) return w;
+    return (uint8_t)((w << r) | (w >> (8u - r)));
+}
+static uint8_t rotr8(uint8_t w, unsigned r) {
+    r &= 7u;
+    if (r == 0) return w;
+    return (uint8_t)((w >> r) | (w << (8u - r)));
+}
+// Bijective in w for every m. Closed inverse, no search loop.
+static uint8_t mix2(uint8_t w, uint8_t m, unsigned tag) {
+    uint8_t k = (uint8_t)(m * 0xB5u + (uint8_t)tag);
+    w = (uint8_t)(w * 0xD3u + k);
+    w = rotl8(w, (m + tag) & 7u);
+    w ^= (uint8_t)(w >> 4);
+    w = (uint8_t)(w * 0x6Bu + (uint8_t)(m ^ (uint8_t)tag));
+    w ^= (uint8_t)(m * 0x1Du + (uint8_t)(tag >> 8));
+    return w;
+}
+static uint8_t mix2_inv(uint8_t w, uint8_t m, unsigned tag) {
+    w ^= (uint8_t)(m * 0x1Du + (uint8_t)(tag >> 8));
+    w = (uint8_t)((uint8_t)(w - (uint8_t)(m ^ (uint8_t)tag)) * 0x43u);
+    w ^= (uint8_t)(w >> 4);
+    w = rotr8(w, (m + tag) & 7u);
+    uint8_t k = (uint8_t)(m * 0xB5u + (uint8_t)tag);
+    w = (uint8_t)((uint8_t)(w - k) * 0x5Bu);
+    return w;
+}
+static uint32_t mix2_word(uint32_t w, uint32_t sel, unsigned tag) {
+    uint32_t o = 0;
+    for (int b = 0; b < 4; b++)
+        o |= (uint32_t)mix2((uint8_t)(w >> (8 * b)), (uint8_t)(sel >> (8 * b)), tag + (unsigned)b * 0x9Du) << (8 * b);
+    return o;
+}
+static uint32_t mix2_inv_word(uint32_t w, uint32_t sel, unsigned tag) {
+    uint32_t o = 0;
+    for (int b = 0; b < 4; b++)
+        o |= (uint32_t)mix2_inv((uint8_t)(w >> (8 * b)), (uint8_t)(sel >> (8 * b)), tag + (unsigned)b * 0x9Du) << (8 * b);
+    return o;
+}
+static unsigned share_tag(int kind, int slot, int kk, int j, int lane) {
+    return (unsigned)kk | ((unsigned)j << 4) | ((unsigned)kind << 8) |
+           ((unsigned)slot << 16) | ((unsigned)lane << 24) | 0x5A170000u;
+}
+
+static uint8_t s4(uint8_t x) {
+    static const uint8_t S[16] = {
+        0x6,0xB,0x5,0xC,0x1,0xF,0x0,0xE,0x9,0x2,0x7,0xD,0xA,0x4,0x3,0x8};
+    return S[x & 15];
+}
+static uint8_t nib_mix(uint8_t z) {
+    uint8_t hi = z >> 4, lo = z & 15;
+    lo = (uint8_t)(lo ^ s4(hi));
+    hi = (uint8_t)(hi ^ s4(lo));
+    lo = (uint8_t)(lo ^ s4(hi));
+    return (uint8_t)((hi << 4) | lo);
+}
+
+static uint32_t seal_stream(uint32_t i) {
+    uint32_t frag = 0xA31C59E7u;
+    switch (i & 7) {
+    case 1: frag = 0x6D24B08Fu; break;
+    case 2: frag = 0x19E7C4A2u; break;
+    case 3: frag = 0xC0B5D713u; break;
+    case 4: frag = 0x52A6E8D1u; break;
+    case 5: frag = 0x8F13C74Bu; break;
+    case 6: frag = 0xE4B2096Cu; break;
+    case 7: frag = 0x37D1A5F0u; break;
+    default: break;
+    }
+    uint32_t x = frag ^ (i * 0x45D9F3Bu);
+    x ^= x >> 16;
+    x *= 0x7FEB352Du;
+    x ^= x >> 15;
+    x *= 0x846CA68Bu;
+    x ^= x >> 16;
+    return x;
+}
+
+static uint32_t feistel22(uint32_t x, uint32_t key) {
+    uint32_t L = (x >> 11) & 0x7FF;
+    uint32_t R = x & 0x7FF;
+    for (int r = 0; r < 4; r++) {
+        uint32_t f = (R * 0x1B5u + (uint32_t)(0x13 * r) + 0x2Cu) ^ key;
+        f &= 0x7FF;
+        f ^= f >> 5;
+        uint32_t nL = R;
+        uint32_t nR = (L ^ f) & 0x7FF;
+        L = nL;
+        R = nR;
+    }
+    return (L << 11) | R;
+}
+static uint32_t prp_at(uint32_t i, uint32_t n, uint32_t key) {
+    uint32_t x = i;
+    do {
+        x = feistel22(x, key);
+    } while (x >= n);
+    return x;
+}
+static uint32_t group_seed(uint32_t base) {
+    return 0xC3A5E791u ^ (base * 0x45D9F3Bu);
+}
+static uint32_t chain_step(uint32_t acc, uint32_t logical) {
+    return (acc + logical) * 0x9E3779B1u ^ (acc >> 11);
+}
+static uint32_t session_mask() { return g_s0 ^ g_s1 ^ g_s2; }
+
+static uint32_t wb_off(int slot, int kk, int j, int lane) {
+    uint32_t off = kMeta;
+    for (int s = 0; s < slot; s++) {
+        uint32_t sz = (s == g_round0_slot) ? kPair : kSmall;
+        off += 32u * sz;
+    }
+    uint32_t sz = (slot == g_round0_slot) ? kPair : kSmall;
+    off += (uint32_t)(kk * 4 + j) * 2u * sz;
+    off += (uint32_t)lane * sz;
+    return off;
+}
+static uint32_t after_wb() {
+    return kMeta + 32u * kPair + 256u * kSmall;
+}
+static uint32_t tail_off(int kind, int slot, int kk, int j, int lane) {
+    uint32_t idx;
+    if (kind == 1) idx = (uint32_t)(kk * 4 + j);
+    else if (kind == 2) idx = 16u + (uint32_t)(kk * 4 + j);
+    else if (kind == 3) idx = 32u + (uint32_t)(slot * 16 + kk * 4 + j);
+    else idx = 176u + (uint32_t)(kk * 4 + j);
+    return after_wb() + idx * kSmall * 2u + (uint32_t)lane * kSmall;
+}
+
+template <typename F>
+static void for_each_group(F fn) {
+    fn(0u, kMeta);
+    for (int slot = 0; slot < 9; slot++) {
+        uint32_t sz = (slot == g_round0_slot) ? kPair : kSmall;
+        for (int kk = 0; kk < 4; kk++)
+            for (int j = 0; j < 4; j++)
+                for (int lane = 0; lane < 2; lane++) {
+                    uint32_t base = wb_off(slot, kk, j, lane);
+                    if (sz == kPair) {
+                        for (uint32_t x = 0; x < 256; x++) fn(base + x * 256u, 256u);
+                    } else {
+                        fn(base, kSmall);
+                    }
+                }
+    }
+    for (int kind = 1; kind <= 4; kind++) {
+        int nslot = (kind == 3) ? 9 : 1;
+        for (int slot = 0; slot < nslot; slot++)
+            for (int kk = 0; kk < 4; kk++)
+                for (int j = 0; j < 4; j++)
+                    for (int lane = 0; lane < 2; lane++)
+                        fn(tail_off(kind, slot, kk, j, lane), kSmall);
+    }
+}
+
+static uint32_t logical_at(const uint32_t *file, uint32_t i, uint32_t n, uint32_t mask, uint32_t acc) {
+    uint32_t word = (mask == 0) ? file[prp_at(i, n, 0)]
+                                : (file[prp_at(i, n, mask)] ^ seal_stream(mask + i));
+    return word ^ seal_stream(i) ^ acc;
+}
+
+static void seal_logical(const uint32_t *logical, uint32_t *file, uint32_t n) {
+    memset(file, 0, sizeof(uint32_t) * n);
+    for_each_group([&](uint32_t base, uint32_t len) {
+        uint32_t acc = group_seed(base);
+        for (uint32_t k = 0; k < len; k++) {
+            uint32_t i = base + k;
+            uint32_t L = logical[i];
+            file[prp_at(i, n, 0)] = L ^ seal_stream(i) ^ acc;
+            acc = chain_step(acc, L);
+        }
+    });
+}
+
+const uint8_t *WBAES::enc_gate() {
+    return (const uint8_t *)(void *)&WBAES::enc_core;
+}
+__attribute__((noinline))
+static uint32_t code_slice(int which) {
+    const uint8_t *p = WBAES::enc_gate() + kSliceOff[which & 3];
+    uint32_t h = 0x811C9DC5u;
+    for (int i = 0; i < 16; i++) h = (h ^ p[i]) * 0x01000193u;
+    return h ^ kCodeExp[which & 3];
+}
+static uint32_t sample_now() {
+    return g_pool[kMeta] ^ g_pool[kMeta + 100] ^ g_pool[kBakeN / 2] ^ g_pool[kBakeN - 1];
+}
+static inline uint32_t round_delta(int r) {
+#ifdef WBAES_BAKED
+    return code_slice(r & 3) ^ g_poison ^ (g_live_sample ^ sample_now());
+#else
+    (void)r;
+    return 0;
+#endif
+}
+
+#ifdef WBAES_BAKED
+__attribute__((noinline))
+static void load_small(uint32_t base, uint32_t hi, uint32_t lo, uint32_t *th, uint32_t *tl, uint32_t *cx) {
+    uint32_t need = 32u + hi * 16u + lo;
+    uint32_t acc = group_seed(base);
+    uint32_t mask = session_mask();
+    for (uint32_t k = 0; k <= need; k++) {
+        uint32_t val = logical_at(g_pool, base + k, kBakeN, mask, acc);
+        if (k == hi) *th = val;
+        if (k == 16u + lo) *tl = val;
+        if (k == need) *cx = val;
+        acc = chain_step(acc, val);
+    }
+}
+__attribute__((noinline))
+static uint32_t load_pair_word(uint32_t row, uint32_t m) {
+    uint32_t acc = group_seed(row);
+    uint32_t mask = session_mask();
+    uint32_t val = 0;
+    for (uint32_t k = 0; k <= m; k++) {
+        val = logical_at(g_pool, row + k, kBakeN, mask, acc);
+        acc = chain_step(acc, val);
+    }
+    return val;
+}
+#endif
+
+static void fill_small(uint32_t *dst, const uint32_t W[256], unsigned tag) {
+    uint32_t seed = 0xA5C31E87u ^ tag;
+    for (int z = 0; z < 256; z++) seed = seed * 0x01000193u ^ W[z];
+    for (int hi = 0; hi < 16; hi++)
+        dst[hi] = seal_stream(seed + (uint32_t)hi * 0x9E3779B1u);
+    for (int lo = 0; lo < 16; lo++)
+        dst[16 + lo] = seal_stream(seed + 0x100u + (uint32_t)lo * 0x9E3779B1u);
+    for (int z = 0; z < 256; z++) {
+        uint8_t m = nib_mix((uint8_t)z);
+        uint8_t hi = m >> 4, lo = m & 15;
+        uint32_t sel = dst[hi] ^ dst[16 + lo];
+        dst[32 + hi * 16 + lo] = mix2_word(W[z], sel, tag);
+    }
+}
+
+static inline uint32_t cell_word(const WBAESTables &T, int kind, int slot, int kk, int j,
+                                 uint8_t z, uint8_t mate, int lane, int round) {
+#ifdef WBAES_BAKED
+    (void)T;
+    unsigned tag = share_tag(kind, slot, kk, j, lane);
+    uint32_t word;
+    if (kind == 0 && slot == g_round0_slot) {
+        uint32_t row = wb_off(slot, kk, j, lane) + (uint32_t)z * 256u;
+        uint32_t sel = (uint32_t)mate * 0x01010101u;
+        word = mix2_inv_word(load_pair_word(row, mate), sel, tag);
+    } else {
+        uint8_t m = nib_mix(z);
+        uint32_t hi = m >> 4, lo = m & 15u;
+        uint32_t base = (kind == 0) ? wb_off(slot, kk, j, lane) : tail_off(kind, slot, kk, j, lane);
+        uint32_t th = 0, tl = 0, cx = 0;
+        load_small(base, hi, lo, &th, &tl, &cx);
+        word = mix2_inv_word(cx, th ^ tl, tag);
+    }
+    // 每个列只异或一次。四次相同增量会互相抵消。
+    return word ^ (kk == 0 ? round_delta(round) : 0u);
+#else
+    (void)mate;
+    (void)lane;
+    (void)round;
+    uint8_t iz = wb_idx(z, kk, j, kind, slot);
+    if (kind == 0) return WBAESTables::dec(&T.WB[slot][kk][j][iz], T.session_half_a, 0);
+    if (kind == 1) return WBAESTables::dec(&T.TF[kk][j][iz], T.session_half_a, 1);
+    if (kind == 2) return WBAESTables::dec(&T.FT[kk][j][iz], T.session_half_a, 2);
+    if (kind == 3) return WBAESTables::dec(&T.DWB[slot][kk][j][iz], T.session_half_a, 3);
+    return WBAESTables::dec(&T.DTF[kk][j][iz], T.session_half_a, 4);
+#endif
+}
+
+
 void WBAES::init() {
+#ifdef WBAES_BAKED
+#if defined(__APPLE__)
+    ptrace(PT_DENY_ATTACH, 0, 0, 0);
+    g_poison = debugger_present() ? 0xA5A5A5A5u : 0u;
+#else
+    g_poison = 0;
+#endif
+    {
+        int pagesize = 0, ncpu = 0, cls = 0;
+        size_t nsz = sizeof(int);
+        sysctlbyname("hw.pagesize", &pagesize, &nsz, nullptr, 0);
+        nsz = sizeof(int);
+        sysctlbyname("hw.ncpu", &ncpu, &nsz, nullptr, 0);
+        nsz = sizeof(int);
+        sysctlbyname("hw.cachelinesize", &cls, &nsz, nullptr, 0);
+        g_env = hy_env_mix(pagesize, ncpu, cls);
+    }
+    g_s5_ready = 1;
+    return;
+#else
 #ifdef WBAES_DYNAMIC_KEY
     if (!g_dyn_ready) {
         // 动态模式未注入 → 表全垃圾 (静默)
@@ -402,8 +776,10 @@ void WBAES::init() {
     }
     init_tables(t1, prng_seed_from(0), sk, half_b);   // 链 1
     init_tables(t2, prng_seed_from(0), sk, half_b);   // 链 2: 同编码等价轨
+#endif
 }
 
+#ifndef WBAES_BAKED
 static uint64_t prng_seed_from(int lane) {
     // 链 seed 从分片块哈希派生: 链 1 = 片 0/1, 链 2 = 片 2/3 (单片 ≠ 密钥)
     // tampered 混入: 改写分片 → 校验失败 → seed 污染 → 表失真 (双保险)
@@ -599,6 +975,7 @@ static void init_tables(WBAESTables &t, uint64_t seed, uint32_t sk, uint32_t hal
         }
     }
 }
+#endif // WBAES_BAKED
 
 // -----------------------------------------------------------------------------
 // 加密: 9 轮查表 + 末轮, 全程无密钥/编码变量 (编码全部烘在表内)
@@ -609,9 +986,13 @@ static void init_tables(WBAESTables &t, uint64_t seed, uint32_t sk, uint32_t hal
 // 攻击者无法收集有效 (正确密文, 故障密文) 对 → DFA 差分分析失效.
 // 同时注入两表同位故障 → 需要精确控制两次故障, 防护达成.
 // -----------------------------------------------------------------------------
-__attribute((__annotate__(("gvenc,indcall,indbr,alias,mba,sub,bcf,fla"))))
+__attribute((__annotate__(("substitution,linearmba,aliasaccess,boguscfg,flatten,indirectbr,indirectcall"))))
 void WBAES::encrypt(const uint8_t in[16], uint8_t out[16]) const {
     anti_debug_check(2);          // 运行中 attach → 静默置位
+#ifdef WBAES_BAKED
+    if (!g_s5_ready)
+        wbaes_key::g_key_tampered |= 0x8000u;
+#else
     // 陷阱抽查: 随机选一个 decoy 项, 解密应等于哨兵 — 被篡改 → 毒化
     {
         const int di = (int)(wb_prng_next() % 16);
@@ -620,6 +1001,7 @@ void WBAES::encrypt(const uint8_t in[16], uint8_t out[16]) const {
             (t1.DECOY_SENTINEL ^ (uint32_t)(di * 256 + dz)))
             wbaes_key::g_key_tampered |= 0x8000u;
     }
+#endif
     if (wbaes_key::g_key_tampered & 0x8000u) {
         for (int i = 0; i < 16; i++) out[i] = (uint8_t)(wb_prng_next() & 0xFF);
         return;                  // 走错误分支: PRNG 垃圾, 非 fault cypher
@@ -631,17 +1013,21 @@ void WBAES::encrypt(const uint8_t in[16], uint8_t out[16]) const {
         for (int i = 0; i < 16; i++) out[i] = (uint8_t)(wb_prng_next() & 0xFF);
         return;
     }
+#ifdef WBAES_BAKED
+    memcpy(out, ct, 16);
+    return;
+#else
     // 回环自检: encrypt 后 decrypt 验证 — fault 泄漏到输出的故障密文
-    // 解密回原明文必不等于输入 → 拦截 (DFA 收集不到有效 fault 对)
     uint8_t back[16];
     if (dec_core(t1, t2, ct, back) != 0 || memcmp(back, in, 16) != 0) {
         for (int i = 0; i < 16; i++) out[i] = (uint8_t)(wb_prng_next() & 0xFF);
         return;
     }
     memcpy(out, ct, 16);
+#endif
 }
 
-__attribute((__annotate__(("gvenc,indcall,indbr,alias,mba,sub,bcf,fla"))))
+__attribute((__annotate__(("substitution,linearmba,aliasaccess,boguscfg,flatten,indirectbr,indirectcall"))))
 void WBAES::decrypt(const uint8_t in[16], uint8_t out[16]) const {
     anti_debug_check(1);
     if (wbaes_key::g_key_tampered & 0x8000u) {
@@ -653,9 +1039,21 @@ void WBAES::decrypt(const uint8_t in[16], uint8_t out[16]) const {
     }
 }
 
-__attribute((__annotate__(("gvenc,indcall,indbr,alias,mba,sub,bcf,fla"))))
+#ifdef WBAES_BAKED
+#include "wbaes_hybrid.inc"
+#endif
+
+__attribute((__annotate__(("substitution,linearmba,aliasaccess,boguscfg,flatten,indirectbr,indirectcall"))))
 int WBAES::enc_core(const WBAESTables &t1, const WBAESTables &t2, const uint8_t in[16], uint8_t out[16]) {
+#if !defined(WBAES_DUMP_TABLES) && !defined(WBAES_NO_MIR)
     asm("backend-obfu");
+#endif
+#ifdef WBAES_BAKED
+    (void)t1;
+    (void)t2;
+    hy_protect(in, out, 0);
+    return 0;
+#else
     // DFA 深防: 轮级双算 — 每轮两套表各算一次, 比对一致才进下轮.
     // 单表故障 → 本轮即失配 → 返回 -1 (垃圾输出), 故障密文永不产生.
     uint8_t s1[4][4], s2[4][4];
@@ -670,8 +1068,10 @@ int WBAES::enc_core(const WBAESTables &t1, const WBAESTables &t2, const uint8_t 
                 const int kk = g_kk_order[ki];   // 会话随机遍历序
                 uint8_t x1 = s1[(j + kk) % 4][kk];
                 uint8_t x2 = s2[(j + kk) % 4][kk];
-                a1 ^= WBAESTables::dec(&t1.WB[WB_PLAN[r]][kk][j][x1], t1.session_half_a, 0);
-                a2 ^= WBAESTables::dec(&t2.WB[WB_PLAN[r]][kk][j][x2], t2.session_half_a, 0);
+                uint8_t m1 = s1[(j + kk) % 4][(kk + 1) % 4];
+                uint8_t m2 = s2[(j + kk) % 4][(kk + 1) % 4];
+                a1 ^= cell_word(t1, 0, WB_PLAN[r], kk, j, x1, m1, 0, r);
+                a2 ^= cell_word(t2, 0, WB_PLAN[r], kk, j, x2, m2, 1, r);
             }
             for (int b = 0; b < 4; b++) {
                 n1[j][b] = (a1 >> (24 - 8 * b)) & 0xFF;
@@ -691,8 +1091,8 @@ int WBAES::enc_core(const WBAESTables &t1, const WBAESTables &t2, const uint8_t 
             uint32_t a1 = 0, a2 = 0;
             for (int ki = 0; ki < 4; ki++) {
                 const int kk = g_kk_order[ki];   // 会话随机遍历序
-                a1 ^= WBAESTables::dec(&t1.TF[kk][j][s1[(j + kk) % 4][kk]], t1.session_half_a, 1);
-                a2 ^= WBAESTables::dec(&t2.TF[kk][j][s2[(j + kk) % 4][kk]], t2.session_half_a, 1);
+                a1 ^= cell_word(t1, 1, 0, kk, j, s1[(j + kk) % 4][kk], 0, 0, 9);
+                a2 ^= cell_word(t2, 1, 0, kk, j, s2[(j + kk) % 4][kk], 0, 1, 9);
             }
             for (int b = 0; b < 4; b++) {
                 n1[j][b] = aff_inv(&g_out_aff, (uint8_t)(a1 >> (24 - 8 * b)));   // 剥离 Q_10
@@ -705,11 +1105,20 @@ int WBAES::enc_core(const WBAESTables &t1, const WBAESTables &t2, const uint8_t 
         memcpy(out, n1, 16);
     }
     return 0;
+#endif
 }
 
-__attribute((__annotate__(("gvenc,indcall,indbr,alias,mba,sub,bcf,fla"))))
+__attribute((__annotate__(("substitution,linearmba,aliasaccess,boguscfg,flatten,indirectbr,indirectcall"))))
 int WBAES::dec_core(const WBAESTables &t1, const WBAESTables &t2, const uint8_t in[16], uint8_t out[16]) {
+#if !defined(WBAES_DUMP_TABLES) && !defined(WBAES_NO_MIR)
     asm("backend-obfu");
+#endif
+#ifdef WBAES_BAKED
+    (void)t1;
+    (void)t2;
+    hy_protect(in, out, 1);
+    return 0;
+#else
     uint8_t s1[4][4], s2[4][4];
     memcpy(s1, in, 16);
     memcpy(s2, in, 16);
@@ -721,8 +1130,8 @@ int WBAES::dec_core(const WBAESTables &t1, const WBAESTables &t2, const uint8_t 
             uint32_t a1 = 0, a2 = 0;
             for (int ki = 0; ki < 4; ki++) {
                 const int kk = g_kk_order[ki];   // 会话随机遍历序
-                a1 ^= WBAESTables::dec(&t1.FT[kk][j][s1[j][kk]], t1.session_half_a, 2);
-                a2 ^= WBAESTables::dec(&t2.FT[kk][j][s2[j][kk]], t2.session_half_a, 2);
+                a1 ^= cell_word(t1, 2, 0, kk, j, s1[j][kk], 0, 0, 1);
+                a2 ^= cell_word(t2, 2, 0, kk, j, s2[j][kk], 0, 1, 1);
             }
             for (int b = 0; b < 4; b++) {
                 n1[j][b] = (a1 >> (24 - 8 * b)) & 0xFF;
@@ -744,8 +1153,8 @@ int WBAES::dec_core(const WBAESTables &t1, const WBAESTables &t2, const uint8_t 
                 const int kk = g_kk_order[ki];   // 会话随机遍历序
                 uint8_t x1 = s1[(j - kk + 4) % 4][kk];
                 uint8_t x2 = s2[(j - kk + 4) % 4][kk];
-                a1 ^= WBAESTables::dec(&t1.DWB[DWB_PLAN[r]][kk][j][x1], t1.session_half_a, 3);
-                a2 ^= WBAESTables::dec(&t2.DWB[DWB_PLAN[r]][kk][j][x2], t2.session_half_a, 3);
+                a1 ^= cell_word(t1, 3, DWB_PLAN[r], kk, j, x1, 0, 0, r);
+                a2 ^= cell_word(t2, 3, DWB_PLAN[r], kk, j, x2, 0, 1, r);
             }
             for (int b = 0; b < 4; b++) {
                 n1[j][b] = (a1 >> (24 - 8 * b)) & 0xFF;
@@ -765,8 +1174,8 @@ int WBAES::dec_core(const WBAESTables &t1, const WBAESTables &t2, const uint8_t 
             uint32_t a1 = 0, a2 = 0;
             for (int ki = 0; ki < 4; ki++) {
                 const int kk = g_kk_order[ki];   // 会话随机遍历序
-                a1 ^= WBAESTables::dec(&t1.DTF[kk][j][s1[(j - kk + 4) % 4][kk]], t1.session_half_a, 4);
-                a2 ^= WBAESTables::dec(&t2.DTF[kk][j][s2[(j - kk + 4) % 4][kk]], t2.session_half_a, 4);
+                a1 ^= cell_word(t1, 4, 0, kk, j, s1[(j - kk + 4) % 4][kk], 0, 0, 10);
+                a2 ^= cell_word(t2, 4, 0, kk, j, s2[(j - kk + 4) % 4][kk], 0, 1, 10);
             }
             for (int b = 0; b < 4; b++) {
                 n1[j][b] = (a1 >> (24 - 8 * b)) & 0xFF;
@@ -779,13 +1188,107 @@ int WBAES::dec_core(const WBAESTables &t1, const WBAESTables &t2, const uint8_t 
         memcpy(out, n1, 16);
     }
     return 0;
+#endif
 }
+
+#ifdef WBAES_DUMP_TABLES
+int WBAES::dump_tables(const char *path) const {
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return -1;
+    const uint32_t magic = 0x31454257u;
+    if (fwrite(&magic, 4, 1, fp) != 1) { fclose(fp); return -1; }
+    g_round0_slot = WB_PLAN[0];
+    uint32_t *logical = (uint32_t *)calloc(kBakeN, sizeof(uint32_t));
+    uint32_t *sealed = (uint32_t *)malloc(sizeof(uint32_t) * kBakeN);
+    if (!logical || !sealed) { fclose(fp); return -1; }
+    uint8_t meta[64] = {};
+    memcpy(meta, WB_PLAN, 9);
+    memcpy(meta + 9, DWB_PLAN, 9);
+    memcpy(meta + 18, g_out_aff.m, 8);
+    memcpy(meta + 26, g_out_aff.minv, 8);
+    meta[34] = g_out_aff.c;
+    memcpy(logical, meta, 64);
+    auto load256 = [&](const uint32_t *a, const uint32_t *b, uint32_t cls, uint32_t *W) -> int {
+        for (int z = 0; z < 256; z++) {
+            uint32_t va = WBAESTables::dec(a + z, t1.session_half_a, cls);
+            uint32_t vb = WBAESTables::dec(b + z, t2.session_half_a, cls);
+            if (va != vb) return -1;
+            W[z] = va;
+        }
+        return 0;
+    };
+    int bad = 0;
+    for (int slot = 0; slot < 9 && !bad; slot++)
+        for (int kk = 0; kk < 4 && !bad; kk++)
+            for (int j = 0; j < 4 && !bad; j++) {
+                uint32_t W[256];
+                if (load256(&t1.WB[slot][kk][j][0], &t2.WB[slot][kk][j][0], 0, W)) { bad = 1; break; }
+                for (int lane = 0; lane < 2; lane++) {
+                    unsigned tag = share_tag(0, slot, kk, j, lane);
+                    uint32_t base = wb_off(slot, kk, j, lane);
+                    if (slot == g_round0_slot) {
+                        for (int x = 0; x < 256; x++) {
+                            uint32_t sel = 0;
+                            for (int m = 0; m < 256; m++) {
+                                sel = (uint32_t)m * 0x01010101u;
+                                logical[base + (uint32_t)x * 256u + (uint32_t)m] = mix2_word(W[x], sel, tag);
+                            }
+                        }
+                    } else {
+                        fill_small(logical + base, W, tag);
+                    }
+                }
+            }
+    auto emit_small = [&](int kind, int slot, int kk, int j, const uint32_t *a, const uint32_t *b, uint32_t cls) -> int {
+        uint32_t W[256];
+        if (load256(a, b, cls, W)) return -1;
+        for (int lane = 0; lane < 2; lane++) {
+            unsigned tag = share_tag(kind, slot, kk, j, lane);
+            fill_small(logical + tail_off(kind, slot, kk, j, lane), W, tag);
+        }
+        return 0;
+    };
+    for (int kk = 0; kk < 4 && !bad; kk++)
+        for (int j = 0; j < 4 && !bad; j++)
+            bad = emit_small(1, 0, kk, j, &t1.TF[kk][j][0], &t2.TF[kk][j][0], 1);
+    for (int kk = 0; kk < 4 && !bad; kk++)
+        for (int j = 0; j < 4 && !bad; j++)
+            bad = emit_small(2, 0, kk, j, &t1.FT[kk][j][0], &t2.FT[kk][j][0], 2);
+    for (int slot = 0; slot < 9 && !bad; slot++)
+        for (int kk = 0; kk < 4 && !bad; kk++)
+            for (int j = 0; j < 4 && !bad; j++)
+                bad = emit_small(3, slot, kk, j, &t1.DWB[slot][kk][j][0], &t2.DWB[slot][kk][j][0], 3);
+    for (int kk = 0; kk < 4 && !bad; kk++)
+        for (int j = 0; j < 4 && !bad; j++)
+            bad = emit_small(4, 0, kk, j, &t1.DTF[kk][j][0], &t2.DTF[kk][j][0], 4);
+    uint32_t covered = 0;
+    for_each_group([&](uint32_t base, uint32_t len) { (void)base; covered += len; });
+    if (bad || covered != kBakeN) {
+        free(logical); free(sealed); fclose(fp); return -1;
+    }
+    seal_logical(logical, sealed, kBakeN);
+    int mismatch = 0;
+    for_each_group([&](uint32_t base, uint32_t len) {
+        uint32_t acc = group_seed(base);
+        for (uint32_t k = 0; k < len && !mismatch; k++) {
+            uint32_t got = logical_at(sealed, base + k, kBakeN, 0, acc);
+            if (got != logical[base + k]) mismatch = 1;
+            acc = chain_step(acc, logical[base + k]);
+        }
+    });
+    if (mismatch) { free(logical); free(sealed); fclose(fp); return -1; }
+    int wr = fwrite(sealed, 4, kBakeN, fp) == kBakeN ? 0 : -1;
+    free(logical); free(sealed);
+    fclose(fp);
+    return wr;
+}
+#endif
 
 #ifndef WBAES_NO_MAIN
 // -----------------------------------------------------------------------------
 // 自验: pycryptodome 预计算向量 (wbaes_key.h) + 加解密回环
 // -----------------------------------------------------------------------------
-int main() {
+int main(int argc, char **argv) {
     anti_debug_check(2);   // writeup 攻击环 4: 调试器 → 静默走错误分支 (不退出)
     WBAES wb;
     wb.init();
@@ -807,8 +1310,12 @@ int main() {
     bool round = memcmp(rt, wbaes_key::test_pt, 16) == 0;
     printf("vector-match: %s\n", vec ? "PASS" : "FAIL");
     printf("roundtrip   : %s\n", round ? "PASS" : "FAIL");
-    printf("table-bytes : %zu KB\n",
-           sizeof(WBAESTables) / 1024 * 2);
+#ifdef WBAES_DUMP_TABLES
+    if (vec && round && argc > 1 && wb.dump_tables(argv[1]) != 0) return 2;
+#else
+    (void)argc;
+    (void)argv;
+#endif
     return (vec && round) ? 0 : 1;
 }
 #endif // WBAES_NO_MAIN

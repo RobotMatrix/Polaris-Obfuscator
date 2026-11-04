@@ -34,31 +34,28 @@ BasicBlock *cloneBasicBlock(BasicBlock *BB) {
   return cloneBB;
 }
 
-Value *createBogusCmp(BasicBlock *insertAfter) {
-  // if((y < 10 || x * (x + 1) % 2 == 0))
-  Module *M = insertAfter->getModule();
-  LLVMContext &context = M->getContext();
-  GlobalVariable *xptr = new GlobalVariable(
-      *M, Type::getInt32Ty(context), false, GlobalValue::CommonLinkage,
-      ConstantInt::get(Type::getInt32Ty(context), 0), "x");
-  GlobalVariable *yptr = new GlobalVariable(
-      *M, Type::getInt32Ty(context), false, GlobalValue::CommonLinkage,
-      ConstantInt::get(Type::getInt32Ty(context), 0), "y");
+// ((x | 1) * ((x | 1) + 1)) is even for every x, including after i32 wrap.
+// The load is volatile, so the predicate is not a constant for the optimizer
+// or a decompiler. One private global is shared; it is never named x or y.
+static GlobalVariable *opaqueState(Module *M) {
+  const char *Name = ".obf.opaque";
+  if (GlobalVariable *Existing = M->getGlobalVariable(Name))
+    return Existing;
+  LLVMContext &Ctx = M->getContext();
+  return new GlobalVariable(*M, Type::getInt32Ty(Ctx), false,
+                            GlobalValue::PrivateLinkage,
+                            ConstantInt::get(Type::getInt32Ty(Ctx), 0), Name);
+}
 
-  IRBuilder<> builder(context);
-  builder.SetInsertPoint(insertAfter);
-  LoadInst *x = builder.CreateLoad(Type::getInt32Ty(context), xptr);
-  LoadInst *y = builder.CreateLoad(Type::getInt32Ty(context), yptr);
-  Value *cond1 =
-      builder.CreateICmpSLT(y, ConstantInt::get(Type::getInt32Ty(context), 10));
-  Value *op1 =
-      builder.CreateAdd(x, ConstantInt::get(Type::getInt32Ty(context), 1));
-  Value *op2 = builder.CreateMul(op1, x);
-  Value *op3 =
-      builder.CreateURem(op2, ConstantInt::get(Type::getInt32Ty(context), 2));
-  Value *cond2 =
-      builder.CreateICmpEQ(op3, ConstantInt::get(Type::getInt32Ty(context), 0));
-  return BinaryOperator::CreateOr(cond1, cond2, "", insertAfter);
+Value *createBogusCmp(BasicBlock *insertAfter) {
+  Module *M = insertAfter->getModule();
+  IRBuilder<> Builder(insertAfter);
+  LoadInst *X = Builder.CreateLoad(Builder.getInt32Ty(), opaqueState(M), true);
+  Value *Odd = Builder.CreateOr(X, Builder.getInt32(1));
+  Value *Even = Builder.CreateAdd(Odd, Builder.getInt32(1));
+  Value *Prod = Builder.CreateMul(Odd, Even);
+  Value *Rem = Builder.CreateURem(Prod, Builder.getInt32(2));
+  return Builder.CreateICmpEQ(Rem, Builder.getInt32(0));
 }
 
 PreservedAnalyses BogusControlFlow2::run(Function &F,

@@ -1,4 +1,5 @@
 #include "llvm/Transforms/Obfuscation/MBAMatrix.h"
+#include "llvm/Transforms/Obfuscation/Utils.h"
 #include <algorithm>
 #include <cstdint>
 #include <map>
@@ -168,7 +169,7 @@ void MBAMatrix::solve(std::vector<int64_t> &Solution) {
     }
   }
   for (auto Iter = FreeFactor.begin(); Iter != FreeFactor.end(); Iter++) {
-    Solution[Iter->first] = (rand() % 200 + 1) * Iter->second;
+    Solution[Iter->first] = (getRandomNumber() % 200 + 1) * Iter->second;
   }
   for (int i = Rank - 1; i >= 0; i--) {
     int VarIdx = getLineFirstNonZero(i);

@@ -22,25 +22,28 @@ void IndirectCall::process(Function &F) {
   int PtrSize =
       Data.getTypeAllocSize(Type::getInt8Ty(F.getContext())->getPointerTo());
   Type *PtrValueType = Type::getIntNTy(F.getContext(), PtrSize * 8);
-  std::vector<CallInst *> CIs;
+  // 32-bit non-zero mask: a wider addend does not survive Mach-O relocation.
+  uint64_t KeyMask = 0xffffffffULL;
+  std::vector<CallBase *> CIs;
   for (BasicBlock &BB : F) {
     for (Instruction &I : BB) {
-      if (isa<CallInst>(I)) {
-        CallInst *CI = (CallInst *)&I;
-        Function *Func = CI->getCalledFunction();
-        if (Func && Func->hasExactDefinition()) {
-          CIs.push_back(CI);
-        }
-      }
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB || CB->isInlineAsm())
+        continue;
+      Function *Func = CB->getCalledFunction();
+      // InvokeInst is the call form used on exception edges. External
+      // declarations and intrinsics stay direct.
+      if (Func && !Func->isIntrinsic() && Func->hasExactDefinition())
+        CIs.push_back(CB);
     }
   }
-  for (CallInst *CI : CIs) {
+  for (CallBase *CI : CIs) {
     Type *Ty = CI->getFunctionType()->getPointerTo();
 
-    Constant *Func = (Constant *)CI->getCalledFunction();
+    Constant *Func = CI->getCalledFunction();
     Constant *CValue = ConstantExpr::getPtrToInt(
         ConstantExpr::getBitCast(Func, Ty, false), PtrValueType, false);
-    unsigned Mask = getRandomNumber();
+    uint64_t Mask = (getRandomNumber() & KeyMask) | 1;
     CValue = ConstantExpr::getAdd(CValue, ConstantInt::get(PtrValueType, Mask));
     CValue = ConstantExpr::getIntToPtr(
         CValue, Type::getInt8Ty(F.getContext())->getPointerTo());
@@ -48,9 +51,8 @@ void IndirectCall::process(Function &F) {
     GlobalVariable *GV = new GlobalVariable(
         *(F.getParent()), Type::getInt8Ty(F.getContext())->getPointerTo(),
         false, GlobalValue::PrivateLinkage, NULL);
-    IRBuilder<> IRB((Instruction *)CI);
-    Value *MaskValue = IRB.getInt32(Mask);
-    MaskValue = IRB.CreateZExt(MaskValue, PtrValueType);
+    IRBuilder<> IRB(CI);
+    Value *MaskValue = ConstantInt::get(PtrValueType, Mask);
     Value *CallPtr = IRB.CreateIntToPtr(
         IRB.CreateSub(IRB.CreatePtrToInt(IRB.CreateLoad(IRB.getInt8PtrTy(), GV),
                                          PtrValueType),

@@ -137,6 +137,19 @@ void GlobalsEncryption::process(Module &M) {
       continue;
     }
 
+    // Split K so the call site has no key immediate. The four words XOR
+    // back to K; only their combination decrypts the global.
+    uint32_t Frag[4];
+    Frag[0] = (uint32_t)getRandomNumber();
+    Frag[1] = (uint32_t)getRandomNumber();
+    Frag[2] = (uint32_t)getRandomNumber();
+    Frag[3] = Frag[0] ^ Frag[1] ^ Frag[2] ^ (uint32_t)K;
+    ArrayType *FragTy = ArrayType::get(Type::getInt32Ty(M.getContext()), 4);
+    GlobalVariable *FragGV = new GlobalVariable(
+        M, FragTy, true, GlobalValue::PrivateLinkage,
+        ConstantDataArray::get(M.getContext(), ArrayRef<uint32_t>(Frag, 4)),
+        ".obf.keyfrag");
+
     std::map<Function *, Value *> FV;
     for (Function *F : Funcs) {
       IRBuilder<> IRB(&*F->getEntryBlock().getFirstInsertionPt());
@@ -145,7 +158,13 @@ void GlobalsEncryption::process(Module &M) {
       IRB.CreateMemCpy(Copy, (MaybeAlign)0, GV, (MaybeAlign)0,
                        IRB.getInt64(Size));
       AllocaInst *Key = IRB.CreateAlloca(IRB.getInt32Ty());
-      IRB.CreateStore(IRB.getInt32(K), Key);
+      Value *Acc = IRB.getInt32(0);
+      for (unsigned Part = 0; Part < 4; ++Part) {
+        Value *Elem = IRB.CreateInBoundsGEP(
+            FragTy, FragGV, {IRB.getInt32(0), IRB.getInt32(Part)});
+        Acc = IRB.CreateXor(Acc, IRB.CreateLoad(IRB.getInt32Ty(), Elem));
+      }
+      IRB.CreateStore(Acc, Key);
       IRB.CreateCall(FunctionCallee(DecFunc),
                      {
                          IRB.CreateBitOrPointerCast(Copy, IRB.getInt8PtrTy()),

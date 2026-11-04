@@ -5,14 +5,13 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/Passes/PassBuilder.h"
+#include "llvm/Support/ObfuscationSeed.h"
 #include "llvm/Transforms/Obfuscation/Utils.h"
-#include <ctime>
 #include <random>
 using namespace llvm;
 namespace polaris {
 PreservedAnalyses AliasAccess::run(Module &M, ModuleAnalysisManager &AM) {
   static_assert(BRANCH_NUM > 1);
-  srand(time(NULL));
   std::vector<Function *> WorkList;
   for (Function &F : M) {
     WorkList.push_back(&F);
@@ -158,7 +157,8 @@ void AliasAccess::process(Function &F) {
         }
         AllocaInst *AI = (AllocaInst *)Opnd;
         IRB.SetInsertPoint(&I);
-        std::shuffle(Graph.begin(), Graph.end(), std::default_random_engine());
+        std::mt19937_64 Eng(llvm::nextObfRandom());
+        std::shuffle(Graph.begin(), Graph.end(), Eng);
         ReferenceNode *Ptr = nullptr;
         for (ReferenceNode *RN : Graph) {
           if (RN->Path.find(AI) != RN->Path.end() ||

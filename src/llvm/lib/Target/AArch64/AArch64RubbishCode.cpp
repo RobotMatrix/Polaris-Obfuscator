@@ -2,7 +2,6 @@
 #include "AArch64InstrInfo.h"
 #include "AArch64Subtarget.h"
 #include "llvm/CodeGen/LivePhysRegs.h"
-#include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
@@ -11,6 +10,7 @@
 #include "llvm/CodeGen/TargetPassConfig.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/ObfuscationSeed.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 #include <cstdio>
@@ -20,6 +20,8 @@
 #include <set>
 #include <vector>
 using namespace llvm;
+
+static uint32_t obfRand() { return (uint32_t)llvm::nextObfRandom(); }
 
 #define DEBUG_TYPE "aarch64-obfuscation"
 
@@ -90,6 +92,11 @@ public:
   MachineBasicBlock *splitBasicBlock(MachineBasicBlock *MBB,
                                      MachineInstr *Header, MachineInstr *Tail,
                                      std::vector<MachineInstr *> &FixPoint);
+  // Spill X16, materialize To with ADRP+ADD, BR X16. SP moves by 16 bytes.
+  void emitIndirectBranch(MachineBasicBlock &From, MachineBasicBlock *To,
+                          std::vector<MachineInstr *> &FixPoint);
+  void emitX16Reload(MachineBasicBlock *To,
+                     std::vector<MachineInstr *> &FixPoint);
   void obfuscateControlFlow(MachineFunction &MF);
   bool containsCall(MachineBasicBlock *MBB);
 
@@ -97,10 +104,8 @@ private:
   MachineRegisterInfo *MRI = nullptr;
   const AArch64InstrInfo *TII = nullptr;
   const TargetRegisterInfo *TRI = nullptr;
-  MachineFrameInfo *MFI = nullptr;
-  // Instructions around which no garbage may be inserted (BL and the
-  // branch that the RET lands on); inserting between them breaks the
-  // call-shaped split return path.
+  // X16 spill, ADRP+ADD, BR, and the matching reload must stay adjacent.
+  // Garbage between them breaks the indirect edge.
   std::set<MachineInstr *> Anchors;
 
   // Caller-saved general purpose registers that are safe to trash:
@@ -162,7 +167,7 @@ MCPhysReg AArch64RubbishCodePass::getRegisterBySize(bool Is64Bit,
   }
   if (Available.empty())
     return AArch64::NoRegister;
-  return Available[rand() % Available.size()];
+  return Available[obfRand() % Available.size()];
 }
 
 // Build a garbage instruction in front of Ptr. WriteNZCV is only true when
@@ -230,7 +235,7 @@ bool AArch64RubbishCodePass::buildMIWrapper(unsigned Opcode,
       return false;
     // ADD/SUB imm12: 0..4095 (shift 0). The shifted-imm operand expands to
     // two machine operands: [imm, shift].
-    uint64_t Imm = rand() % 4096;
+    uint64_t Imm = obfRand() % 4096;
     Gen = BuildMI(*MBB, *Ptr, Ptr->getDebugLoc(), TII->get(Opcode))
               .addDef(Reg0)
               .addReg(Reg0)
@@ -257,7 +262,7 @@ bool AArch64RubbishCodePass::buildMIWrapper(unsigned Opcode,
     MCPhysReg Reg1 = getRegisterBySize(Is64Bit, Regs);
     if (Reg0 == AArch64::NoRegister || Reg1 == AArch64::NoRegister)
       return false;
-    uint64_t Shift = rand() % (Is64Bit ? 64 : 32);
+    uint64_t Shift = obfRand() % (Is64Bit ? 64 : 32);
     Gen = BuildMI(*MBB, *Ptr, Ptr->getDebugLoc(), TII->get(Opcode))
               .addDef(Reg0)
               .addReg(Reg0)
@@ -366,12 +371,64 @@ bool AArch64RubbishCodePass::containsCall(MachineBasicBlock *MBB) {
   return false;
 }
 
+// Spill X16 with a 16-byte pre-indexed store, materialize the block address
+// in X16, and BR X16. The target block must start with emitX16Reload.
+void AArch64RubbishCodePass::emitIndirectBranch(
+    MachineBasicBlock &From, MachineBasicBlock *To,
+    std::vector<MachineInstr *> &FixPoint) {
+  DebugLoc DL;
+  MachineBasicBlock::iterator At = From.end();
+  MachineInstr *Save =
+      BuildMI(From, At, DL, TII->get(AArch64::STRXpre))
+          .addReg(AArch64::SP, RegState::Define)
+          .addReg(AArch64::X16)
+          .addReg(AArch64::SP)
+          .addImm(-16)
+          .getInstr();
+  MCSymbol *Sym = To->getSymbol();
+  MachineInstr *Adrp =
+      BuildMI(From, At, DL, TII->get(AArch64::ADRP))
+          .addReg(AArch64::X16, RegState::Define)
+          .addSym(Sym, AArch64II::MO_PAGE)
+          .getInstr();
+  MachineInstr *Add =
+      BuildMI(From, At, DL, TII->get(AArch64::ADDXri))
+          .addReg(AArch64::X16, RegState::Define)
+          .addReg(AArch64::X16)
+          .addSym(Sym, static_cast<unsigned char>(AArch64II::MO_PAGEOFF |
+                                                  AArch64II::MO_NC))
+          .addImm(0)
+          .getInstr();
+  MachineInstr *Br = BuildMI(From, At, DL, TII->get(AArch64::BR))
+                         .addReg(AArch64::X16)
+                         .getInstr();
+  for (MachineInstr *I : {Save, Adrp, Add, Br}) {
+    Anchors.insert(I);
+    FixPoint.push_back(I);
+  }
+  To->setMachineBlockAddressTaken();
+  To->setLabelMustBeEmitted();
+}
+
+void AArch64RubbishCodePass::emitX16Reload(
+    MachineBasicBlock *To, std::vector<MachineInstr *> &FixPoint) {
+  MachineInstr *Reload =
+      BuildMI(*To, To->begin(), DebugLoc(), TII->get(AArch64::LDRXpost))
+          .addReg(AArch64::SP, RegState::Define)
+          .addReg(AArch64::X16, RegState::Define)
+          .addReg(AArch64::SP)
+          .addImm(16)
+          .getInstr();
+  Anchors.insert(Reload);
+  FixPoint.push_back(Reload);
+}
+
 // Split MBB between Header and Tail and move the body to the end of the
-// function, turning the straight-line flow into MBB -> (garbage fallthrough)
-// ... Body (at function end) -> End.
-// The "call" trick on ARM64: BL Body makes LR point after the BL, and Body
-// ends with RET which jumps back to LR. Bodies containing calls are rejected
-// because a nested BL would clobber LR.
+// function. Executed edges are BR X16 after ADRP+ADD, not direct B, so a
+// disassembler cannot follow the boundary. Dirty bytes occupy the layout
+// fallthrough of MBB and are never executed. A call or FrameDestroy in the
+// body is merged back: a call clobbers the surrounding frame, and
+// FrameDestroy must stay with the epilogue.
 MachineBasicBlock *
 AArch64RubbishCodePass::splitBasicBlock(MachineBasicBlock *MBB,
                                     MachineInstr *Header, MachineInstr *Tail,
@@ -426,7 +483,7 @@ AArch64RubbishCodePass::splitBasicBlock(MachineBasicBlock *MBB,
   }
   MachineBasicBlock *End = Body->splitAt(*Point2, true, nullptr);
 
-  if (containsCall(Body) || containsCall(End)) {
+  if (containsCall(Body) || containsCall(End) || containsFrameDestroy(Body)) {
     // LR would be clobbered inside the body; abort this split and merge back.
     MBB->splice(MBB->end(), Body, Body->begin(), Body->end());
     MBB->splice(MBB->end(), End, End->begin(), End->end());
@@ -449,54 +506,42 @@ AArch64RubbishCodePass::splitBasicBlock(MachineBasicBlock *MBB,
     return nullptr;
   }
 
-  // AArch64 SP must stay 16-byte aligned at all times (hardware trap
-  // EXC_ARM_SP_ALIGN otherwise). Round the reservation up.
-  uint64_t StackSize = (MFI->estimateStackSize(*MF) + 15) & ~15ULL;
+  // X16 is allocatable, so spill it before the branch and reload at each
+  // target. The slot is 16 bytes, so SP stays 16-byte aligned.
+  emitX16Reload(Body, FixPoint);
+  emitX16Reload(End, FixPoint);
+  // MBB -> Body is the executed edge. MBB -> End replaces the old dead
+  // direct B End so that edge is not a direct branch either. Body -> End
+  // is the other executed edge.
+  emitIndirectBranch(*MBB, Body, FixPoint);
+  emitIndirectBranch(*MBB, End, FixPoint);
+  emitIndirectBranch(*Body, End, FixPoint);
 
-  // Call-shaped split. Split points are confined between FrameSetup and
-  // FrameDestroy (see obfuscateControlFlow), so Body never restores LR --
-  // RET in Body safely returns to the instruction after BL, which is the
-  // branch back to End. This mirrors the X86 CALL/RET disguise and makes
-  // Body look like a standalone function tail to decompilers.
-  FixPoint.push_back(BuildMI(*MBB, MBB->end(), nullptr, TII->get(AArch64::B))
-                         .addMBB(Body)
-                         .getInstr());
-  FixPoint.push_back(BuildMI(*MBB, MBB->end(), nullptr, TII->get(AArch64::B))
-                         .addMBB(End)
-                         .getInstr());
-
-  MachineInstr *MI = &*End->begin();
   // RubbishSize must be a multiple of 4 (AArch64 instructions are 4-byte
-  // aligned) and <= 4095 so it fits in an ADDXri imm12.
-  unsigned RubbishSize = ((rand() % 30 + 20) * 4) & 0xFFC;
+  // aligned). The bytes are never executed; BR X16 skips over them.
+  unsigned RubbishSize = ((obfRand() % 30 + 20) * 4) & 0xFFC;
   if (getenv("ARMRC_NO_DIRTY"))
     RubbishSize = 0;
 
-  BuildMI(*Body, Body->end(), nullptr, TII->get(AArch64::B))
-      .addMBB(End)
-      .getInstr();
-
-  // Dirty bytes live in a dedicated block that no runtime path reaches.
-  // Landing past them via LR skew is layout-fragile: any instruction
-  // inserted at End->begin() (dataflow garbage, later splits) shifts the
-  // target. The RET here always returns to the fixed branch after BL.
+  // Place the garbage in MBB's layout fallthrough. Body is moved to the
+  // function end, so the executed BR X16 jumps over this block.
   MachineBasicBlock *DirtyBB = MF->CreateMachineBasicBlock();
-  MF->insert(++MachineFunction::iterator(End), DirtyBB);
-  DirtyBB->addSuccessor(End);
-  std::vector<unsigned char> RandBytes;
-  for (unsigned i = 0; i < RubbishSize; i++) {
-    RandBytes.push_back(rand() & 0xff);
+  MF->insert(MachineFunction::iterator(Body), DirtyBB);
+  MachineInstr *Trap =
+      BuildMI(*DirtyBB, DirtyBB->end(), nullptr, TII->get(AArch64::BRK))
+          .addImm(1)
+          .getInstr();
+  if (RubbishSize) {
+    std::vector<unsigned char> RandBytes;
+    RandBytes.reserve(RubbishSize);
+    for (unsigned i = 0; i < RubbishSize; i++)
+      RandBytes.push_back(static_cast<unsigned char>(obfRand() & 0xff));
+    insertDirtyBytes(Trap, RandBytes);
   }
-  MachineInstr *BrTo = BuildMI(*DirtyBB, DirtyBB->end(), nullptr,
-                               TII->get(AArch64::B))
-                            .addMBB(End)
-                            .getInstr();
-  insertDirtyBytes(BrTo, RandBytes);
   DirtyBB->setMachineBlockAddressTaken();
   DirtyBB->setLabelMustBeEmitted();
 
   Body->moveBefore(&*MF->end());
-  DirtyBB->moveBefore(&*MF->end());
   if (getenv("ARMRC_DEBUG"))
     errs() << "[ARMRC] mbb=" << MBB->getNumber() << " body=" << Body->getNumber()
            << " end=" << End->getNumber() << " dirty=" << DirtyBB->getNumber()
@@ -566,7 +611,7 @@ void AArch64RubbishCodePass::randomMoveBasicBlock(
     if (MBB == &MF.front()) {
       continue;
     }
-    MachineBasicBlock *Before = MoveList[rand() % MoveList.size()];
+    MachineBasicBlock *Before = MoveList[obfRand() % MoveList.size()];
     if (Before != MBB) {
       MBB->moveBefore(Before);
     }
@@ -647,7 +692,7 @@ void AArch64RubbishCodePass::generateRubbishCode(ObfuscateInstrInfo &OI) {
     }
   }
   while (Tries--) {
-    const RubbishDesc &D = Descs[rand() % Descs.size()];
+    const RubbishDesc &D = Descs[obfRand() % Descs.size()];
     if (D.Flags && !OI.NZCVAvailable)
       continue;
     if (D.Def && D.Ty != RegImm && D.Ty != OnlyReg) {
@@ -876,45 +921,10 @@ void AArch64RubbishCodePass::obfuscateControlFlow(MachineFunction &MF) {
               Nops.push_back(Nop);
             }
           }
+          // The executed edges are already BR X16. A second splitAt on a
+          // random block faults in transferSuccessorsAndUpdatePHIs.
           WorkList.push_back(NewBlock);
-
-          AvailableBlocks.clear();
-          for (MachineBasicBlock &MBB : MF) {
-            if (&MBB == &MF.front() ||
-                std::find(WorkList.begin(), WorkList.end(), &MBB) !=
-                    WorkList.end() ||
-                MBB.size() < 4) {
-              continue;
-            }
-            AvailableBlocks.push_back(&MBB);
-          }
-          if (AvailableBlocks.size() != 0) {
-            MachineBasicBlock *InsertInto =
-                AvailableBlocks[rand() % AvailableBlocks.size()];
-            unsigned InsertPos = InsertInto->size() / 2;
-
-            for (MachineInstr &MI : *InsertInto) {
-              InsertPos--;
-              if (std::find(FixPoint.begin(), FixPoint.end(), &MI) !=
-                  FixPoint.end()) {
-                continue;
-              }
-              if (InsertPos <= 0) {
-                if (MI.getFlag(MachineInstr::FrameSetup) ||
-                    MI.getFlag(MachineInstr::FrameDestroy) ||
-                    InsertInto->size() < 6) {
-                  continue;
-                }
-                MachineBasicBlock *InsertBefore =
-                    InsertInto->splitAt(MI, true, nullptr);
-                BuildMI(*InsertInto, InsertInto->end(), nullptr,
-                        TII->get(AArch64::B))
-                    .addMBB(InsertBefore);
-                NewBlock->moveBefore(InsertBefore);
-                break;
-              }
-            }
-          }
+          (void)AvailableBlocks;
         }
       }
     }
@@ -961,14 +971,12 @@ bool AArch64RubbishCodePass::checkShouldProcess(MachineFunction &MF,
 }
 
 bool AArch64RubbishCodePass::runOnMachineFunction(MachineFunction &MF) {
-  if (const char *Seed = getenv("ARMRC_SEED"))
-    srand(atoi(Seed));
-  else
-    srand(time(0));
+  // Block numbers restart at 0 for every function. A merged block in one
+  // function must not suppress splits in a later function.
+  MergedMBBs.clear();
   MRI = &MF.getRegInfo();
   TII = MF.getSubtarget<AArch64Subtarget>().getInstrInfo();
   TRI = MF.getSubtarget().getRegisterInfo();
-  MFI = &MF.getFrameInfo();
 
   ObfuscateOption OO;
   Anchors.clear();

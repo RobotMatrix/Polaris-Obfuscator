@@ -10,7 +10,7 @@ struct Flattening : PassInfoMixin<Flattening> {
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
 
   static bool isRequired() { return true; }
-  void doFlatten(Function *f, int seed, Function *updateFunc);
+  void doFlatten(Function *f);
   Function *buildUpdateKeyFunc(Module *m);
 };
 

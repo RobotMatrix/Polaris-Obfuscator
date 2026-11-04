@@ -43,7 +43,10 @@ void IndirectBranch::process(Function &F) {
       IndirectBlockInfo Info;
       Info.BB = BB;
       Info.IndexWithinTable = Map.size();
-      Info.RandomKey = 0;
+      // Mach-O encodes this addend in the pointer slot. A full 64-bit key
+      // is truncated by the relocation and the indirect branch lands off
+      // the block. A non-zero 32-bit key still hides the raw address.
+      Info.RandomKey = (getRandomNumber() & 0xffffffffULL) | 1;
       Map[BB] = Info;
       Values.push_back(nullptr);
     }

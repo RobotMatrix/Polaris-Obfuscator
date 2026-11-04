@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llvm/Passes/PassBuilder.h"
+#include <cstdint>
 
 using namespace llvm;
 
@@ -8,7 +9,7 @@ namespace polaris {
 struct IndirectBlockInfo {
   BasicBlock *BB;
   unsigned IndexWithinTable;
-  unsigned RandomKey;
+  uint64_t RandomKey;
 };
 struct IndirectBranch : PassInfoMixin<IndirectBranch> {
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);

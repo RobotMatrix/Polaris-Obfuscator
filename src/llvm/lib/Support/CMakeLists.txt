@@ -144,6 +144,7 @@ add_llvm_component_library(LLVMSupport
   COM.cpp
   CodeGenCoverage.cpp
   CommandLine.cpp
+  ObfuscationSeed.cpp
   Compression.cpp
   CRC.cpp
   ConvertUTF.cpp

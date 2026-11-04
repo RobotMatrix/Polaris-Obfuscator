@@ -6,6 +6,7 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/ObfuscationSeed.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include <algorithm>
@@ -121,9 +122,7 @@ std::string readAnnotate(Function &f) {
   }
   return (annotation);
 }
-uint64_t getRandomNumber() {
-  return (((uint64_t)rand()) << 32) | ((uint64_t)rand());
-}
+uint64_t getRandomNumber() { return llvm::nextObfRandom(); }
 uint32_t getUniqueNumber(std::vector<uint32_t> &rand_list) {
   uint32_t num = getRandomNumber() & 0xffffffff;
   while (true) {
@@ -150,7 +149,8 @@ void getRandomNoRepeat(unsigned upper_bound, unsigned size,
     list.push_back(i);
   }
 
-  std::shuffle(list.begin(), list.end(), std::default_random_engine());
+  std::mt19937_64 Eng(getRandomNumber());
+  std::shuffle(list.begin(), list.end(), Eng);
   for (unsigned i = 0; i < size; i++) {
     result.push_back(list[i]);
   }
