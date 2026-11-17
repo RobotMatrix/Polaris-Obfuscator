@@ -71,7 +71,11 @@ std::vector<uint8_t> randomProgram(std::mt19937_64 &rng, uint32_t *initRegs) {
       // Short displacements, so loops form and terminate often.
       imm = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int>(rng() % 9) - 4));
     } else if (o == Opcode::Ld || o == Opcode::St) {
-      imm = (rng() % 4) * 64u; // keep addresses mostly inside 4096
+      // Mostly aligned and inside 4096; one in eight is deliberately misaligned,
+      // which must fault identically in all three engines.
+      imm = (rng() % 4) * 64u;
+      if ((rng() % 8) == 0)
+        imm += static_cast<uint32_t>(rng() % 4);
     } else if (o == Opcode::Movi) {
       imm = static_cast<uint32_t>(rng() % 64);
     } else if (o == Opcode::Shl || o == Opcode::Shr) {
@@ -147,6 +151,11 @@ int main(int argc, char **argv) {
     else if (std::string(argv[i]) == "--count")
       count = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 0));
   }
+
+  const char *emitDir = nullptr;
+  for (int i = 1; i + 1 < argc; ++i)
+    if (std::string(argv[i]) == "--emit-dir")
+      emitDir = argv[++i];
 
   std::mt19937_64 rng(seed);
   HsvmParams p;
@@ -224,6 +233,46 @@ int main(int argc, char **argv) {
         break;
       }
     }
+    // Emit the program and its oracle outcome for the compiler-pass gate.
+    if (emitDir) {
+      char stem[512];
+      std::snprintf(stem, sizeof(stem), "%s/prog_%u", emitDir, n);
+      std::string srcPath = std::string(stem) + ".c";
+      FILE *fh = std::fopen(srcPath.c_str(), "w");
+      if (fh) {
+        std::fprintf(fh,
+                     "#include <stdio.h>\n"
+                     "extern int hsvm_entry(int);\n"
+                     "int main(void) {\n"
+                     "  unsigned v = (unsigned)hsvm_entry(%uu);\n"
+                     "  if (v == 0xFFFFFFFEu) { printf(\"fault\\n\"); return 0; }\n"
+                     "  if (v == 0xFFFFFFFFu) { printf(\"oob\\n\"); return 0; }\n"
+                     "  printf(\"r0=%%u\\n\", v);\n"
+                     "  return 0;\n}\n",
+                     initRegs);
+        std::fprintf(fh, "const unsigned char hsvm_bytecode[%zu] __attribute__((used)) = {",
+                     code.size());
+        for (size_t i = 0; i < code.size(); ++i)
+          std::fprintf(fh, "%s%u", i ? "," : "", code[i]);
+        std::fprintf(fh, "};\n");
+        std::fclose(fh);
+        std::string expect;
+        if (interp.faulted())
+          expect = "fault";
+        else if (interp.halted()) {
+          char b[64];
+          std::snprintf(b, sizeof(b), "r0=%u", interp.reg(0));
+          expect = b;
+        } else
+          expect = "budget"; // the native program has no step cap: skip in the gate
+        std::string exPath = std::string(stem) + ".expect";
+        if (FILE *ef = std::fopen(exPath.c_str(), "w")) {
+          std::fprintf(ef, "%s\n", expect.c_str());
+          std::fclose(ef);
+        }
+      }
+    }
+
     if (bad)
       ++diverged;
     if (interp.halted())

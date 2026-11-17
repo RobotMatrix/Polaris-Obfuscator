@@ -516,3 +516,21 @@ LLVM IR 放在 V-08 的 Polaris pass 里。代价：这里不能取性能口径�
 
 **未覆盖**：`Ld/St` 的未对齐分支（生成器的立即数都是 64 的倍数）；
 真编译器 pass 没有纳入随机测试（每次要调 clang）；`diverged=0` 不等于语义完全正确。
+
+## ADR-033 随机程序过真编译器，修掉"编译期报错 vs 运行时故障"的语义分歧（2026-11-17）
+
+新增 `scripts/verify_vmp_fuzz.sh`（ctest `vmp_fuzz`）：随机字节码经 `-passes=hsvm` 编译后运行，
+输出必须等于 oracle 的结局；oracle 撞步数上限的程序跳过（原生无步数概念）。
+
+**抓到两个问题**：
+1. **语义分歧**：解释器只在"执行到"越界寄存器指令时故障，而 pass 用
+   `report_fatal_error("hsvm: register index out of range")` 在编译期中止——
+   同一段字节码，原本能跑完的程序变成编不过。已改为发射到 fault 块的无条件分支，
+   与访存越界同一套处理。**规则：lowering 不能让"运行时才发生的事"变成编译期失败。**
+2. **输入不一致**：生成的 C 用 `hsvm_entry(0)`，oracle 用随机 `initRegs`，
+   两边比的不是同一个程序（`want=r0=1797755835 got=r0=0`）。已改为按 `initRegs` 生成实参。
+
+生成器同时补上 `Ld/St` 未对齐分支（每 8 个地址 1 个不对齐），三方测试仍 `diverged=0`。
+
+结果：30 个随机程序，24 个编译并比对通过、6 个因 budget 跳过，gate 退出 0；
+ctest 28 个测试全绿。

@@ -184,14 +184,18 @@ PreservedAnalyses HSVMLowering::run(Module &M, ModuleAnalysisManager &AM) {
       B.CreateBr(Next);
       break;
     case Hsv_Movi:
-      if (d.dst >= kRegs)
-        report_fatal_error("hsvm: register index out of range");
+      if (d.dst >= kRegs) {
+        B.CreateBr(FaultBlk);
+        break;
+      }
       storeReg(B, d.dst, B.getInt32(d.imm));
       B.CreateBr(Next);
       break;
     case Hsv_Mov:
-      if (d.dst >= kRegs || d.a >= kRegs)
-        report_fatal_error("hsvm: register index out of range");
+      if (d.dst >= kRegs || d.a >= kRegs) {
+        B.CreateBr(FaultBlk);
+        break;
+      }
       storeReg(B, d.dst, loadReg(B, d.a));
       B.CreateBr(Next);
       break;
@@ -203,8 +207,10 @@ PreservedAnalyses HSVMLowering::run(Module &M, ModuleAnalysisManager &AM) {
     case Hsv_Mul:
     case Hsv_Shl:
     case Hsv_Shr: {
-      if (d.dst >= kRegs || d.a >= kRegs || d.b >= kRegs)
-        report_fatal_error("hsvm: register index out of range");
+      if (d.dst >= kRegs || d.a >= kRegs || d.b >= kRegs) {
+        B.CreateBr(FaultBlk);
+        break;
+      }
       Value *x = loadReg(B, d.a);
       Value *y = loadReg(B, d.b);
       Value *r = nullptr;
@@ -231,8 +237,10 @@ PreservedAnalyses HSVMLowering::run(Module &M, ModuleAnalysisManager &AM) {
       B.CreateRet(loadReg(B, 0));
       break;
     case Hsv_Ld: {
-      if (d.dst >= kRegs || d.a >= kRegs)
-        report_fatal_error("hsvm: register index out of range");
+      if (d.dst >= kRegs || d.a >= kRegs) {
+        B.CreateBr(FaultBlk);
+        break;
+      }
       Value *addr = B.CreateAdd(loadReg(B, d.a), B.getInt32(d.imm));
       BasicBlock *Cont = BasicBlock::Create(Ctx, "hsvm.ld", F);
       checkAddr(B, addr, Cont, FaultBlk);
@@ -251,8 +259,10 @@ PreservedAnalyses HSVMLowering::run(Module &M, ModuleAnalysisManager &AM) {
       break;
     }
     case Hsv_St: {
-      if (d.a >= kRegs || d.b >= kRegs)
-        report_fatal_error("hsvm: register index out of range");
+      if (d.a >= kRegs || d.b >= kRegs) {
+        B.CreateBr(FaultBlk);
+        break;
+      }
       Value *addr = B.CreateAdd(loadReg(B, d.a), B.getInt32(d.imm));
       Value *val = loadReg(B, d.b);
       BasicBlock *Cont = BasicBlock::Create(Ctx, "hsvm.st", F);
@@ -276,8 +286,10 @@ PreservedAnalyses HSVMLowering::run(Module &M, ModuleAnalysisManager &AM) {
       break;
     }
     case Hsv_Brz: {
-      if (d.a >= kRegs)
-        report_fatal_error("hsvm: register index out of range");
+      if (d.a >= kRegs) {
+        B.CreateBr(FaultBlk);
+        break;
+      }
       const int64_t target = static_cast<int64_t>(pc) + static_cast<int32_t>(d.imm);
       BasicBlock *T = (target < 0 || target >= static_cast<int64_t>(slots))
                           ? OutOfRange
