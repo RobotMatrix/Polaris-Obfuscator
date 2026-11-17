@@ -120,14 +120,18 @@ int main() {
     CHECK(h.pc == 0, "pc does not move on halt");
   }
 
-  // Register range: 64 registers, index 64 faults.
+  // Register range: Machine::kMaxRegs is 16, so 15 is legal and 16 faults.
   {
     SemState s = fresh(mem);
-    CHECK(semStep(s, mk(Opcode::Movi, 63, 0, 0, 42)), "top register is legal");
-    CHECK(s.regs[63] == 42, "top register keeps its value");
+    CHECK(s.regCount == 16, "default register count matches the machine");
+    CHECK(semStep(s, mk(Opcode::Movi, 15, 0, 0, 42)), "top register is legal");
+    CHECK(s.regs[15] == 42, "top register keeps its value");
     SemState bad = fresh(mem);
-    CHECK(!semStep(bad, mk(Opcode::Mov, 0, 64)), "register 64 faults");
+    CHECK(!semStep(bad, mk(Opcode::Mov, 0, 16)), "register 16 faults");
     CHECK(bad.faulted, "register fault is recorded");
+    SemState wide = fresh(mem);
+    wide.regCount = 64;
+    CHECK(semStep(wide, mk(Opcode::Movi, 63, 0, 0, 7)), "count is a parameter, not a constant");
   }
 
   return hsvm_test::summary("semantics");

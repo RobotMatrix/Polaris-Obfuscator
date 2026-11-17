@@ -356,3 +356,22 @@ fault 是语义的一部分（越界寄存器、越界/未对齐地址 → `faul
 
 **未做**：MIR → LLVM IR lowering 本身、寄存器分配、pass 接入、重建 clang。
 切片 2 的完成判据现有一条可执行的尺子：lowering 后的实现与 `semStep` 逐条差分一致。
+
+## ADR-024 V-03 差分框架落地，并抓出三处规格错误（2026-11-17）
+
+`tests/test_diff.cpp`（ctest `diff`，13 断言）逐步锁步比较解释器与 `semStep`：
+regs / mem / pc / 停机标志 / 故障标志，分歧时报 step、pc、指令反汇编与字段名。
+
+抓到的三处错误：
+1. 寄存器数是 **16**（`Machine::kMaxRegs`，`regCount_ = p.n / 32`），我此前在 `semantics.h`
+   写死 64 并断言"寄存器 63 合法"——已改为从机器读入 `regCount`，断言 15 合法 / 16 故障。
+2. `Machine::step()` 在故障路径返回 true（只置标志并停止）；比较返回值是在比约定，
+   已改为比较状态位。
+3. `allops` 在 Plain 模式第 12 步故障（`ld r11,[r12+0xb0b0b0b]` 地址越界），与
+   `programs.h` 的"只在 linear 模式有意义"注释一致；真实覆盖改用 sum / crc / copy_xor。
+
+**新增只读访问器**（不改行为）：`pcValue()`、`code()`、`stepOnce()`。
+**未做**：lowering（V-04 起）。
+
+教训：oracle 不依赖解释器是对的，但 oracle 的**常量**必须由解释器校准；
+写死 64 寄存器这类错误只有差分测试能抓出来。

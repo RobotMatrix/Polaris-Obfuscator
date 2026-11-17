@@ -18,6 +18,7 @@ namespace hsvm {
 
 struct SemState {
   uint32_t regs[64] = {};
+  uint32_t regCount = 16; // Machine::kMaxRegs; set from the machine under test
   uint8_t *mem = nullptr;
   uint32_t memBytes = 0;
   uint32_t pc = 0;
@@ -25,9 +26,9 @@ struct SemState {
   bool faulted = false;
 };
 
-constexpr uint32_t kSemRegs = 64;
+constexpr uint32_t kSemMaxRegs = 64;
 
-inline bool semRegOk(uint8_t r) { return r < kSemRegs; }
+inline bool semRegOk(const SemState &s, uint8_t r) { return r < s.regCount; }
 
 inline bool semMemOk(const SemState &s, uint32_t addr) {
   return (addr & 3u) == 0 && addr + 4u <= s.memBytes && s.mem != nullptr;
@@ -61,7 +62,7 @@ inline bool semStep(SemState &s, const MirOp &op) {
     s.pc += 1;
     return true;
   case Opcode::Mov:
-    if (!semRegOk(op.a) || !semRegOk(op.dst)) {
+    if (!semRegOk(s, op.a) || !semRegOk(s, op.dst)) {
       s.faulted = true;
       return false;
     }
@@ -76,7 +77,7 @@ inline bool semStep(SemState &s, const MirOp &op) {
   case Opcode::Mul:
   case Opcode::Shl:
   case Opcode::Shr: {
-    if (!semRegOk(op.a) || !semRegOk(op.b) || !semRegOk(op.dst)) {
+    if (!semRegOk(s, op.a) || !semRegOk(s, op.b) || !semRegOk(s, op.dst)) {
       s.faulted = true;
       return false;
     }
@@ -99,7 +100,7 @@ inline bool semStep(SemState &s, const MirOp &op) {
     return true;
   }
   case Opcode::Ld: {
-    if (!semRegOk(op.a) || !semRegOk(op.dst)) {
+    if (!semRegOk(s, op.a) || !semRegOk(s, op.dst)) {
       s.faulted = true;
       return false;
     }
@@ -113,7 +114,7 @@ inline bool semStep(SemState &s, const MirOp &op) {
     return true;
   }
   case Opcode::St: {
-    if (!semRegOk(op.a) || !semRegOk(op.b)) {
+    if (!semRegOk(s, op.a) || !semRegOk(s, op.b)) {
       s.faulted = true;
       return false;
     }
@@ -131,7 +132,7 @@ inline bool semStep(SemState &s, const MirOp &op) {
                                  static_cast<int32_t>(op.imm));
     return true;
   case Opcode::Brz: {
-    if (!semRegOk(op.a)) {
+    if (!semRegOk(s, op.a)) {
       s.faulted = true;
       return false;
     }

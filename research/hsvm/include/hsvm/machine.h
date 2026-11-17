@@ -104,6 +104,12 @@ public:
   uint64_t faultsDetected() const { return faultsDetected_; }
 
   const std::vector<BitVector> &vTable() const { return v_; }
+  // Read-only views used by the differential harness (V-03). They observe, they
+  // do not change behaviour.
+  uint32_t pcValue() const { return pc_; }
+  // One instruction, for the differential harness: same code path as run().
+  bool stepOnce() { return step(); }
+  const std::vector<uint8_t> &code() const { return code_; }
   const BitMatrix &projection() const { return H_; }
   const HsvmParams &params() const { return p_; }
   uint32_t regCount() const { return regCount_; }
