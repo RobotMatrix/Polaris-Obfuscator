@@ -1,2 +1,10 @@
 exported-binaries/wbaes-challenge/macos/wbaes_max
 exported-binaries/wbaes-challenge/macos/wbaes_clean
+polaris-secure-sdk/build/
+src/.cache/
+src/build-vm/
+.hermes/
+.omo/
+.vm-test/
+.vscode/
+*.ipa
