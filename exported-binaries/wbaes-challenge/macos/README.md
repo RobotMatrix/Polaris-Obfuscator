@@ -21,6 +21,50 @@
 | `wbaes_dl4_clean` | `-O2`，异构表 + 每表内部编码 + 掩码 | 有 | `755e…`（**脚本提取失败**） | `abe296ee…` |
 | `wbaes_dl4_max` | `-O2` + 8 pass，同上 | 有 | `755e…`（**脚本提取失败**） | `abe296ee…` |
 
+| `wbaes_vm_clean` | `-O2`，dl4 全部 + **HSV 字节码算每轮表偏移** | 有 | `07d9…`（未公开） | `29d00ce8…` |
+| `wbaes_vm_max` | `-O2` + 8 pass，同上 | 有 | `07d9…`（未公开） | `29d00ce8…` |
+
+**`*_vm` 是含 VM 的一代。** 与 dl4 同一套表（异构族 + lane 内部编码 + 掩码 + 封印 + DFA 双算），
+差别在热路径上多了一段真在跑的 HSV 字节码（ISA v2，`Tld`）：
+
+- 字节码部分：**每轮、每个状态字节的表偏移**。程序 43 条指令 / 344 字节，16 寄存器、
+  4 KiB 内存；用 `Tld` 从表尾调度块（偏移 32/36、40/44、48、52、56）读出
+  `base / round_stride / col_stride / lane_stride / pair_stride`，算出
+  `base + round*stride + col*col_stride + lane_stride(fam,k)`，`St` 回 VM 内存并返回 `r0`。
+  C++ 侧 `hy_mc_round` 的每个表地址都取自这个返回值。
+- **不是**字节码的部分：69 MB 表数据本身（`Tld` 只读，ISA 没有"写宿主内存"的指令），
+  以及配对表（`hy_pair_map`）的地址。
+- 编译器只对 `wbaes_vm.cpp` 加 `-mllvm -passes=hsvm`，把 `@hsvm_bytecode` 降低成
+  `@hsvm_entry` 的原生代码；其余 TU 保持 8 pass。产物里因此有 4 个符号：
+
+  ```
+  nm wbaes_vm_clean | grep hsvm
+  _hsvm_bytecode  _hsvm_entry  _hsvm_table  _hsvm_table_len
+  otool -s __DATA __hsvm wbaes_vm_clean    # 43 条 8 字节指令，6 条 0x10 = tld
+  ```
+  `_hsvm_entry` 内部没有任何间接跳转（`br x*` 计数 0）—— lowering 后是直接分支，
+  不是解释器。`strip -S` 后大小 69,798,704 / 69,815,232 B（比 dl4 多 400 B）。
+- **实测成本**（`bench_wbaes 3000`，同一张表，关/开 VM 两档）：
+
+  ```
+  关闭 VM：加密 4.11 µs/块   解密 4.83 µs/块
+  开启 VM：加密 10.56 µs/块  解密 11.33 µs/块      (×2.6 / ×2.3)
+  ```
+  原因是每个块要 288 次 `hsvm_entry`（16 偏移 × 9 轮 × 2 方向），每次 40.5 ns，
+  其中大部分是 pass 每次调用清零 4 KiB VM 内存。**这一代比 dl4 慢一倍多，不是免费的。**
+- 这一代的值在"热路径确实由字节码驱动"，不在"表更难读"：表还是那 69 MB，
+  静态提取路径与 dl4 相同。实测（同一脚本）：
+
+  ```
+  python3 demos/wbaes/extract_key.py wbaes_vm_clean --verify
+    section : __DATA,__hytab fileoff=32784 size=69206080
+    env     : pagesize=16384 ncpu=10 cls=128 -> 0x25c99707
+    round-0 input bijections found: [11216]
+    candidate mask seeds: ['0x19b53639']
+    recovery failed: no candidate key           (29.0 s)
+  ```
+  失败原因与 dl4 相同（每格是 `E[MC·S(x)]`，随机 256 元素双射），不是 VM 的功劳。
+
 `*_dl4` 在 dl3 的异构之上把内部编码补齐：每条 lane 一个随机 256 元素双射，
 每行两张 64K 表把两条 lane 的逆取回来，明文部分和 XOR 后再走 256 项随机边界置换
 （F3 也一样，所以它的轮边界不再是仿射）。表总长仍是 69,206,080 B，调度同上。
@@ -129,6 +173,14 @@ vector-match: PASS
 roundtrip   : PASS
 ```
 
+`*_vm` 两个的预期输出（又换了一把钥）：
+```
+plaintext : 6bc1bee22e409f96e93d7e117393172a
+ciphertext: 29d00ce827afdb377671f07402cda1f5
+vector-match: PASS
+roundtrip   : PASS
+```
+
 `*_dl4` 两个的预期输出（又换了一把钥）：
 ```
 ciphertext: abe296eea2625f251ba57ed0b408272c
@@ -138,7 +190,10 @@ roundtrip   : PASS
 
 ## 结构提示（不做隐瞒，这些是你该自己验证的）
 
-- 表区在 `__DATA,__hytab`，长度 69,206,080 字节（dl3/dl4；dl/dl2 是 69,206,016）：9 加密轮 + 末轮
+- `*_vm` 多一个 `__DATA,__hsvm` 节（344 字节字节码）和 `_hsvm_entry` 函数；
+  调度块尾部（偏移 32..59）多出 7 个布局字（base/round_stride/col_stride/lane_stride/
+  pair_stride），它们和族字节一起被掩码、被封印，读它们的是 VM 而不是 C++。
+- 表区在 `__DATA,__hytab`，长度 69,206,080 字节（dl3/dl4/vm；dl/dl2 是 69,206,016）：9 加密轮 + 末轮
   的配对表 + 9 步逆向路径 + 表尾 64 B 调度块。每轮/每列的表槽大小相同，槽内按族的形状铺表。
 - 每轮的实现族写在表尾调度块（`dir*16 + round`，第 10 个字节是校验），随表一起掩码和封印；
   所以"数表槽形状推轮数"不再成立，但调度块本身在解掩后是明文可读的。

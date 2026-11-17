@@ -38,6 +38,10 @@
 | `demo_wbaes_noasm.cpp` | plain/IR 对照版：无标注无 asm（Polaris IR pass 与 MIR 均不触发） |
 | `aes.h` / `tiny_aes.c` | kokke/tiny-AES-c（MIT），仅用其 KeyExpansion 与 ECB 做交叉验证 |
 | `tiny_aes.o` | tiny_aes.c 预编译产物（可删，重编会重新生成） |
+| `wbaes_vm.cpp` / `wbaes_vm.h` | HSV 字节码程序（每轮 16 个表偏移）+ 宿主侧封装。**只有这个 TU** 用 `-mllvm -passes=hsvm` 编译 |
+| `wbaes_hybrid.h` / `wbaes_hybrid.inc` | 表网络与热路径；`WBAES_HAVE_VM` 打开后表地址取自 VM 返回的偏移 |
+| `bench_wbaes.cpp` | 每块加解密耗时（`#define WBAES_NO_MAIN` + include demo TU，测的就是发布路径） |
+| `tests/test_vm_offsets.cpp` | VM 偏移 vs C 参考实现（含非本机布局字，证明常量没有被烘进字节码） |
 
 ## 2. 白盒原理
 
@@ -736,6 +740,78 @@ DFA 也可攻击解密路径（fault dec 收集 (ct, pt') 差分），现在两�
 
 **验证**: DFA 自检 4/4 + C v6/C++ v6/C v7（10-pass 混淆 + devbind + P3 全部）ALL PASS；
 iOS P3 重编 3 个 UI 二进制完成（装机仍待证书续期）。
+
+### 5.26 HSV 虚拟机进热路径（2026-11-17）
+
+导出的这一代（`wbaes_vm_*`）里有一段**真的在跑**的 HSV 字节码：每轮、每个状态字节的
+表偏移由 VM 算，C++ 侧不再自己推地址。位置与边界见 `WB-DESIGN-V2.md` §5，
+为什么整轮不能搬进 VM 见 `research/hsvm/reports/S5-nativevm/v15-vm-in-wbaes.md`。
+
+**字节码做什么**（`wbaes_vm.cpp`，ISA v2、43 条指令 / 344 字节 / 16 寄存器 / 4 KiB 内存）：
+
+```
+输入  arg = (dir << 8) | (round << 4) | i
+fam   = 调度块字节 [dir*16 + round]                ← Tld（ISA v2 的 0x10）
+off   = base[dir] + round*round_stride[dir] + (i>>2)*col_stride
+        + lane_stride(fam, i&3)
+输出  St 回 VM 内存 4*i，并作为 r0 返回
+```
+
+`base / round_stride / col_stride / lane_stride / pair_stride` 全部由生成端写进表尾调度块
+（偏移 32/36、40/44、48、52、56），VM 用 Tld 逐个读出来——字节码里没有 69 MB 布局的
+任何常量（`tests/test_vm_offsets.cpp` 用非本机布局字验证这一点）。
+所以调度块被改一个字节，偏移就跟着错，而不是"校验发现后照旧用常量"。
+
+**编译接线**：只有 `wbaes_vm.cpp` 走 `-mllvm -passes=hsvm`，pass 把 `@hsvm_bytecode`
+降低成 `@hsvm_entry` 的原生代码（一条指令一个基本块、直接分支，没有 opcode 取指、
+没有解释器分发循环）；demo/bench 两个 TU 保持原来的 pass 列表。
+
+```bash
+W=$PWD
+# 1) 生成表（含调度块布局字），换钥后必做
+clang++ -O2 -std=c++17 -I$W gen_hybrid.cpp -o gen_hybrid && ./gen_hybrid hy_table.bin
+# 2) 字节码 TU：只加 hsvm
+clang++ -O2 -std=c++17 -DWBAES_BAKED -DWBAES_NO_MIR -DWBAES_HAVE_VM -I. -I$W \
+        -mllvm -passes=hsvm -c wbaes_vm.cpp -o wbaes_vm.o
+# 3) demo（clean / max 两档）
+clang++ -O2 -std=c++17 -DWBAES_BAKED -DWBAES_NO_MIR -DWBAES_HAVE_VM -I. -I$W \
+        demo_wbaes.cpp hy_tab.S wbaes_vm.o -o wbaes_vm_clean
+clang++ -O2 -std=c++17 -DWBAES_BAKED -DWBAES_NO_MIR -DWBAES_HAVE_VM -I. -I$W \
+        demo_wbaes.cpp hy_tab.S wbaes_vm.o \
+        -mllvm -passes=alias,gvenc,indcall,indbr,mba,sub,bcf,fla -o wbaes_vm_max
+```
+
+**V1–V6（判据见 `VM-REQUIREMENT.md`）**
+
+| 判据 | 命令 | 结果 |
+|---|---|---|
+| V1 产物里有 VM | `nm wbaes_vm_clean \| grep hsvm` | `_hsvm_bytecode` `_hsvm_entry` `_hsvm_table` `_hsvm_table_len` |
+| | `otool -s __DATA __hsvm wbaes_vm_clean` | 43 条 8 字节指令，首条 `0x01 0x08 …`，其中 6 条是 `0x10`（tld） |
+| | `otool -tv` 里 `_hsvm_entry` 的 `br x*` 计数 | **0**（172 条指令，全是直接 `b`/`cbz`/`cbnz`，无分发循环） |
+| V2 VM 真被执行 | `-DWBAES_VM_SCHEDTEST` | 翻转调度块第 48 字节（列步长低字节；不在族校验里、不在抽样封印的采样点上）→ 密文 `29d00ce8…` → `5d138252…`，恢复后回到 `29d00ce8…` |
+| V3 函数不变 | 旧钥 `755e…` 下混合 + 四个强制族各生成一次 | 五次密文全部 `abe296eea2625f251ba57ed0b408272c` |
+| V4 性能 | `bench_wbaes 3000`，同一张表 | 关 VM `4.11 / 4.83 µs`，开 VM `10.56 / 11.33 µs`（见下） |
+| V5 双算不退化 | `-DWBAES_DFA_SELFTEST` | 三次三份不同垃圾，`vector-match: FAIL` |
+| V6 自检 | `gen_hybrid` 退出码 + demo | 生成端 0（`table-check PASS` / `seal-check PASS`，未走 `return 8/9`）；demo `roundtrip: PASS` |
+
+**V4 的成本，以及它为什么不是免费的**：`hy_mc_round` 的每个表地址都来自 VM，
+一个块（一次加密、一次解密）要 **288 次 `hsvm_entry`**（16 个偏移 × 9 轮 × 2 方向）。
+单次调用 **40.5 ns**（`hsvm_entry` 微基准），其中大部分是 pass 每次调用都要清零
+4 KiB VM 内存（降低后的入口里是 `bzero(…, 0x1000)`）加 16 个寄存器初值，字节码本身只占
+十几纳秒。所以：
+
+```
+加密 4.11 → 10.56 µs（×2.6）   解密 4.83 → 11.33 µs（×2.3）
+```
+
+这就是把偏移计算搬进 VM 的实价：同一个数量级以内、但确实慢一倍多。
+ISA 只允许 `r0` 一个出口（没有"写宿主内存"的 opcode，`Tst` 在
+`v15-vm-in-wbaes.md` 里只是提案），所以 16 个偏移只能 16 次调用；
+若以后加 `Tst` 或让 `hsvm_entry` 返回打包值，这一项可以按倍数降下来。
+
+**边界（不要夸大）**：进 VM 的是"轮控制流 + 表偏移"，不是表数据本身。
+攻击者仍然静态读那 69 MB 表；VM 在这里买到的是"热路径确实由字节码驱动"，
+而反编译读表的人仍会看到 `hy_mc_round` 的表形状分派。
 
 ## 6. 安全性边界（教学版声明）
 

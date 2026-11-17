@@ -221,3 +221,45 @@ vector-match: PASS / roundtrip: PASS
 产物：`exported-binaries/wbaes-challenge/macos/wbaes_dl4_{clean,max}`，`strip -S` 后
 69,798,304 / 69,814,832 B，校验和进 `sha256.txt`。
 
+
+
+## 12. 含 VM 的一代（2026-11-17，实测）
+
+流程比 §11 多一步：先编 `wbaes_vm.o`（唯一带 `-mllvm -passes=hsvm` 的 TU），
+再和其它 TU 一起链接。表生成不变（调度块尾部多了 7 个布局字，见 README §5.26）。
+
+```
+$ python3 rotate_key.py
+key      : 07d90ca930dbca2a46ba6b4cf1bc83cb
+test_pt  : 6bc1bee22e409f96e93d7e117393172a
+test_ct  : 29d00ce827afdb377671f07402cda1f5
+offsets  : K=[27, 60, 31, 25] C=[7, 20, 3, 0] CH=[33, 56, 51, 4]
+
+$ ./gen_hybrid hy_table.bin
+env: pagesize=16384 ncpu=10 cls=128
+seal: 0xd1710798
+table-check PASS / seal-check PASS
+round families enc: F1 F2 F3 F0 F1 F2 F0 F3 F1
+              dec: F0 F1 F2 F0 F3 F1 F2 F0 F3
+wrote hy_table.bin (69206080 bytes)
+
+$ clang++ -O2 -std=c++17 -DWBAES_BAKED -DWBAES_NO_MIR -DWBAES_HAVE_VM -I. -I$W \
+          -mllvm -passes=hsvm -c wbaes_vm.cpp -o wbaes_vm.o
+$ clang++ ... demo_wbaes.cpp hy_tab.S wbaes_vm.o [-mllvm -passes=<8 pass>] -o wbaes_vm_{clean,max}
+
+$ ./wbaes_vm_clean && ./wbaes_vm_max
+ciphertext: 29d00ce827afdb377671f07402cda1f5
+vector-match: PASS / roundtrip: PASS
+```
+
+`openssl enc -aes-128-ecb -K 07d9… -nopad` 独立复核得到同一密文。
+
+产物：`exported-binaries/wbaes-challenge/macos/wbaes_vm_{clean,max}`，`strip -S` 后
+69,798,704 / 69,815,232 B，校验和进 `sha256.txt`。
+成本与 V1–V6 证据在 `README.md` §5.26；`extract_key.py wbaes_vm_clean --verify`
+仍是 `recovery failed: no candidate key`（29.0 s）。
+
+**已知遗留**：`hy_table.bin` 仍是 git 里被跟踪的 69 MB 生成物，且内容停在换钥前
+（69,206,016 B 的 dl3 形状），与当前 `hy_seal.h` 不匹配 —— 用它重编必然
+`vector-match: FAIL`。本轮没有把它从索引里移除（未获授权），换钥请按 §3 在
+临时目录重新生成。
