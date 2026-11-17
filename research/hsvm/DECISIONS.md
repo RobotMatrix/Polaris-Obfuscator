@@ -330,3 +330,14 @@ ARX 族是密钥恢复问题，未测。
 
 **未做**：MIR → LLVM IR lowering、寄存器分配、LLVM pass 接入、重建 Polaris clang。
 切片 1 只保证"能把字节码读成结构化形式且不丢信息"，不保证任何语义等价。
+
+## ADR-022 阶段 5 切片 2 前置：语义规格已固定，lowering 未实现（2026-11-17）
+
+`reports/S5-nativevm/slice2-semantics.md` 把 16 条 opcode 的语义、fault 条件与三个边界
+（内存小端、位移掩码 31、32 位回绕）逐条对应到 `src/machine.cpp` 的 `switch (op)`。
+
+**未实现**：MIR → LLVM IR 的 lowering、寄存器分配、pass 接入、重建 clang。
+切片 2 的验收判据已写明（差分测试 + fault 停机一致 + 三个边界断言），但尚无代码。
+
+诚实标注：本条产出是**规格**，不是实现。阶段 5 的剩余工作量估计 1–2 周工程
+（800–1200 行 lowering + 600–900 行状态布局 + 重编 clang）。
