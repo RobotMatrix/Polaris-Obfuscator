@@ -17,6 +17,17 @@
 
 using namespace hsvm;
 
+// ISA v2: allops contains Tld, so the linear-mode machine needs a host table.
+static const uint8_t *tldTable() {
+  static uint8_t t[64];
+  static bool init = false;
+  if (!init) {
+    for (int i = 0; i < 64; ++i) t[i] = static_cast<uint8_t>(i * 3 + 1);
+    init = true;
+  }
+  return t;
+}
+
 namespace {
 
 HsvmParams mkParams(uint64_t seed) {
@@ -36,6 +47,7 @@ HsvmParams mkParams(uint64_t seed) {
 std::vector<std::string> runTrajectory(uint64_t seed, uint8_t memByte) {
   Machine vm(mkParams(seed), VmMode::Linear);
   vm.loadProgram(programAllOps());
+  vm.setTable(tldTable(), 64);
   vm.fillRegs(0x12345678u);
   std::vector<uint8_t> mem(Machine::kMemBytes, memByte);
   vm.writeMem(0, mem.data(), static_cast<uint32_t>(mem.size()));
@@ -123,6 +135,7 @@ void testInputIndependence() {
 void testStateDump() {
   Machine vm(mkParams(7), VmMode::Linear);
   vm.loadProgram(programAllOps());
+  vm.setTable(tldTable(), 64);
   vm.fillRegs(1);
   vm.setStateDumpEnabled(true);
   vm.run(100);

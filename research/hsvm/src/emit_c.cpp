@@ -107,6 +107,17 @@ std::string emitC(const std::vector<uint8_t> &code, uint32_t regCount,
         out += "  store32(regs[" + std::to_string(o.a) + "] + " +
                std::to_string(o.imm) + "u, regs[" + std::to_string(o.b) + "]);\n";
         break;
+      case IrKind::TableLoad: {
+        emitGuard(out, o.dst);
+        emitGuard(out, o.a);
+        const std::string d = std::to_string(o.dst), a = std::to_string(o.a);
+        out += "  { static unsigned char *tbl = 0; static unsigned long long len = 0;\n";
+        out += "    uint32_t ad = regs[" + a + "] + " + std::to_string(o.imm) + "u;\n";
+        out += "    if (!tbl || ad + 4u > len || (ad & 3u)) { fault(); }\n";
+        out += "    else { regs[" + d + "] = (uint32_t)tbl[ad] | ((uint32_t)tbl[ad+1] << 8) |";
+        out += " ((uint32_t)tbl[ad+2] << 16) | ((uint32_t)tbl[ad+3] << 24); } }\n";
+        break;
+      }
       case IrKind::Jmp: {
         const int64_t target = static_cast<int64_t>(pc) +
                                static_cast<int32_t>(o.imm);

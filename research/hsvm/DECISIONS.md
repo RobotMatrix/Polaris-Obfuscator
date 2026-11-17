@@ -565,5 +565,10 @@ ctest 28 个测试全绿。
 （`Machine::setTable` + `SemState::table/tableBytes`），`hsvm_dump_program` 输出的 C 里带
 `hsvm_table`/`hsvm_table_len`（null/0，故 allops 仍按预期 fault）。
 
-**因此仍限 16 条**，直到 `emitC` 补上 `Tld`（发出有界检查 + `*(uint32_t*)(hsvm_table+addr)`）并给
-线性模式测试接表。这是唯一的剩余项，判据：三处改回 `kNumOpcodes` 后 ctest 仍 28/28。
+**已补齐**：`emitC` 现在发射 `Tld`（函数内静态 `tbl/len`，`!tbl || ad+4>len || ad&3` → `fault()`，
+否则按字节拼装读出 32 位），随机测试与线性模式都接了同一张 64 B 表。
+
+**allops 仍不含 `Tld`，这是决定不是缺口**：allops 在停止指令处结束，而 `Tld` 的地址是数据相关的
+（寄存器被填成 `0xA5A5A5A5` 时立即数落在 64 B 表外，程序中途 fault），塞进 allops 会破坏
+"每条 opcode 一步"这条它存在的语义。`Tld` 的覆盖改由 gate 的 `tld/bounds` 用例承担
+（命中 / 越界 / 未对齐三种结果），这比"塞进 allops 但中途 fault"更强。

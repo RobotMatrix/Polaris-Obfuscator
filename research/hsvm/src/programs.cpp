@@ -96,7 +96,10 @@ const std::vector<uint8_t> &programCopyXor() {
 const std::vector<uint8_t> &programAllOps() {
   static const std::vector<uint8_t> code = [] {
     Asm a;
-    for (uint32_t i = 0; i < 16u; ++i) // widened once emitC and the gate harness carry a host table
+    // allops stops at Halt, and Tld's address is data-dependent: with the register
+    // file filled with a pattern its immediate lands outside the 64-byte table and
+    // the program faults mid-way. Tld is covered by the gate's tld/bounds case.
+    for (uint32_t i = 0; i < 16u; ++i)
       a.op(static_cast<Opcode>(i), static_cast<uint8_t>(i % 16),
            static_cast<uint8_t>((i + 1) % 16), static_cast<uint8_t>((i + 2) % 16),
            i * 0x01010101u);
