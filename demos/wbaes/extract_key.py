@@ -155,12 +155,15 @@ def find_section(path, want_sect="__hytab"):
 
 
 # ---- key recovery ---------------------------------------------------------
-def read_row(table, env, col, side, row):
+def read_row(table, env, col, side, row, reader=None):
     """64K entries of one round-0 (col,side) table, one output row, as B[x*256+y].
 
     The logical index in the table is x | (y << 8), so it is unpacked into the
-    x-major layout the recovery expects.
+    x-major layout the recovery expects. `reader` supplies table bytes, which is
+    how a data-layer-masked build is read: only the offsets the recovery touches
+    ever get unmasked.
     """
+    rd = reader if reader is not None else table.__getitem__
     base = col * COL + (U32 if side else 0)
     tag = hy_tag(0, 0, col, side)
     out = bytearray(N)
@@ -168,7 +171,7 @@ def read_row(table, env, col, side, row):
         p = base + hy_scatter(logical, env, tag) * 4
         x = logical & 255
         y = logical >> 8
-        out[x * 256 + y] = table[p + row]
+        out[x * 256 + y] = rd(p + row)
     return out
 
 
@@ -200,10 +203,92 @@ def find_input_bijection(data):
     return hits
 
 
+def fnv1a16(key):
+    """hy_mask_seed(): the data-layer mask seed is FNV-1a over the 16 key bytes."""
+    h = 2166136261
+    for b in key:
+        h ^= b
+        h = (h * 16777619) & 0xFFFFFFFF
+    return h or 0x9E3779B9
+
+
+def make_reader(table, seed):
+    """XOR-keystream reader for a data-layer-masked table (xorshift32, seed = FNV(key))."""
+    if seed is None:
+        return None
+    st = seed & 0xFFFFFFFF
+    ks = bytearray()
+
+    def get(i):
+        nonlocal st
+        while len(ks) <= i:
+            x = st
+            x ^= (x << 13) & 0xFFFFFFFF
+            x ^= x >> 17
+            x ^= (x << 5) & 0xFFFFFFFF
+            st = x & 0xFFFFFFFF
+            ks.append((st >> 24) & 0xFF)
+        return table[i] ^ ks[i]
+
+    return get
+
+
+def scan_mask_seed_exact(data):
+    """The seed that feeds the unmask xorshift: MOVZ/MOVK pair right before the loop."""
+    try:
+        _, _, _, toff, tsize = find_section_bytes(data, "__text")
+    except SystemExit:
+        return None
+    n = tsize // 4
+    insn = [struct.unpack_from("<I", data, toff + 4 * i)[0] for i in range(n)]
+
+    def fields(v):
+        return v & 0x1F, (v >> 5) & 0x1F, (v >> 10) & 0x3F, (v >> 16) & 0x1F, (v >> 22) & 3
+
+    for i in range(2, n - 2):
+        a, b, c = insn[i], insn[i + 1], insn[i + 2]
+        if any((v & 0x7F000000) != 0x4A000000 for v in (a, b, c)):
+            continue                      # not EOR (shifted register, 32-bit)
+        da, na, ia, ma, sa = fields(a)
+        db, nb, ib, mb, sb = fields(b)
+        dc, nc, ic, mc, sc = fields(c)
+        if not (da == na == ma == db == nb == mb == dc == nc == mc):
+            continue
+        if (sa, ia, sb, ib, sc, ic) != (0, 13, 1, 17, 2, 5):
+            continue                      # x ^= x<<13; x ^= x>>17; x ^= x<<5
+        for j in range(1, 12):
+            if i - j - 1 < 0:
+                break
+            z, k = insn[i - j - 1], insn[i - j]
+            if (z & 0x7F800000) == 0x52800000 and (k & 0x7F800000) == 0x72800000:
+                if (z & 0x1F) == (k & 0x1F) == da and ((z >> 21) & 3) == 0 and ((k >> 21) & 3) == 1:
+                    return (((k >> 5) & 0xFFFF) << 16) | ((z >> 5) & 0xFFFF)
+    return None
+
+
+def scan_mask_seeds(data):
+    """Candidate HY_MASK_SEED constants: adjacent MOVZ/MOVK w-register pairs in __text."""
+    try:
+        _, _, _, toff, tsize = find_section_bytes(data, "__text")
+    except SystemExit:
+        return []
+    n = tsize // 4
+    insn = [struct.unpack_from("<I", data, toff + 4 * i)[0] for i in range(n)]
+    seeds = []
+    for i in range(n - 1):
+        a, b = insn[i], insn[i + 1]
+        if (a & 0x7F800000) == 0x52800000 and (b & 0x7F800000) == 0x72800000:
+            if (a & 0x1F) == (b & 0x1F) and ((a >> 21) & 3) == 0 and ((b >> 21) & 3) == 1:
+                v = (((b >> 5) & 0xFFFF) << 16) | ((a >> 5) & 0xFFFF)
+                if v and v not in seeds:
+                    seeds.append(v)
+    return seeds
+
+
 _MUL = {1: list(range(256)), 2: [gmul(i, 2) for i in range(256)], 3: [gmul(i, 3) for i in range(256)]}
 
 
-def rows_consistent(table, env, key, p0=None):
+def rows_consistent(table, env, key, p0=None, reader=None):
     """All 32 row tables must be conflict-free for the recovered key."""
     for col in range(4):
         for side in range(2):
@@ -217,7 +302,7 @@ def rows_consistent(table, env, key, p0=None):
                 m0, m1 = MC[row][side * 2], MC[row][side * 2 + 1]
                 left = [_MUL[m0][v] for v in a]
                 right = [_MUL[m1][v] for v in b]
-                B = read_row(table, env, col, side, row)
+                B = read_row(table, env, col, side, row, reader)
                 if p0 is not None:
                     B = relabel(B, p0[hy_sr_src(dst0)], p0[hy_sr_src(dst0 + 1)])
                 seen = {}
@@ -232,14 +317,14 @@ def rows_consistent(table, env, key, p0=None):
     return True
 
 
-def recover_key(table, env, p0=None):
+def recover_key(table, env, p0=None, reader=None):
     """Eight round-0 tables -> 16 key bytes; p0 undoes an input bijection if present."""
     key = bytearray(16)
     for col in range(4):
         for side in range(2):
             row = 2 if side == 0 else 0        # MixColumns row whose coefficients are (1,1)
             dst0 = 4 * col + 2 * side
-            B = read_row(table, env, col, side, row)
+            B = read_row(table, env, col, side, row, reader)
             if p0 is not None:
                 B = relabel(B, p0[hy_sr_src(dst0)], p0[hy_sr_src(dst0 + 1)])
             k0, k1 = recover_pair(B)
@@ -361,6 +446,8 @@ def main(argv=None):
     ap.add_argument("--pagesize", type=int, help="target hw.pagesize used for table generation")
     ap.add_argument("--ncpu", type=int)
     ap.add_argument("--cls", type=int, help="target hw.cachelinesize")
+    ap.add_argument("--mask-seed", type=lambda s: int(s, 0),
+                    help="XOR-mask seed for a data-layer build; default: scan __text")
     ap.add_argument("--verify", action="store_true",
                     help="run the binary's self-test and compare with local AES-128")
     args = ap.parse_args(argv)
@@ -380,30 +467,42 @@ def main(argv=None):
     print(f"env     : pagesize={ps} ncpu={nc} cls={cl} -> 0x{env:08x}")
 
     data = open(args.binary, "rb").read()
-    key, p0, mode = None, None, "plain round-0 index"
-    try:
-        key = recover_key(table, env)
-        if not rows_consistent(table, env, key):
-            key = None
-    except SystemExit:
-        key = None
-    if key is None:
-        cands = find_input_bijection(data)
-        print(f"plain recovery failed; round-0 input bijections found: {[c[0] for c in cands]}")
-        for off, cand in cands:
-            try:
-                k = recover_key(table, env, cand)
-            except SystemExit as e:
-                print(f"  bijection @{off}: {e}")
-                continue
-            if rows_consistent(table, env, k, cand):
-                key, p0 = k, cand
-                mode = f"round-0 input bijection @file offset {off}"
-                break
-            print(f"  bijection @{off}: rows inconsistent, skipping")
+    p0cands = find_input_bijection(data)
+    if args.mask_seed is not None:
+        seeds = [args.mask_seed]
+    else:
+        exact = scan_mask_seed_exact(data)
+        seeds = [exact] if exact is not None else scan_mask_seeds(data)
+    if p0cands:
+        print(f"round-0 input bijections found: {[c[0] for c in p0cands]}")
+    if seeds:
+        print(f"candidate mask seeds (MOVZ/MOVK in __text): {[f'0x{s:08x}' for s in seeds]}")
+
+    modes = [(None, None, "plain round-0 index")]
+    for off, cand in p0cands:
+        modes.append((None, cand, f"round-0 input bijection @file offset {off}"))
+    for s in seeds:
+        modes.append((s, None, f"data-layer mask seed 0x{s:08x}"))
+        for off, cand in p0cands:
+            modes.append((s, cand, f"mask seed 0x{s:08x} + input bijection @{off}"))
+
+    key, seed_used, mode = None, None, None
+    for s, cand, label in modes:
+        reader = make_reader(table, s)
+        try:
+            k = recover_key(table, env, cand, reader)
+        except SystemExit:
+            continue
+        if not rows_consistent(table, env, k, cand, reader):
+            continue
+        key, seed_used, mode = k, s, label
+        break
     if key is None:
         raise SystemExit("recovery failed: no candidate key (wrong env, or a hardening we do not undo)")
     print(f"mode    : {mode}")
+    if seed_used is not None:
+        print(f"mask seed vs FNV-1a(key): 0x{fnv1a16(key):08x} -> "
+              f"{'match' if fnv1a16(key) == seed_used else 'MISMATCH'}")
     for col in range(4):
         for side in range(2):
             dst0 = 4 * col + 2 * side

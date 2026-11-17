@@ -75,6 +75,11 @@ extract_key.py wbaes_dl_clean   → recovery failed: no candidate key
 ```
 
 **买到的**：静态读表失效——表区是密文，提取器连第 0 轮表结构都拼不出来。
+**已被攻破（2026-11-17，同一份 extract_key.py 的更新版）**：
+  `extract_key.py wbaes_dl_clean → AES-128 key: 98d272d16d6cc9d6ecd48a26c0ca69d3`
+  因为 `HY_MASK_SEED` 就烘在二进制里，提取器读到它、生成同一串 keystream、解掩后再跑原算法即可。
+  换句话说：**静态掩码只挡住了"没有更新脚本"的那一版攻击者**，成本约等于写 15 行代码。
+
 **买不到的**：解密到私有缓冲后，调试器 dump 内存照样拿到明文表；
 `HY_MASK_SEED` 就在二进制里，写个 15 行解掩器即可绕过静态防护。
 这是抬高静态分析成本，不是防提取。
