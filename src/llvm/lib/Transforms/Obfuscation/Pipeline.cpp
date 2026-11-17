@@ -10,6 +10,7 @@
 #include "llvm/Transforms/Obfuscation/CustomCC.h"
 #include "llvm/Transforms/Obfuscation/Flattening.h"
 #include "llvm/Transforms/Obfuscation/GlobalsEncryption.h"
+#include "llvm/Transforms/Obfuscation/HSVMLowering.h"
 #include "llvm/Transforms/Obfuscation/IndirectBranch.h"
 #include "llvm/Transforms/Obfuscation/IndirectCall.h"
 #include "llvm/Transforms/Obfuscation/LinearMBA.h"
@@ -60,6 +61,9 @@ static void addObfuscationPass(ModulePassManager &MPM, StringRef Name) {
     MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
   } else if (Name == "gvenc") {
     MPM.addPass(GlobalsEncryption());
+  } else if (Name == "hsvm") {
+    // Stage 5 slice: lower @hsvm.bytecode into @hsvm_entry.
+    MPM.addPass(HSVMLowering());
   } else {
     report_fatal_error(Twine("unknown obfuscation pass '") + Name + "'");
   }
@@ -76,7 +80,7 @@ ModulePassManager buildObfuscationPipeline() {
   // sub/mba rewrite data first, then bogus CFG, then flattening, then
   // indirect control transfers. String decryption runs last so it sees the
   // final users of each global.
-  static const char *Order[] = {"ccc",  "sub",     "mba",   "alias", "bcf",
+  static const char *Order[] = {"hsvm", "ccc",  "sub",     "mba",   "alias", "bcf",
                                 "merge", "fla",     "indbr", "indcall",
                                 "gvenc"};
   std::set<std::string> Wanted;

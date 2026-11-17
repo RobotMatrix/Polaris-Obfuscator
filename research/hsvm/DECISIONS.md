@@ -421,3 +421,24 @@ LLVM IR 放在 V-08 的 Polaris pass 里。代价：这里不能取性能口径�
 
 **边界**：`budget`（步数上限）是发射层自定界，不属于 ISA/解释器语义；
 只验证过 arm64 macOS；正常停机只由 sum/memround 两个用例覆盖。
+
+## ADR-028 V-08/V-09 Polaris pass 接入与工具链重建（2026-11-17）
+
+**V-09**：`ninja LLVMObfuscation` → `ninja clang`，clang 版本从 `832aca214` 前进到 `8e3dd9795`（= HEAD）。
+`git log 832aca214..HEAD -- src/llvm` 为 2，证明旧二进制确实落后——我此前"src/llvm 没改所以不用重编"的判断是错的。
+
+**V-08**：新增 `HSVMLowering`（`-passes=hsvm`），契约 `@hsvm_bytecode`（`[N x i8]`，8 字节/指令）
++ `@hsvm_entry`（`i32 ()`）。降低寄存器类 opcode 与停机指令；`Ld/St/Jmp/Brz` 明确拒绝
+（`hsvm: opcode not lowered yet: <Name>` 中止编译），不产出错代码。opcode 值经宏取自 `HSVMOpcodes.def`。
+
+三个接线坑：
+1. 新 pass 必须在 `addObfuscationPass()` 的 if 链**和** `buildObfuscationPipeline()` 的 `Order[]`
+   白名单两处登记，否则 `unknown obfuscation pass`；
+2. C 全局名是 `hsvm_bytecode`（下划线），只查 `hsvm.bytecode` 会让 pass 静默不生效，
+   表现为链接期 `undefined _hsvm_entry`；
+3. `report_fatal_error(std::string)` 重载歧义，用 `Twine`。
+
+**验证**：`scripts/verify_vmp_pass.sh` 退出 0——寄存器程序返回 49（与 oracle 一致），
+含 `ld` 的程序被拒绝且信息明确。
+
+**未做**：访存/分支 lowering、真实程序端到端、把 gate 接进 ctest（V-10）、性能口径。

@@ -13,6 +13,7 @@ add_llvm_component_library(LLVMObfuscation
   Substitution.cpp
   Pipeline.cpp
   MBAMatrix.cpp
+  HSVMLowering.cpp
 
   LINK_COMPONENTS
   Core
