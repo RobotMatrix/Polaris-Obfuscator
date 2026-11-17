@@ -1394,6 +1394,31 @@ int main(int argc, char **argv) {
     bool round = memcmp(rt, wbaes_key::test_pt, 16) == 0;
     printf("vector-match: %s\n", vec ? "PASS" : "FAIL");
     printf("roundtrip   : %s\n", round ? "PASS" : "FAIL");
+#ifdef WBAES_VM_SCHEDTEST
+    // V2: is the VM's output actually used? Flip one byte of the schedule block in
+    // the unmasked table, after the one-time seal pass has run, and encrypt again.
+    // Byte 48 (low byte of the column stride the VM multiplies by the column
+    // index) is covered by neither the schedule checksum nor the sampled seal, so
+    // the only thing that can notice it is the reader using the VM's offsets.
+    {
+        uint8_t a[16], b[16], c[16];
+        wb.encrypt(wbaes_key::test_pt, a);
+        hy_test_flip_sched();
+        wb.encrypt(wbaes_key::test_pt, b);
+        hy_test_flip_sched();
+        wb.encrypt(wbaes_key::test_pt, c);
+        printf("vm-sched intact  : ");
+        for (int i = 0; i < 16; i++) printf("%02x", a[i]);
+        printf(" %s\n", memcmp(a, wbaes_key::test_ct, 16) == 0 ? "PASS" : "FAIL");
+        printf("vm-sched damaged : ");
+        for (int i = 0; i < 16; i++) printf("%02x", b[i]);
+        printf(" %s (vector-match must fail here)\n",
+               memcmp(b, wbaes_key::test_ct, 16) != 0 ? "PASS" : "FAIL");
+        printf("vm-sched restored: ");
+        for (int i = 0; i < 16; i++) printf("%02x", c[i]);
+        printf(" %s\n", memcmp(c, wbaes_key::test_ct, 16) == 0 ? "PASS" : "FAIL");
+    }
+#endif
 #ifdef WBAES_DUMP_TABLES
     if (vec && round && argc > 1 && wb.dump_tables(argv[1]) != 0) return 2;
 #else

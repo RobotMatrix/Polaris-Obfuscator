@@ -200,11 +200,27 @@ inline void hy_store8t(uint8_t *tab, uint32_t off, uint8_t logical, uint32_t env
 // One column of one round, whatever shape the schedule picked for that round.
 // F1/F2/F3 read their lanes through a random bijection per (row,k) and decode
 // two lanes at a time in a 64K table; F0 keeps the Q network it always had.
+//
+// lane16 (optional) is the 16-entry offset table the HSV bytecode produced for
+// this (dir, round): entry 4*col+k is the byte offset of column col's lane-k
+// table, and entry 4*col+0 is that column's slot base. The reader then takes
+// every table address from the VM instead of computing it; the generator passes
+// nullptr and keeps deriving the same numbers itself.
 inline void hy_mc_round(const uint8_t *tab, uint32_t base, int round, int dir, int src_kind,
-                        const uint8_t in[16], uint8_t out[16], uint32_t env) {
+                        const uint8_t in[16], uint8_t out[16], uint32_t env,
+                        const uint32_t *lane16 = nullptr) {
     const int fam = (int)tab[HY_SCHED_OFF + (uint32_t)dir * HY_SCHED_STRIDE + (uint32_t)round];
     for (int col = 0; col < 4; col++) {
-        const uint32_t cb = base + (uint32_t)col * HY_COL;
+        const uint32_t cb = lane16 ? lane16[4 * col] : base + (uint32_t)col * HY_COL;
+        // Lane-table base per input row k. The stride is the family's: F0 reads
+        // lanes 0,1 from the left pair table and lanes 2,3 from the right one;
+        // the other families give every lane its own table HY_W1024 apart (F2's
+        // 256-byte coefficient tables sit at k*4*HY_W256, the same distance).
+        uint32_t lk[4];
+        for (int k = 0; k < 4; k++)
+            lk[k] = lane16 ? lane16[4 * col + k]
+                           : (fam == HY_FAM_PAIR ? ((k >= 2) ? cb + HY_U32 : cb)
+                                                 : cb + (uint32_t)k * HY_W1024);
         uint8_t b[4];
         for (int k = 0; k < 4; k++) b[k] = in[hy_pick(src_kind, k + 4 * col)];
         if (fam == HY_FAM_T32 || fam == HY_FAM_T32K) {
@@ -213,7 +229,7 @@ inline void hy_mc_round(const uint8_t *tab, uint32_t base, int round, int dir, i
             const int rb = (fam == HY_FAM_T32K) ? HY_K_T32K_R : HY_K_T32_R;
             uint32_t w[4];
             for (int k = 0; k < 4; k++)
-                w[k] = hy_load32t(tab, cb + (uint32_t)k * HY_W1024, b[k], env,
+                w[k] = hy_load32t(tab, lk[k], b[k], env,
                                   hy_tag(dir, round, col, kw + k));
             for (int row = 0; row < 4; row++) {
                 const uint8_t a0 = (uint8_t)(w[0] >> (8 * row)), a1 = (uint8_t)(w[1] >> (8 * row));
@@ -232,7 +248,7 @@ inline void hy_mc_round(const uint8_t *tab, uint32_t base, int round, int dir, i
             uint8_t v[4][4];
             for (int k = 0; k < 4; k++)
                 for (int row = 0; row < 4; row++)
-                    v[k][row] = hy_load8t(tab, cb + (uint32_t)(k * 4 + row) * HY_W256, b[k], env,
+                    v[k][row] = hy_load8t(tab, lk[k] + (uint32_t)row * HY_W256, b[k], env,
                                           hy_tag(dir, round, col, HY_K_T8_C + k * 4 + row));
             for (int row = 0; row < 4; row++) {
                 const uint8_t pl = hy_load8(tab, cb + HY_Q_OFF + (uint32_t)(2 * row) * HY_N,
@@ -246,9 +262,9 @@ inline void hy_mc_round(const uint8_t *tab, uint32_t base, int round, int dir, i
                                                hy_tag(dir, round, col, HY_K_T8_R + row));
             }
         } else {
-            uint32_t left = hy_load32(tab, cb, (uint16_t)(b[0] | (b[1] << 8)), env,
+            uint32_t left = hy_load32(tab, lk[0], (uint16_t)(b[0] | (b[1] << 8)), env,
                                       hy_tag(dir, round, col, HY_K_PAIR_L));
-            uint32_t right = hy_load32(tab, cb + HY_U32, (uint16_t)(b[2] | (b[3] << 8)), env,
+            uint32_t right = hy_load32(tab, lk[2], (uint16_t)(b[2] | (b[3] << 8)), env,
                                        hy_tag(dir, round, col, HY_K_PAIR_L + 1));
             for (int row = 0; row < 4; row++) {
                 uint8_t pl = (uint8_t)((left >> (8 * row)) & 255);

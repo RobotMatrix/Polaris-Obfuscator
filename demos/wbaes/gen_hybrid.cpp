@@ -361,6 +361,17 @@ static void fill_round(uint8_t *tab, uint32_t base, int dir, int round, int fam,
 
 // The schedule goes into the table so the reader is driven by data: a family
 // byte per (dir, round) plus a check byte, all sealed and masked with the rest.
+// The tail of the block carries the layout words the HSV bytecode reads through
+// Tld: base and round stride per direction, column stride, and the two lane
+// strides (one table per lane for F1/F2/F3, two pair tables for F0). They sit at
+// 4-byte-aligned offsets because Tld only reads aligned words.
+static void put32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+}
+
 static void write_sched(uint8_t *tab, const int enc[9], const int dec[9]) {
     for (int d = 0; d < 2; d++) {
         const int *s = d == 0 ? enc : dec;
@@ -372,6 +383,14 @@ static void write_sched(uint8_t *tab, const int enc[9], const int dec[9]) {
         }
         g[9] = x;
     }
+    uint8_t *w = tab + HY_SCHED_OFF;
+    put32(w + 32, 0u);                            // encrypt base offset
+    put32(w + 36, HY_OFF_DEC + HY_DEC_ENTRY);     // decrypt base offset
+    put32(w + 40, HY_ROUND);                      // encrypt round stride
+    put32(w + 44, HY_DEC_STEP);                   // decrypt round stride
+    put32(w + 48, HY_COL);                        // column stride
+    put32(w + 52, HY_W1024);                      // lane stride, F1/F2/F3
+    put32(w + 56, HY_U32);                        // pair stride, F0 lanes 2/3
 }
 
 static void fill_pairs(uint8_t *tab, uint32_t base, int dir, int round, int wiring,
@@ -388,10 +407,16 @@ static void fill_pairs(uint8_t *tab, uint32_t base, int dir, int round, int wiri
     }
 }
 
+// --fam N forces every round in both directions to family N (0..3). Every family
+// computes the same function, so the ciphertext must not change: that is what the
+// four forced builds verify. Without it the mixed schedule above is used.
+static int g_force_fam = -1;
+
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <out.bin> [--pagesize N] [--ncpu N] [--cls N]\n"
-                        "  缺省读本机 sysctl; 交叉生成时显式给目标设备参数 (iOS: 16384/<ncpu>/<cls>)\n", argv[0]);
+        fprintf(stderr, "usage: %s <out.bin> [--pagesize N] [--ncpu N] [--cls N] [--fam N]\n"
+                        "  缺省读本机 sysctl; 交叉生成时显式给目标设备参数 (iOS: 16384/<ncpu>/<cls>)\n"
+                        "  --fam 0..3: 九轮全部使用同一实现族 (用于密文一致性对照)\n", argv[0]);
         return 2;
     }
     // hw.cachelinesize 是 8 字节 sysctl, int 缓冲会 ENOMEM → 读成 0 (与运行时一致地修)
@@ -408,6 +433,11 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--pagesize")) { pagesize = strtoull(argv[++i], nullptr, 0); ov_ps = true; }
         else if (!strcmp(argv[i], "--ncpu")) { ncpu = strtoull(argv[++i], nullptr, 0); ov_nc = true; }
         else if (!strcmp(argv[i], "--cls")) { cls = strtoull(argv[++i], nullptr, 0); ov_cl = true; }
+        else if (!strcmp(argv[i], "--fam")) {
+            const long v = strtol(argv[++i], nullptr, 0);
+            if (v < 0 || v > 3) { fprintf(stderr, "bad --fam (0..3)\n"); return 2; }
+            g_force_fam = (int)v;
+        }
     }
     if ((ov_ps && pagesize == 0) || (ov_nc && ncpu == 0) || (ov_cl && cls == 0)) {
         fprintf(stderr, "bad env value\n");
@@ -452,8 +482,15 @@ static int generate(const char *out_path, uint32_t env, uint8_t key[16]) {
     uint8_t P0[16][256], P0i[16][256];
     for (int i = 0; i < 16; i++) rand_perm(P0[i], P0i[i]);
 
+    // The schedule: mixed by default, one family everywhere under --fam.
+    int sched_enc[9], sched_dec[9];
+    for (int i = 0; i < 9; i++) {
+        sched_enc[i] = g_force_fam >= 0 ? g_force_fam : SCHED_ENC[i];
+        sched_dec[i] = g_force_fam >= 0 ? g_force_fam : SCHED_DEC[i];
+    }
+
     std::vector<uint8_t> tab(HY_TOTAL, 0);
-    write_sched(tab.data(), SCHED_ENC, SCHED_DEC);
+    write_sched(tab.data(), sched_enc, sched_dec);
 
     for (int r = 0; r < 9; r++) {
         uint8_t rk_next[16];
@@ -465,7 +502,7 @@ static int generate(const char *out_path, uint32_t env, uint8_t key[16]) {
         sp.outp = (const uint8_t (*)[256])P[r];
         sp.src_kind = 1;
         sp.sbox_fwd = 1;
-        fill_round(tab.data(), hy_enc_col(r, 0), 0, r, SCHED_ENC[r], sp, env);
+        fill_round(tab.data(), hy_enc_col(r, 0), 0, r, sched_enc[r], sp, env);
         burn16(rk_next);                   // 本轮密钥随表写入完成即焚
     }
     {
@@ -538,7 +575,7 @@ static int generate(const char *out_path, uint32_t env, uint8_t key[16]) {
         sp.outp = (const uint8_t (*)[256])Mperm[step];
         sp.src_kind = 0;
         sp.sbox_fwd = 0;
-        fill_round(tab.data(), hy_dec_mc(step), 1, step, SCHED_DEC[step], sp, env);
+        fill_round(tab.data(), hy_dec_mc(step), 1, step, sched_dec[step], sp, env);
         burn16(folded);                    // 折叠常量随本轮表写入完成即焚
 
         uint8_t outv[16][256];
@@ -680,9 +717,9 @@ static int generate(const char *out_path, uint32_t env, uint8_t key[16]) {
     {
         static const char *nm[4] = {"F0", "F1", "F2", "F3"};
         printf("round families enc:");
-        for (int r = 0; r < 9; r++) printf(" %s", nm[SCHED_ENC[r]]);
+        for (int r = 0; r < 9; r++) printf(" %s", nm[sched_enc[r]]);
         printf("\n              dec:");
-        for (int r = 0; r < 9; r++) printf(" %s", nm[SCHED_DEC[r]]);
+        for (int r = 0; r < 9; r++) printf(" %s", nm[sched_dec[r]]);
         printf("\n");
     }
     printf("wrote %s (%u bytes)\n", out_path, HY_TOTAL);
