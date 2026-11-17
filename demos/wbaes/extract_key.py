@@ -16,6 +16,14 @@ constant encoded byte per group; the reference-pair identity
 turns that into a 256x256 search, and a second pair (0,2) removes the residual
 k0 ambiguity.
 
+dl3 added byte-indexed families (F1/F2/F3) and a round-family schedule at the end
+of the table; the round-0 attack became a direct read: the table row held
+MC[row][k]*S(x^k) verbatim, so MixColumns' coefficient 1 handed over the key byte
+after one inverse S-box (recover_key_tbox). dl4 keeps every lane but puts a random
+256-element bijection on it and its inverse inside a 64K decode table, so no
+single row is MC[row][k]*S(x^k) any more and this tool's one-table test has
+nothing to recognise; it stops with a message saying so instead of guessing.
+
     extract_key.py <baked-binary>                 # print the key
     extract_key.py <baked-binary> --verify        # also re-run the binary's
                                                   # self-test and compare with
@@ -263,7 +271,9 @@ def recover_key_tbox(get, env, p0, fam):
                     if rows[row][p0[src][a]] != gmul(m, SBOX[a ^ key[src]]):
                         raise SystemExit(
                             f"t-box mismatch col {col} k {k} row {row} x {a:02x}: "
-                            "table is not MC[row][k]*S(x^k)")
+                            "table is not MC[row][k]*S(x^k) - a dl4 build re-encodes "
+                            "every lane through its own random bijection, and this "
+                            "one-table test cannot undo that")
     return bytes(key)
 
 

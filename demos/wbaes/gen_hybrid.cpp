@@ -191,43 +191,23 @@ static int table_has_key(const uint8_t *buf, size_t n, const uint8_t k[16]) {
 // ---- per-round family schedule -------------------------------------------------
 // Which shape each round uses. Every family computes the identical function, so
 // the ciphertext cannot depend on this array - that is exactly what the checks
-// below verify. HY_FAM_T32K folds the key word and the output offset into one
-// table's 32-bit output and therefore has no recode step; the only place a
-// random output bijection could sit is gone, so those rounds get an affine one
-// (a*x^b), which commutes with the XOR of the four lookups. Every other family
-// keeps a full random bijection on both sides, because there the encoding is
-// applied by a table entry rather than by an arithmetic identity.
+// below verify. Within one column every family but F0 hides its table values the
+// same way: each lane of a lookup is a random 256-element bijection of
+// MC[row][k]*S(x), the four lanes of a row are decoded two at a time in a 64K
+// table (the inverse of those bijections), the two plain partial sums are XORed,
+// and a 256-entry table applies the random boundary permutation. So no table row
+// holds S(x^k) or MC(S(x^k)) verbatim, and no boundary is affine.
 static const int SCHED_ENC[9] = {HY_FAM_T32, HY_FAM_T8, HY_FAM_T32K, HY_FAM_PAIR, HY_FAM_T32,
                                  HY_FAM_T8, HY_FAM_PAIR, HY_FAM_T32K, HY_FAM_T32};
 static const int SCHED_DEC[9] = {HY_FAM_PAIR, HY_FAM_T32, HY_FAM_T8, HY_FAM_PAIR, HY_FAM_T32K,
                                  HY_FAM_T32, HY_FAM_T8, HY_FAM_PAIR, HY_FAM_T32K};
-
-static void rand_affine(uint8_t a[16], uint8_t b[16]) {
-    for (int i = 0; i < 16; i++) {
-        uint8_t v;
-        do { v = (uint8_t)rnd32(); } while (!v); // a == 0 would not be a bijection
-        a[i] = v;
-        b[i] = (uint8_t)rnd32();
-    }
-}
-
-static void fill_affine(uint8_t P[16][256], uint8_t Pi[16][256], const uint8_t a[16], const uint8_t b[16]) {
-    for (int i = 0; i < 16; i++)
-        for (int x = 0; x < 256; x++) {
-            uint8_t v = (uint8_t)(gmul(a[i], (uint8_t)x) ^ b[i]);
-            P[i][x] = v;
-            Pi[i][v] = (uint8_t)x;
-        }
-}
 
 // What one round needs to know, independent of which family implements it.
 struct RndSpec {
     const uint8_t (*inp)[256];  // input decoding per source byte; null = identity
     const uint8_t *rk_pre;      // XORed before SubBytes (round 0 only); null = none
     const uint8_t *rk_after;    // constant added after the linear layer
-    const uint8_t (*outp)[256]; // output encoding per destination byte
-    const uint8_t *aff_a;       // HY_FAM_T32K output encoding a*x^b
-    const uint8_t *aff_b;
+    const uint8_t (*outp)[256]; // boundary permutation per destination byte
     int src_kind;
     int sbox_fwd;               // 1: SubBytes then MC; 0: identity then InvMC
 };
@@ -277,66 +257,96 @@ static void fill_col_pair(uint8_t *tab, uint32_t cb, int dir, int round, int col
     burn(Qi, sizeof(Qi));
 }
 
-// FAM_T32 / FAM_T32K: four 32-bit lookups per column, each indexed by one
-// encoded state byte, XORed together. The key is added in the recode table's
-// index (T32) or into one table's output (T32K).
+// One random bijection per (row,k) lane and its inverse. The inverse is
+// materialised inside the 64K decode tables only: a lane value cannot be undone
+// by reading one row of one 256-entry table, which is what made dl3's rows
+// equal MC[row][k]*S(x) and handed over the key byte.
+struct LaneEnc {
+    uint8_t e[4][4][256];
+    uint8_t d[4][4][256];
+};
+
+static void fill_lane_enc(LaneEnc &L) {
+    for (int row = 0; row < 4; row++)
+        for (int k = 0; k < 4; k++) rand_perm(L.e[row][k], L.d[row][k]);
+}
+
+// The tail F1/F2/F3 share: two 64K decode tables per output row (lanes k=0,1
+// and k=2,3), XOR of the two plain partial sums, then the boundary permutation.
+// key_in_quad != 0 folds the column constant into the first decode table, which
+// is how F3 keeps "no key XOR anywhere in the code".
+static void fill_col_dec(uint8_t *tab, uint32_t cb, int dir, int round, int col,
+                         int qb, int rb, uint32_t roff, const RndSpec &sp,
+                         const LaneEnc &L, int key_in_quad, uint32_t env) {
+    for (int row = 0; row < 4; row++) {
+        const int dst = row + 4 * col;
+        for (int p = 0; p < 2; p++) {
+            const uint8_t *d0 = L.d[row][2 * p], *d1 = L.d[row][2 * p + 1];
+            for (int a = 0; a < 256; a++)
+                for (int b = 0; b < 256; b++) {
+                    uint8_t v = (uint8_t)(d0[a] ^ d1[b]);
+                    if (key_in_quad && p == 0) v ^= sp.rk_after[dst];
+                    hy_store8(tab, cb + HY_Q_OFF + (uint32_t)(2 * row + p) * HY_N,
+                              (uint16_t)(a | (b << 8)), env,
+                              hy_tag(dir, round, col, qb + 2 * row + p), v);
+                }
+        }
+        const uint8_t rk = key_in_quad ? 0 : sp.rk_after[dst];
+        for (int x = 0; x < 256; x++)
+            hy_store8t(tab, cb + roff + (uint32_t)row * HY_W256, (uint8_t)x, env,
+                       hy_tag(dir, round, col, rb + row), sp.outp[dst][(uint8_t)(x ^ rk)]);
+    }
+}
+
+// FAM_T32 / FAM_T32K: four 32-bit lookups per column. Each byte of the 32-bit
+// word is one MC contribution already pushed through a random bijection, so the
+// word is not XOR-combined directly; the decode tables below undo the bijections
+// on a pair of lanes at a time. The key sits in the boundary permutation's index
+// (T32) or in the first decode table (T32K).
 static void fill_col_t32(uint8_t *tab, uint32_t cb, int dir, int round, int col, int fam,
                          const RndSpec &sp, uint32_t env) {
     const uint8_t (*M)[4] = sp.sbox_fwd ? MC : IMC;
-    const int kd = 0; // designated source carrying the column constant in T32K
+    LaneEnc L;
+    fill_lane_enc(L);
     for (int k = 0; k < 4; k++) {
         const int src = hy_pick(sp.src_kind, k + 4 * col);
         for (int enc = 0; enc < 256; enc++) {
             const uint8_t sb = round_byte(sp, src, (uint8_t)enc);
             uint32_t word = 0;
-            for (int row = 0; row < 4; row++) {
-                const int dst = row + 4 * col;
-                uint8_t v = gmul(sb, M[row][k]);
-                if (fam == HY_FAM_T32K) {
-                    // a*(c ^ rk) ^ b == a*c ^ (a*rk ^ b): GF multiply distributes
-                    // over XOR, so the affine output encoding survives the XOR of
-                    // the four tables and the constant term rides in one of them.
-                    v = gmul(sp.aff_a[dst], v);
-                    if (k == kd) v ^= (uint8_t)(gmul(sp.aff_a[dst], sp.rk_after[dst]) ^ sp.aff_b[dst]);
-                }
-                word |= (uint32_t)v << (8 * row);
-            }
+            for (int row = 0; row < 4; row++)
+                word |= (uint32_t)L.e[row][k][gmul(sb, M[row][k])] << (8 * row);
             hy_store32t(tab, cb + (uint32_t)k * HY_W1024, (uint8_t)enc, env,
                         hy_tag(dir, round, col,
                                (fam == HY_FAM_T32K ? HY_K_T32K_W : HY_K_T32_W) + k),
                         word);
         }
     }
-    if (fam == HY_FAM_T32K) return;
-    for (int row = 0; row < 4; row++) {
-        const int dst = row + 4 * col;
-        for (int x = 0; x < 256; x++)
-            hy_store8t(tab, cb + HY_T32_R_OFF + (uint32_t)row * HY_W256, (uint8_t)x, env,
-                       hy_tag(dir, round, col, HY_K_T32_R + row),
-                       sp.outp[dst][(uint8_t)(x ^ sp.rk_after[dst])]);
-    }
+    if (fam == HY_FAM_T32K)
+        fill_col_dec(tab, cb, dir, round, col, HY_K_T32K_Q, HY_K_T32K_R, HY_T32_R_OFF, sp,
+                     L, 1, env);
+    else
+        fill_col_dec(tab, cb, dir, round, col, HY_K_T32_Q, HY_K_T32_R, HY_T32_R_OFF, sp,
+                     L, 0, env);
+    burn(&L, sizeof(L));
 }
 
-// FAM_T8: 16 coefficient byte tables per column, XOR-accumulated per output
-// byte. No 32-bit load anywhere in this shape.
+// FAM_T8: 16 coefficient byte tables per column, one per (k,row), plus the same
+// decode/boundary tail. No 32-bit load anywhere in this shape.
 static void fill_col_t8(uint8_t *tab, uint32_t cb, int dir, int round, int col,
                         const RndSpec &sp, uint32_t env) {
     const uint8_t (*M)[4] = sp.sbox_fwd ? MC : IMC;
+    LaneEnc L;
+    fill_lane_enc(L);
     for (int k = 0; k < 4; k++) {
         const int src = hy_pick(sp.src_kind, k + 4 * col);
         for (int row = 0; row < 4; row++)
             for (int enc = 0; enc < 256; enc++)
                 hy_store8t(tab, cb + (uint32_t)(k * 4 + row) * HY_W256, (uint8_t)enc, env,
                            hy_tag(dir, round, col, HY_K_T8_C + k * 4 + row),
-                           gmul(round_byte(sp, src, (uint8_t)enc), M[row][k]));
+                           L.e[row][k][gmul(round_byte(sp, src, (uint8_t)enc), M[row][k])]);
     }
-    for (int row = 0; row < 4; row++) {
-        const int dst = row + 4 * col;
-        for (int x = 0; x < 256; x++)
-            hy_store8t(tab, cb + HY_T8_R_OFF + (uint32_t)row * HY_W256, (uint8_t)x, env,
-                       hy_tag(dir, round, col, HY_K_T8_R + row),
-                       sp.outp[dst][(uint8_t)(x ^ sp.rk_after[dst])]);
-    }
+    fill_col_dec(tab, cb, dir, round, col, HY_K_T8_Q, HY_K_T8_R, HY_T8_R_OFF, sp, L, 0, env);
+    burn(&L, sizeof(L));
 }
 
 static void fill_round(uint8_t *tab, uint32_t base, int dir, int round, int fam,
@@ -432,15 +442,8 @@ static int generate(const char *out_path, uint32_t env, uint8_t key[16]) {
     }
 
     uint8_t P[9][16][256], Pi[9][16][256];
-    uint8_t Pa[9][16], Pb[9][16];
-    for (int r = 0; r < 9; r++) {
-        if (SCHED_ENC[r] == HY_FAM_T32K) {
-            rand_affine(Pa[r], Pb[r]);
-            fill_affine(P[r], Pi[r], Pa[r], Pb[r]);
-        } else {
-            for (int i = 0; i < 16; i++) rand_perm(P[r][i], Pi[r][i]);
-        }
-    }
+    for (int r = 0; r < 9; r++)
+        for (int i = 0; i < 16; i++) rand_perm(P[r][i], Pi[r][i]);
 
     // Round 0 previously took the plaintext byte straight as the table index, so
     // each entry equalled S(pt ^ k0) and a table reader could recover the key.
@@ -460,8 +463,6 @@ static int generate(const char *out_path, uint32_t env, uint8_t key[16]) {
         sp.rk_pre = (r == 0) ? key : nullptr;
         sp.rk_after = rk_next;
         sp.outp = (const uint8_t (*)[256])P[r];
-        sp.aff_a = Pa[r];
-        sp.aff_b = Pb[r];
         sp.src_kind = 1;
         sp.sbox_fwd = 1;
         fill_round(tab.data(), hy_enc_col(r, 0), 0, r, SCHED_ENC[r], sp, env);
@@ -484,8 +485,6 @@ static int generate(const char *out_path, uint32_t env, uint8_t key[16]) {
         // P/Pi 编码链最后消费点已过, 全部焚毁 (~73KB)
         burn(P, sizeof(P));
         burn(Pi, sizeof(Pi));
-        burn(Pa, sizeof(Pa));
-        burn(Pb, sizeof(Pb));
     }
 
     auto table_enc = [&](const uint8_t in[16], uint8_t out[16]) {
@@ -505,15 +504,8 @@ static int generate(const char *out_path, uint32_t env, uint8_t key[16]) {
     for (int r = 0; r < 10; r++)
         for (int i = 0; i < 16; i++) rand_perm(D[r][i], Di[r][i]);
     uint8_t Mperm[9][16][256], Minv[9][16][256];
-    uint8_t Ma[9][16], Mb[9][16];
-    for (int r = 0; r < 9; r++) {
-        if (SCHED_DEC[r] == HY_FAM_T32K) {
-            rand_affine(Ma[r], Mb[r]);
-            fill_affine(Mperm[r], Minv[r], Ma[r], Mb[r]);
-        } else {
-            for (int i = 0; i < 16; i++) rand_perm(Mperm[r][i], Minv[r][i]);
-        }
-    }
+    for (int r = 0; r < 9; r++)
+        for (int i = 0; i < 16; i++) rand_perm(Mperm[r][i], Minv[r][i]);
 
     {
         uint8_t rk10[16];
@@ -544,8 +536,6 @@ static int generate(const char *out_path, uint32_t env, uint8_t key[16]) {
         sp.rk_pre = nullptr;
         sp.rk_after = folded;
         sp.outp = (const uint8_t (*)[256])Mperm[step];
-        sp.aff_a = Ma[step];
-        sp.aff_b = Mb[step];
         sp.src_kind = 0;
         sp.sbox_fwd = 0;
         fill_round(tab.data(), hy_dec_mc(step), 1, step, SCHED_DEC[step], sp, env);
@@ -574,8 +564,6 @@ static int generate(const char *out_path, uint32_t env, uint8_t key[16]) {
         burn(Di, sizeof(Di));
         burn(Mperm, sizeof(Mperm));
         burn(Minv, sizeof(Minv));
-        burn(Ma, sizeof(Ma));
-        burn(Mb, sizeof(Mb));
     }
 
     auto table_dec = [&](const uint8_t in[16], uint8_t out[16]) {
