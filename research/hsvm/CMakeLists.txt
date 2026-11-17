@@ -110,6 +110,10 @@ add_executable(test_psi tests/test_psi.cpp)
 target_link_libraries(test_psi PRIVATE hsvm_core)
 target_compile_options(test_psi PRIVATE -Wall -Wextra)
 
+add_executable(test_mir tests/test_mir.cpp src/mir.cpp)
+target_link_libraries(test_mir PRIVATE hsvm_core)
+add_test(NAME mir COMMAND test_mir)
+
 add_executable(test_modenc tests/test_modenc.cpp)
 target_link_libraries(test_modenc PRIVATE hsvm_core)
 target_compile_options(test_modenc PRIVATE -Wall -Wextra)

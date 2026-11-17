@@ -49,7 +49,8 @@ reports/        每次运行的证据包（run.json + summary.md）
 - 阶段 4B C7 多样性：完成实验，**负结果**（16 实例均 16 次查询被恢复，多样性不加成本）
 - 阶段 5 前置 DFA 实测：**失败**（9 条密文取钥，外部报告已本地复核）
 - C6 抗 DFA 第一步：转移冗余比对已实现（`setFaultCheckEnabled`，2× 代价）
-- M3 起（LLVM pass、C2、Native VM）：未开始
+- 阶段 5 切片 1：bytecode→MirOp 无损提升已实现（ctest `mir`），lowering 未开始
+- M3 起（LLVM pass、C2）：未开始
 - 证据：`reports/M0/`、`reports/M1/`、`reports/G0/`、`reports/G1-model/`、
   `reports/G1-model-addendum/`
 - 决策：`DECISIONS.md`（ADR-006 判定与选项、ADR-007 方案 B 结果与建议）
