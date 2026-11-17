@@ -92,6 +92,7 @@ bool Machine::loadProgram(const std::vector<uint8_t> &code, std::string *err) {
   }
   code_ = code;
   pristine_ = code;
+  shadow_ = mem_;
   pc_ = 0;
   t_ = 0;
   halted_ = false;
@@ -128,6 +129,25 @@ void Machine::fillRegs(uint32_t value) {
 void Machine::writeMem(uint32_t addr, const void *src, uint32_t len) {
   assert(addr + len <= kMemBytes && "writeMem out of range");
   std::memcpy(mem_.data() + addr, src, len);
+  if (shadow_.size() == mem_.size())
+    std::memcpy(shadow_.data() + addr, src, len);
+}
+
+void Machine::pokeMemory(uint32_t addr, uint8_t value) {
+  if (addr < mem_.size())
+    mem_[addr] = value; // shadow deliberately untouched
+}
+
+void Machine::verifyMemoryPlane() {
+  if (!monitor_)
+    return;
+  auto fnv = [](const std::vector<uint8_t> &b) {
+    uint32_t h = 0x811c9dc5u;
+    for (uint8_t c : b)
+      h = (h ^ c) * 0x01000193u;
+    return static_cast<uint64_t>(h);
+  };
+  monitor_->checkpoint(EvidencePlane::Memory, fnv(mem_), fnv(shadow_));
 }
 
 uint32_t Machine::readMem32(uint32_t addr) const {

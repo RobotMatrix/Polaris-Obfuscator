@@ -37,7 +37,10 @@
 - 篡改后 `poisonMask() != 0`。
 
 这让 C6 从"单元层组件"变成"接在真实执行轨迹上"的检查层。
-仍未做：Memory / Timing 两个平面的真实埋点（目前只有 ControlFlow 有数据源）。
+Memory 平面同样接入：`writeMem` 同步维护 shadow 副本，`verifyMemoryPlane()`
+比较 `mem_` 与 `shadow_` 的 FNV 摘要；`pokeMemory()` 模拟绕过 VM 直写缓冲区。
+测试证明：经 `writeMem` 写入保持 Green，直写一个字节即 Red。
+仍未做：Timing 平面（需要外部时钟采样，进程内自测会不稳定）。
 
 ## 边界（必须一起读）
 

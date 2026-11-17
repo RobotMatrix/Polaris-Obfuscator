@@ -135,6 +135,23 @@ void testMachineIntegration() {
   CHECK(m2.state() != RiskState::Green,
         "patching an instruction trips the control-flow plane");
   CHECK(m2.poisonMask() != 0, "tampered run yields a poison mask");
+
+  // Memory plane: the shadow copy follows writeMem, so a direct poke shows up.
+  Machine mem(p, VmMode::Linear);
+  CHECK(mem.loadProgram(programAllOps()), "allops loads (memory test)");
+  mem.fillRegs(0x12345678);
+  const uint8_t payload[4] = {0xDE, 0xAD, 0xBE, 0xEF};
+  mem.writeMem(0x40, payload, 4);
+  IntegrityMonitor m3(0xB2);
+  mem.setIntegrityMonitor(&m3);
+  mem.verifyMemoryPlane();
+  CHECK(m3.state() == RiskState::Green,
+        "memory written through writeMem keeps the plane green");
+
+  mem.pokeMemory(0x41, 0x00); // bypasses writeMem
+  mem.verifyMemoryPlane();
+  CHECK(m3.state() == RiskState::Red,
+        "a direct memory poke trips the memory plane");
 }
 
 } // namespace

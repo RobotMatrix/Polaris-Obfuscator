@@ -87,6 +87,12 @@ public:
   // Debug/test hook: patch one byte of the live program image, i.e. simulate an
   // attacker who owns the process and rewrites code in place.
   bool patchInstructionByte(uint32_t slot, uint32_t byteOff, uint8_t value);
+  // Test hook: write memory without going through writeMem, i.e. simulate an
+  // attacker who poked the buffer directly instead of following the VM.
+  void pokeMemory(uint32_t addr, uint8_t value);
+  // Memory plane: compare the live buffer against the shadow kept in sync by
+  // writeMem. A mismatch means somebody wrote outside the VM's own path.
+  void verifyMemoryPlane();
 
   const std::vector<BitVector> &vTable() const { return v_; }
   const BitMatrix &projection() const { return H_; }
@@ -113,6 +119,7 @@ private:
   std::vector<uint8_t> mem_;
   std::vector<uint8_t> code_;
   std::vector<uint8_t> pristine_; // load-time image, used by the C6 hook
+  std::vector<uint8_t> shadow_;  // memory as the VM last wrote it (C6 memory plane)
   IntegrityMonitor *monitor_ = nullptr;
   uint32_t regCount_ = 0;
   uint32_t pc_ = 0;
