@@ -462,3 +462,20 @@ LLVM IR 放在 V-08 的 Polaris pass 里。代价：这里不能取性能口径�
 
 **未做**：pass 侧无步数预算概念（只有 oracle 会截断）；性能口径未测；
 `crc`/`copy_xor` 目前只覆盖故障路径，未覆盖正常跑完。
+
+## ADR-030 阶段 5 收口：功能等价已证，性能与安全主张明确留空（2026-11-17）
+
+阶段 5 以 V-01…V-11 交付完毕：字节码 → `lift` → `lowerOp` → `emitC`
+→ `HSVMLowering`（`-passes=hsvm`），四个真实程序在原生路径上的结局与解释器/oracle 完全一致，
+含故障停机点与 ISA 外 opcode 的拒绝。证据：ctest 25 个（`mir` 103、`semantics` 38、`diff` 13、
+`lower_regs` 15、`lower_full` 19、`emit_c` 18、`vmp_gate` 6 用例）。
+
+**明确留空的三项**（写进 `reports/S5-nativevm/summary.md`，不是遗漏）：
+1. 不构成安全主张——§10.1 第 1 条已触发（`R_plain` 最小 5.62），C1/C2 路线已终止；
+2. 没有性能数字——初始寄存器是编译期常量，`-O1` 会折叠整段程序；且 `hsvm_entry` 是无参 `i32 ()`，
+   无运行时输入，构不出不可折叠负载。要测性能必须先改契约为 `i32 (i32)` 并沿用既有口径（cap 3.0，不换尺子）；
+3. 只覆盖 arm64 macOS，且 `crc`/`copy_xor` 仅落在故障路径。
+
+**教训**：把"能编译"当成"已接入"会连续踩坑——`Order[]` 白名单、`hsvm_bytecode` 下划线命名、
+`report_fatal_error` 重载歧义三处都表现为"pass 不生效"，而不是报错。gate 脚本的价值就在于
+把这类静默失败变回红。
