@@ -130,6 +130,10 @@ add_executable(test_lower_full tests/test_lower_full.cpp src/lower.cpp src/mir.c
 target_link_libraries(test_lower_full PRIVATE hsvm_core)
 add_test(NAME lower_full COMMAND test_lower_full)
 
+add_executable(test_emit tests/test_emit.cpp src/emit_c.cpp src/lower.cpp src/mir.cpp)
+target_link_libraries(test_emit PRIVATE hsvm_core)
+add_test(NAME emit_c COMMAND test_emit)
+
 add_executable(test_modenc tests/test_modenc.cpp)
 target_link_libraries(test_modenc PRIVATE hsvm_core)
 target_compile_options(test_modenc PRIVATE -Wall -Wextra)
