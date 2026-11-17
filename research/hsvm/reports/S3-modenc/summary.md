@@ -36,9 +36,28 @@
 - 模块编码的正确性（组合后仍是同一函数）由 `test_modenc` 覆盖；这属于 §6.3 的必要条件，
   不等于证明模块化在编译器里能安全落地。
 
+## §6.2 代数正规化：仿射编码的可识别性（本轮补上）
+
+`tools/hsvm_ddt.cpp` 检验：仿射 module 编码是否把底层函数的差分结构藏住。
+
+| 包装方式 | 差分分布表的行多重集是否不变 |
+|---|---|
+| 仿射 `A2∘ψ∘A1`（随机可逆 8×8 + 常量） | **不变** |
+| 随机逐 lane 双射 | 变 |
+
+原因：仿射映射对差分是线性的，`DDT(F)` 的每一行只是 `DDT(ψ)` 的行/列置换，
+所以**攻击者仅凭一张表就能识别出这是仿射共轭，并据此对齐模块结构**。
+这正是 §6.2 所依赖的前提：仿射模块编码可被整体归一化。
+
+**做到哪一步**：可识别性（identification）已证明并可复现。
+**没做到哪一步**：真正解出 `A1`、`A2` 并还原 `ψ` 的归一化（normalization）未实现——
+那是仿射等价求解（Biryukov–Shamir / Beierle–Leander 一类算法），工作量与风险都远大于本轮。
+所以文档 §6.2 的结论现在是"必要条件已证、充分性未证"。
+
 ## 复现
 
 ```bash
-cd research/hsvm && ./build/hsvm_normalize --out reports/S3-modenc/normalization.json
+cd research/hsvm && ./build/hsvm_ddt --out reports/S3-modenc/ddt.json   # exit 0 = 仿射可识别
+./build/hsvm_normalize --out reports/S3-modenc/normalization.json
 ./build/test_modenc    # == modenc: 8 pass, 0 fail ==
 ```

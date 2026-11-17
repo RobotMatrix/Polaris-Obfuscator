@@ -61,6 +61,10 @@ add_executable(hsvm_gamma tools/hsvm_gamma.cpp)
 target_link_libraries(hsvm_gamma PRIVATE hsvm_core)
 target_compile_options(hsvm_gamma PRIVATE -Wall -Wextra)
 
+add_executable(hsvm_ddt tools/hsvm_ddt.cpp)
+target_link_libraries(hsvm_ddt PRIVATE hsvm_core)
+target_compile_options(hsvm_ddt PRIVATE -Wall -Wextra)
+
 add_executable(hsvm_games tools/hsvm_games.cpp)
 target_link_libraries(hsvm_games PRIVATE hsvm_core)
 target_compile_options(hsvm_games PRIVATE -Wall -Wextra)
@@ -123,6 +127,7 @@ add_test(NAME linear COMMAND test_linear)
 add_test(NAME psi COMMAND test_psi)
 add_test(NAME model COMMAND test_model)
 add_test(NAME modenc COMMAND test_modenc)
+add_test(NAME ddt_normalization COMMAND hsvm_ddt)
 add_test(NAME c6 COMMAND test_c6)
 
 # --- Python-side checks (stdlib only) --------------------------------------

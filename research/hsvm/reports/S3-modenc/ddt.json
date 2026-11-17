@@ -1,0 +1,8 @@
+{
+  "experiment": "affine-ddt-invariance",
+  "w": 8,
+  "ddt_profile_invariant_affine": true,
+  "ddt_profile_invariant_random": false,
+  "affine_identifiable_from_table": true,
+  "note": "affine maps act linearly on differences, so the difference profile survives; a random per-lane bijection does not preserve it"
+}
