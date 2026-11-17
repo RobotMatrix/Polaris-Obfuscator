@@ -23,7 +23,9 @@ static uint32_t hy_seal_hash(uint32_t stride) {
 }
 static int hy_table_unmasked = 0;
 static void hy_table_unmask(void) {
-    uint32_t st = HY_MASK_SEED;
+    // Four words that only make sense together; nothing here is a function of
+    // the key, and no single immediate equals the seed.
+    uint32_t st = HY_SEED_FRAG[0] ^ HY_SEED_FRAG[1] ^ HY_SEED_FRAG[2] ^ HY_SEED_FRAG[3];
     for (uint32_t i = 0; i < HY_TABLE_BYTES; i++) {
         hy_tab_buf[i] = (uint8_t)(hy_tab_ptr[i] ^ hy_mask_next(&st));
     }
@@ -40,6 +42,7 @@ static int hy_table_intact(void) {
     if (hy_seal_hash(4096) != HY_TABLE_SEAL_S4096) return 0;
     hy_table_unmask();
     hy_table_unmasked = 1;
+    if (hy_seal_hash(4096) != HY_TABLE_SEAL_S4096_P) return 0; // wrong seed
 #ifdef HY_DEBUG
     {
         uint32_t h = 2166136261u;

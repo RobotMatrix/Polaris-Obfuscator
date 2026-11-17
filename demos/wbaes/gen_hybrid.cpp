@@ -467,20 +467,24 @@ static int generate(const char *out_path, uint32_t env, uint8_t key[16]) {
         burn16(rkb);
         if (hit) return 12;
     }
-    uint32_t maskSeed = 0;
-    std::vector<uint8_t> plainCopy = tab;
+    // The mask seed must not be a function of the key: deriving it from the key
+    // handed the attacker a free checksum of the very key this was meant to
+    // protect. It is random per generation, and it is stored as four words whose
+    // XOR is the seed, so no single immediate equals it.
+    uint32_t maskSeed = arc4random();
+    uint32_t seedFrag[4];
+    seedFrag[0] = arc4random();
+    seedFrag[1] = arc4random();
+    seedFrag[2] = arc4random();
+    seedFrag[3] = seedFrag[0] ^ seedFrag[1] ^ seedFrag[2] ^ maskSeed;
+    uint32_t sampledPlain = 2166136261u;
     {
-        uint8_t kb[16];
-        for (int i = 0; i < 16; i++) kb[i] = wbaes_key::key_byte(i);
-        uint32_t st = hy_mask_seed(kb);
-        maskSeed = st;
-        for (size_t i = 0; i < tab.size(); ++i) tab[i] ^= hy_mask_next(&st);
-        burn(kb, sizeof(kb));
-    }
-
-    if (FILE *pf = fopen("hy_table.plain.bin", "wb")) {
-        fwrite(plainCopy.data(), 1, plainCopy.size(), pf);
-        fclose(pf);
+        uint32_t st = maskSeed;
+        for (size_t i = 0; i < tab.size(); ++i) {
+            uint8_t m = hy_mask_next(&st);
+            if ((i & 4095u) == 0) { sampledPlain ^= tab[i]; sampledPlain *= 16777619u; }
+            tab[i] ^= m;
+        }
     }
 
     FILE *fp = fopen(out_path, "wb");
@@ -510,8 +514,10 @@ static int generate(const char *out_path, uint32_t env, uint8_t key[16]) {
                 "#define HY_TABLE_BYTES %uu\n"
                 "#define HY_TABLE_SEAL 0x%08xu\n"
                 "#define HY_TABLE_SEAL_S4096 0x%08xu\n"
-                "#define HY_MASK_SEED 0x%08xu\n",
-                (unsigned)tab.size(), seal, sampled, maskSeed);
+                "#define HY_TABLE_SEAL_S4096_P 0x%08xu\n"
+                "static volatile const unsigned int HY_SEED_FRAG[4] = {0x%08xu,0x%08xu,0x%08xu,0x%08xu};\n",
+                (unsigned)tab.size(), seal, sampled, sampledPlain,
+                seedFrag[0], seedFrag[1], seedFrag[2], seedFrag[3]);
         fclose(sf);
         printf("seal: 0x%08x\n", seal);
     }
