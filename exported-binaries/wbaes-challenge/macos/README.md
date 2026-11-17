@@ -12,11 +12,25 @@
 | `wbaes_dl_clean` | `-O2`，表已掩码 | 有 | `98d2…`（**已提取**） | `bb28990b…` |
 | `wbaes_dl_max` | `-O2` + 8 pass，表已掩码 | 有 | `98d2…`（**已提取**） | `bb28990b…` |
 
-| `wbaes_dl2_clean` | `-O2`，随机种子掩码 | 有 | `98d2…`（未公开） | `bb28990b…` |
-| `wbaes_dl2_max` | `-O2` + 8 pass，随机种子掩码 | 有 | `98d2…`（未公开） | `bb28990b…` |
+| `wbaes_dl2_clean` | `-O2`，随机种子掩码 | 有 | `98d2…`（**已提取**） | `bb28990b…` |
+| `wbaes_dl2_max` | `-O2` + 8 pass，随机种子掩码 | 有 | `98d2…`（**已提取**） | `bb28990b…` |
 
-`*_dl2` 把种子改成与密钥无关的随机值、并以 4 个字（volatile）存盘：当前 `extract_key.py` 在这两个
-上面 8.0 s 失败（`no candidate key`），但对自适应工具只是多一个模式。
+`*_dl2` 把种子改成与密钥无关的随机值、并以 4 个字（volatile）存盘。**也已实测攻破**（5.0 s）：
+
+```
+extract_key.py wbaes_dl2_max --verify
+  candidate mask seeds: ['0xf32a8adc']
+  mode    : mask seed 0xf32a8adc + input bijection @11480
+  AES-128 key: 98d272d16d6cc9d6ecd48a26c0ca69d3
+  key reproduces the shipped binary: YES
+```
+
+定位方式不靠猜：解掩循环里四行 `ldr wX,[xN,#0/4/8/12]` 加两条 `eor` 就是
+`f0^f1^f2^f3`，往前回溯 `add`/`adrp` 还原地址（本文件 0x2cb8），读 4 个字 XOR 即得种子。
+因为种子与密钥无关，这一代**不再有**"FNV 验钥"那条捷径，验证只能靠结构 + 自检密文。
+
+如实说：`dl2` 的种子仍然在产物里，只是从"一条立即数"变成"四个字 + 一次 XOR"；
+攻击成本 4.9 s → 5.0 s。这条路的真正上限在 DATA-LAYER.md 第六节已经写清楚。
 
 `*_dl` 两代是**数据层加密**版本：表在二进制里是密文，运行时验封印后解掩到私有缓冲。
 **这套防护已实测攻破**（约 4.9 s，`extract_key.py` 现在自带）：

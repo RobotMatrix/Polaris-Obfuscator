@@ -266,6 +266,96 @@ def scan_mask_seed_exact(data):
     return None
 
 
+def scan_mask_seed_frag(data):
+    """dl2: seed = XOR of four words loaded as ldr wX,[xN,#{0,4,8,12}] before the loop."""
+    segs, text = [], None
+    ncmds, sizeofcmds = struct.unpack_from("<II", data, 16)
+    off = 32
+    for _ in range(ncmds):
+        cmd, cmdsize = struct.unpack_from("<II", data, off)
+        if cmd == 0x19:
+            vmaddr, vmsize, fileoff, filesize = struct.unpack_from("<QQQQ", data, off + 24)
+            segs.append((vmaddr, vmsize, fileoff, filesize))
+            nsects = struct.unpack_from("<I", data, off + 64)[0]
+            for i in range(nsects):
+                s = data[off + 72 + i * 80: off + 72 + (i + 1) * 80]
+                if s[:16].rstrip(b"\x00") == b"__text":
+                    text = (struct.unpack_from("<I", s, 48)[0], struct.unpack_from("<Q", s, 40)[0])
+        off += cmdsize
+    if text is None:
+        return None
+    toff, tsize = text
+    taddr = None
+    for vmaddr, vmsize, fileoff, filesize in segs:
+        if fileoff <= toff < fileoff + filesize:
+            taddr = vmaddr + (toff - fileoff)
+            break
+    if taddr is None:
+        return None
+
+    def vm2file(addr):
+        for vmaddr, vmsize, fileoff, filesize in segs:
+            if vmaddr <= addr < vmaddr + vmsize:
+                return fileoff + (addr - vmaddr)
+        return None
+
+    n = tsize // 4
+    insn = [struct.unpack_from("<I", data, toff + 4 * i)[0] for i in range(n)]
+
+    def fld(v):
+        return v & 0x1F, (v >> 5) & 0x1F, (v >> 10) & 0x3F, (v >> 16) & 0x1F, (v >> 22) & 3
+
+    def is_ldr_w(v):
+        return (v & 0xFFC00000) == 0xB9400000
+
+    def is_add_imm(v):
+        return (v & 0xFF800000) == 0x91000000
+
+    def is_adrp(v):
+        return (v & 0x9F000000) == 0x90000000
+
+    def adrp_page(i):
+        v = insn[i]
+        imm = (((v >> 5) & 0x7FFFF) << 2) | ((v >> 29) & 3)
+        if imm & (1 << 20):
+            imm -= 1 << 21
+        return ((taddr + 4 * i) & ~0xFFF) + (imm << 12)
+
+    def resolve(i, reg):
+        for j in range(i - 1, max(-1, i - 12), -1):
+            v = insn[j]
+            if is_add_imm(v) and fld(v)[0] == reg and fld(v)[1] == reg:
+                addv = ((v >> 10) & 0xFFF) << (12 if (v >> 22) & 1 else 0)
+                for k in range(j - 1, max(-1, j - 8), -1):
+                    if is_adrp(insn[k]) and fld(insn[k])[0] == reg:
+                        return adrp_page(k) + addv
+        return None
+
+    for i in range(2, n - 2):
+        a, b, c = insn[i], insn[i + 1], insn[i + 2]
+        if any((v & 0x7F000000) != 0x4A000000 for v in (a, b, c)):
+            continue
+        fa, fb, fc = fld(a), fld(b), fld(c)
+        if not (fa[0] == fa[1] == fa[3] == fb[0] == fb[1] == fb[3] == fc[0] == fc[1] == fc[3]):
+            continue
+        if (fa[4], fa[2], fb[4], fb[2], fc[4], fc[2]) != (0, 13, 1, 17, 0, 5):
+            continue
+        by_base = {}
+        for j in range(max(0, i - 24), i):
+            v = insn[j]
+            if is_ldr_w(v):
+                by_base.setdefault(fld(v)[1], {})[((v >> 10) & 0xFFF) * 4] = j
+        for reg, ldrs in by_base.items():
+            if set(ldrs) >= {0, 4, 8, 12}:
+                addr = resolve(min(ldrs.values()), reg)
+                fo = vm2file(addr) if addr is not None else None
+                if fo is None:
+                    continue
+                words = struct.unpack_from("<4I", data, fo)
+                return words[0] ^ words[1] ^ words[2] ^ words[3]
+    return None
+
+
 def scan_mask_seeds(data):
     """Candidate HY_MASK_SEED constants: adjacent MOVZ/MOVK w-register pairs in __text."""
     try:
@@ -472,11 +562,17 @@ def main(argv=None):
         seeds = [args.mask_seed]
     else:
         exact = scan_mask_seed_exact(data)
-        seeds = [exact] if exact is not None else scan_mask_seeds(data)
+        frag = scan_mask_seed_frag(data)
+        seeds = []
+        for s in (exact, frag):
+            if s is not None and s not in seeds:
+                seeds.append(s)
+        if not seeds:
+            seeds = scan_mask_seeds(data)
     if p0cands:
         print(f"round-0 input bijections found: {[c[0] for c in p0cands]}")
     if seeds:
-        print(f"candidate mask seeds (MOVZ/MOVK in __text): {[f'0x{s:08x}' for s in seeds]}")
+        print(f"candidate mask seeds: {[f'0x{s:08x}' for s in seeds]}")
 
     modes = [(None, None, "plain round-0 index")]
     for off, cand in p0cands:

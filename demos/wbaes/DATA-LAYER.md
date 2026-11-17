@@ -102,5 +102,26 @@ extract_key.py        recovery failed: no candidate key   (8.0 s)
 **这仍然不是"解不开"**：种子就是那 4 个字，读出来 XOR 一下即可，攻击者只需给脚本加一个模式。
 成本从"读一条立即数"变成"找 4 个字并相加"，量级是分钟。
 
+**已实测（2026-11-17，`extract_key.py` 现在自动处理）**：
+
+```
+extract_key.py wbaes_dl2_max --verify
+  candidate mask seeds: ['0xf32a8adc']
+  mode    : mask seed 0xf32a8adc + input bijection @11480
+  AES-128 key: 98d272d16d6cc9d6ecd48a26c0ca69d3
+  key reproduces the shipped binary: YES          (5.0 s)
+```
+
+定位是确定性的，不需要搜索：解掩循环前是
+`ldr w15,[x13]` / `ldr w16,[x13,#4]` / `eor` / `ldr w16,[x13,#8]` / `ldr w13,[x13,#0xc]` / `eor` / `eor`，
+从 xorshift 三连 (`lsl #13`/`lsr #17`/`lsl #5`) 往回 24 条指令内找"同一基址 + 偏移 0/4/8/12"
+的四条 `ldr`，再回溯 `add #imm` / `adrp` 还原地址（本文件 0x2cb8），读 4 个字 XOR。
+
+坑：`xxd -g4` 显示的是大端分组，直接 XOR 显示值得到的是**字节逆序**的种子
+（0xdc8a2af3 而不是 0xf32a8adc），第一版因此多失败一次。
+
+结论不变且更硬：dl2 相比 dl 只把攻击从 4.9 s 拖到 5.0 s。种子仍在产物内，
+任何"解掩所需的秘密"在离线单二进制里都必然可被读出——这一步只是在移动常数。
+
 结论（架构层）：离线单二进制里，任何"解掩所需的秘密"都必然在产物内，
 所以数据层的上限就是"多花几分钟"。要突破只能把秘密移出产物（服务端下发 / 设备密钥 / 会话协商）。
