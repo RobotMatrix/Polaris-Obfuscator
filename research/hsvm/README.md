@@ -48,6 +48,7 @@ reports/        每次运行的证据包（run.json + summary.md）
 - 阶段 4A C6 证据层：完成（`c6.h/c6.cpp`，18 条断言，三平面 + 链式证据 + 状态机）
 - 阶段 4B C7 多样性：完成实验，**负结果**（16 实例均 16 次查询被恢复，多样性不加成本）
 - 阶段 5 前置 DFA 实测：**失败**（9 条密文取钥，外部报告已本地复核）
+- C6 抗 DFA 第一步：转移冗余比对已实现（`setFaultCheckEnabled`，2× 代价）
 - M3 起（LLVM pass、C2、Native VM）：未开始
 - 证据：`reports/M0/`、`reports/M1/`、`reports/G0/`、`reports/G1-model/`、
   `reports/G1-model-addendum/`

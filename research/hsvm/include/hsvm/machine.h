@@ -93,6 +93,15 @@ public:
   // Memory plane: compare the live buffer against the shadow kept in sync by
   // writeMem. A mismatch means somebody wrote outside the VM's own path.
   void verifyMemoryPlane();
+  // Fault detection (C6 answer to DFA): the step transition is computed twice
+  // and compared. A glitch that corrupts one copy is caught here instead of
+  // leaking a faulty ciphertext. Detection is reported on the Memory plane as
+  // "state self-consistency".
+  void setFaultCheckEnabled(bool on) { faultCheck_ = on; }
+  // Test hook: simulates an attacker glitching one state bit between the two
+  // computations (the DFA model: one faulty copy, one correct copy).
+  void injectFault(uint32_t stateBit) { pendingFaultBit_ = stateBit + 1; }
+  uint64_t faultsDetected() const { return faultsDetected_; }
 
   const std::vector<BitVector> &vTable() const { return v_; }
   const BitMatrix &projection() const { return H_; }
@@ -121,6 +130,9 @@ private:
   std::vector<uint8_t> pristine_; // load-time image, used by the C6 hook
   std::vector<uint8_t> shadow_;  // memory as the VM last wrote it (C6 memory plane)
   IntegrityMonitor *monitor_ = nullptr;
+  bool faultCheck_ = false;
+  uint32_t pendingFaultBit_ = 0; // 0 = none, otherwise bit index + 1
+  uint64_t faultsDetected_ = 0;
   uint32_t regCount_ = 0;
   uint32_t pc_ = 0;
   uint64_t t_ = 0;

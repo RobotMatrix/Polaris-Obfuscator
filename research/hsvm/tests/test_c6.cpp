@@ -152,6 +152,28 @@ void testMachineIntegration() {
   mem.verifyMemoryPlane();
   CHECK(m3.state() == RiskState::Red,
         "a direct memory poke trips the memory plane");
+
+  // Fault detection: the DFA model is one faulty copy vs one correct copy.
+  Machine fc(p, VmMode::Linear);
+  CHECK(fc.loadProgram(programAllOps()), "allops loads (fault test)");
+  fc.fillRegs(0x12345678);
+  fc.setFaultCheckEnabled(true);
+  IntegrityMonitor m4(0xC3);
+  fc.setIntegrityMonitor(&m4);
+  fc.run();
+  CHECK(fc.faultsDetected() == 0, "clean run detects no fault");
+  CHECK(m4.state() == RiskState::Green, "clean run keeps the planes green");
+
+  Machine fi(p, VmMode::Linear);
+  CHECK(fi.loadProgram(programAllOps()), "allops loads (fault injection)");
+  fi.fillRegs(0x12345678);
+  fi.setFaultCheckEnabled(true);
+  fi.injectFault(37); // glitch one state bit, as DFA does
+  IntegrityMonitor m5(0xC4);
+  fi.setIntegrityMonitor(&m5);
+  fi.run();
+  CHECK(fi.faultsDetected() == 1, "single-bit fault is detected");
+  CHECK(m5.state() == RiskState::Red, "detected fault raises the memory plane");
 }
 
 } // namespace

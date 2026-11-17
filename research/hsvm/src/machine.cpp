@@ -205,8 +205,25 @@ bool Machine::step() {
 
   if (mode_ == VmMode::Linear) {
     // F(s,i) = s XOR v(i); no data dependency, no arithmetic.
-    BitVector s = stateBits();
+    const BitVector before = stateBits();
+    BitVector s = before;
     s.xorWith(v_[pc_]);
+    if (faultCheck_) {
+      if (pendingFaultBit_ != 0) {
+        s.flip(pendingFaultBit_ - 1);
+        pendingFaultBit_ = 0;
+      }
+      BitVector check = before;
+      check.xorWith(v_[pc_]);
+      const bool consistent = (check == s);
+      if (!consistent) {
+        ++faultsDetected_;
+        if (monitor_)
+          monitor_->checkpoint(EvidencePlane::Memory, 0, 1);
+      } else if (monitor_) {
+        monitor_->checkpoint(EvidencePlane::Memory, 1, 1);
+      }
+    }
     for (uint32_t r = 0; r < regCount_; ++r) {
       uint32_t word = 0;
       for (uint32_t b = 0; b < 32; ++b)
