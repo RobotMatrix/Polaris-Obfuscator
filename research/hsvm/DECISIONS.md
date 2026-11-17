@@ -534,3 +534,20 @@ LLVM IR 放在 V-08 的 Polaris pass 里。代价：这里不能取性能口径�
 
 结果：30 个随机程序，24 个编译并比对通过、6 个因 budget 跳过，gate 退出 0；
 ctest 28 个测试全绿。
+
+## ADR-034 ISA v2：新增 Tld（宿主表读取），研究层已落地，pass 待接（2026-11-17）
+
+白盒 AES 一轮要查 64 KiB 表，而 VM 内存只有 4 KiB，所以 ISA 需要一条"读宿主表"的指令：
+`Tld dst, a + imm32` —— 从宿主提供的只读区取 32 位字，越界/未对齐即 fault（与 `Ld` 同语义）。
+
+本轮已落地：`HSVMOpcodes.def` 加 `Tld = 0x10`（17 opcodes）、`isa.h` 重新生成、
+解释器 `machine.cpp`、oracle `semantics.h`、lowering `lower.cpp`（`IrKind::TableLoad`）与
+`Machine::setTable` 全部实现；ctest 28/28 绿。
+
+**范围限定（明确写下来，避免误以为全链路已支持）**：
+- `allops` 程序、随机测试与 `test_linear` 仍只用 0x00–0x0F，因为宿主表尚未接到 pass 与 gate；
+- 编译器 pass 遇到 `Tld` 仍 `report_fatal_error`（大声拒绝，不静默近似）；
+- 因此 `vmp_gate` 的六个用例语义未变。
+
+下一步（一个完整增量）：pass 用 `@hsvm_table` 指针 + `@hsvm_table_len` 发射有界检查，
+C 发射器同步，再放开 allops/fuzz 到 17 条，并补 gate 用例（Tld 命中 / 越界 / 未对齐）。

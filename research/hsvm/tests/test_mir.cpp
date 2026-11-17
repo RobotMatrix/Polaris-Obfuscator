@@ -36,7 +36,7 @@ int main() {
   // Garbage is refused, not silently decoded.
   std::vector<MirOp> bad;
   CHECK(!lift({0x00, 0x01, 0x02}, &bad), "truncated input is refused");
-  CHECK(!lift({0x10, 0, 0, 0, 0, 0, 0, 0}, &bad), "unknown opcode is refused");
+  CHECK(!lift({0x11, 0, 0, 0, 0, 0, 0, 0}, &bad), "unknown opcode is refused");
   CHECK(bad.empty(), "refused input leaves no partial output");
 
   // High register indices survive: the ISA addresses 64 registers.

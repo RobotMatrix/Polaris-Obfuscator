@@ -21,6 +21,8 @@ struct SemState {
   uint32_t regCount = 16; // Machine::kMaxRegs; set from the machine under test
   uint8_t *mem = nullptr;
   uint32_t memBytes = 0;
+  const uint8_t *table = nullptr; // ISA v2: host table for Tld
+  uint32_t tableBytes = 0;
   uint32_t pc = 0;
   bool halted = false;
   bool faulted = false;
@@ -114,6 +116,19 @@ inline bool semStep(SemState &s, const MirOp &op) {
       return false;
     }
     s.regs[op.dst] = semLoad32(s, addr);
+    s.pc += 1;
+    return true;
+  }
+  case Opcode::Tld: {
+    if (!semRegOk(s, op.dst) || !semRegOk(s, op.a)) { s.faulted = true; return false; }
+    const uint32_t addr = s.regs[op.a] + op.imm;
+    if (s.table == nullptr || addr > s.tableBytes - 4 || (addr & 3u) != 0) {
+      s.faulted = true;
+      return false;
+    }
+    s.regs[op.dst] = (uint32_t)s.table[addr] | ((uint32_t)s.table[addr + 1] << 8) |
+                     ((uint32_t)s.table[addr + 2] << 16) |
+                     ((uint32_t)s.table[addr + 3] << 24);
     s.pc += 1;
     return true;
   }

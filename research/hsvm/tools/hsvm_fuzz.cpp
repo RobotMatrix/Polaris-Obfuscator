@@ -64,7 +64,8 @@ std::vector<uint8_t> randomProgram(std::mt19937_64 &rng, uint32_t *initRegs) {
     return static_cast<uint8_t>((rng() % 16) == 0 ? 16 + (rng() % 8) : (rng() % 16));
   };
   for (uint32_t i = 0; i < len; ++i) {
-    const uint8_t op = static_cast<uint8_t>(rng() % kNumOpcodes);
+    // Tld is excluded: the fuzz harness has no host table wired yet.
+    const uint8_t op = static_cast<uint8_t>(rng() % 16u);
     uint32_t imm = static_cast<uint32_t>(rng());
     const Opcode o = static_cast<Opcode>(op);
     if (o == Opcode::Jmp || o == Opcode::Brz) {

@@ -167,7 +167,7 @@ int main() {
     nop.op = Opcode::Nop;
     CHECK(lowerOp(nop, &ir) && ir.empty(), "nop lowers to zero operations");
     MirOp bogus;
-    bogus.op = static_cast<Opcode>(0x10);
+    bogus.op = static_cast<Opcode>(0x11);
     CHECK(!lowerOp(bogus, &ir), "an opcode outside the ISA is refused");
     CHECK(ir.empty(), "a refusal appends nothing");
   }

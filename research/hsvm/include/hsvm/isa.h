@@ -30,10 +30,11 @@ enum class Opcode : uint8_t {
   St = 0x0C,
   Jmp = 0x0D,
   Brz = 0x0E,
+  Tld = 0x10,
   Halt = 0x0F,
 };
 
-constexpr uint32_t kNumOpcodes = 16;
+constexpr uint32_t kNumOpcodes = 17;
 constexpr uint32_t kInstrBytes = 8;
 
 inline const char *opcodeName(Opcode op) {
@@ -53,6 +54,7 @@ inline const char *opcodeName(Opcode op) {
   case Opcode::St: return "st";
   case Opcode::Jmp: return "jmp";
   case Opcode::Brz: return "brz";
+  case Opcode::Tld: return "tld";
   case Opcode::Halt: return "halt";
   }
   return "?";

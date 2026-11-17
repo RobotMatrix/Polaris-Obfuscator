@@ -47,6 +47,19 @@ public:
   static constexpr uint32_t kMemBytes = 4096;
   static constexpr uint32_t kMaxRegs = 16;
 
+  // ISA v2: Tld reads from a host-provided read-only table outside the 4 KiB VM
+  // memory (the white-box tables are 64 KiB each).
+  void setTable(const uint8_t *t, uint32_t bytes) { table_ = t; tableBytes_ = bytes; }
+  bool tableOk(uint32_t addr) const {
+    return table_ != nullptr && addr <= tableBytes_ - 4 && (addr & 3u) == 0;
+  }
+  uint32_t readTable32(uint32_t addr) const {
+    return (uint32_t)table_[addr] | ((uint32_t)table_[addr + 1] << 8) |
+           ((uint32_t)table_[addr + 2] << 16) | ((uint32_t)table_[addr + 3] << 24);
+  }
+  const uint8_t *table_ = nullptr;
+  uint32_t tableBytes_ = 0;
+
   // Throws std::invalid_argument when the parameter point cannot be hosted by
   // the 16 x 32-bit register file (that is a harness limit, not a scheme rule).
   Machine(const HsvmParams &p, VmMode mode);

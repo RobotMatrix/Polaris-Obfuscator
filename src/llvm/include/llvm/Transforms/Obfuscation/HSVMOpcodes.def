@@ -28,4 +28,6 @@ HSV_OPCODE(Ld, 0x0B)
 HSV_OPCODE(St, 0x0C)
 HSV_OPCODE(Jmp, 0x0D)
 HSV_OPCODE(Brz, 0x0E)
+// ISA v2: Tld reads a word from the host table (not the 4 KiB VM memory).
+HSV_OPCODE(Tld, 0x10)
 HSV_OPCODE(Halt, 0x0F)

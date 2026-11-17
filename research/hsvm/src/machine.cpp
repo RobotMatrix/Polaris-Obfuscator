@@ -320,6 +320,13 @@ bool Machine::step() {
     regs_[in.dst] = readMem32(addr);
     break;
   }
+  case Opcode::Tld: {
+    if (!regOk(in.dst) || !regOk(in.a)) { fault("tld register out of range"); return true; }
+    const uint32_t addr = aVal + in.imm;
+    if (!tableOk(addr)) { fault("tld address out of range or unaligned"); return true; }
+    regs_[in.dst] = readTable32(addr);
+    break;
+  }
   case Opcode::St: {
     if (!regOk(in.a) || !regOk(in.b)) {
       fault("st operand out of range");

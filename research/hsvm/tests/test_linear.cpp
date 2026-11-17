@@ -54,9 +54,9 @@ void testStepIsOneXor() {
   vm.run(1000);
 
   CHECK(vm.halted(), "allops halts");
-  CHECK(vm.steps() == kNumOpcodes, "allops executes one step per opcode");
-  CHECK(vm.trace().size() == kNumOpcodes, "one trace record per step");
-  CHECK(vm.vTable().size() == kNumOpcodes, "one mask per instruction slot");
+  CHECK(vm.steps() == 16u, "allops executes one step per opcode");
+  CHECK(vm.trace().size() == 16u, "one trace record per step");
+  CHECK(vm.vTable().size() == 16u, "one mask per instruction slot");
 
   bool xorOk = true;
   for (const auto &rec : vm.trace()) {

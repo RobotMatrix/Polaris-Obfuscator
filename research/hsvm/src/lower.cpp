@@ -46,6 +46,9 @@ bool lowerOp(const MirOp &in, std::vector<IrOp> *out) {
   case Opcode::Ld:
     o.kind = IrKind::Load;
     break;
+  case Opcode::Tld:
+    o.kind = IrKind::TableLoad;
+    break;
   case Opcode::St:
     o.kind = IrKind::Store;
     break;
@@ -105,6 +108,18 @@ bool irExec(SemState &s, const std::vector<IrOp> &ops) {
         return false;
       }
       s.regs[o.dst] = semLoad32(s, addr);
+      break;
+    }
+    case IrKind::TableLoad: {
+      if (!semRegOk(s, o.dst) || !semRegOk(s, o.a)) { s.faulted = true; return false; }
+      const uint32_t addr = s.regs[o.a] + o.imm;
+      if (s.table == nullptr || addr > s.tableBytes - 4 || (addr & 3u) != 0) {
+        s.faulted = true;
+        return false;
+      }
+      s.regs[o.dst] = (uint32_t)s.table[addr] | ((uint32_t)s.table[addr + 1] << 8) |
+                      ((uint32_t)s.table[addr + 2] << 16) |
+                      ((uint32_t)s.table[addr + 3] << 24);
       break;
     }
     case IrKind::Store: {

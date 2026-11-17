@@ -25,6 +25,7 @@ enum class IrKind : uint8_t {
   Shl,   // dst = a << (b & 31)
   Shr,   // dst = a >> (b & 31)
   Load,  // dst = mem32[a + imm]
+  TableLoad, // dst = table32[a + imm] (ISA v2 host table)
   Store, // mem32[a + imm] = b
   Jmp,   // pc += simm(imm)
   Brz,   // regs[a] == 0 ? pc += simm(imm) : pc += 1
