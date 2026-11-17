@@ -6,6 +6,7 @@
 #include <vector>
 #define WBAES_NO_DEVBIND 1
 #include "wbaes_key.h"
+#include "hy_mask.h"
 #include "wbaes_hybrid.h"
 #include <sys/sysctl.h>
 
@@ -466,6 +467,22 @@ static int generate(const char *out_path, uint32_t env, uint8_t key[16]) {
         burn16(rkb);
         if (hit) return 12;
     }
+    uint32_t maskSeed = 0;
+    std::vector<uint8_t> plainCopy = tab;
+    {
+        uint8_t kb[16];
+        for (int i = 0; i < 16; i++) kb[i] = wbaes_key::key_byte(i);
+        uint32_t st = hy_mask_seed(kb);
+        maskSeed = st;
+        for (size_t i = 0; i < tab.size(); ++i) tab[i] ^= hy_mask_next(&st);
+        burn(kb, sizeof(kb));
+    }
+
+    if (FILE *pf = fopen("hy_table.plain.bin", "wb")) {
+        fwrite(plainCopy.data(), 1, plainCopy.size(), pf);
+        fclose(pf);
+    }
+
     FILE *fp = fopen(out_path, "wb");
     if (!fp) return 7;
     if (fwrite(tab.data(), 1, tab.size(), fp) != tab.size()) return 7;
@@ -492,8 +509,9 @@ static int generate(const char *out_path, uint32_t env, uint8_t key[16]) {
                 "#pragma once\n"
                 "#define HY_TABLE_BYTES %uu\n"
                 "#define HY_TABLE_SEAL 0x%08xu\n"
-                "#define HY_TABLE_SEAL_S4096 0x%08xu\n",
-                (unsigned)tab.size(), seal, sampled);
+                "#define HY_TABLE_SEAL_S4096 0x%08xu\n"
+                "#define HY_MASK_SEED 0x%08xu\n",
+                (unsigned)tab.size(), seal, sampled, maskSeed);
         fclose(sf);
         printf("seal: 0x%08x\n", seal);
     }

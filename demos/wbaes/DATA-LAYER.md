@@ -55,22 +55,26 @@ $ clang++ -S -emit-llvm demo_wbaes.cpp | grep kHyTab
 **成本**：启动时全表解密 69 MB 约数毫秒；按页惰性解密则几乎没有常驻开销，但每个查表要加一次
 「页已解密？」判断。
 
-## 五、生成端加密的尝试（未完成，代码已回退）
+## 五、生成端加密：已实现并验证（2026-11-17）
 
-按上面的方案做了一版：`gen_hybrid` 在写文件前用 key 派生的 xorshift 流异或全表，
-并额外输出 `HY_MASK_SEED`、`HY_TABLE_SEAL`（密文全表）、`HY_TABLE_SEAL_S4096`（密文抽样）、
-`HY_TABLE_SEAL_S4096_P`（明文抽样）；运行时先验密文封印，再原地解掩，再用明文抽样复核。
+`gen_hybrid` 在写文件前用 key 派生的 xorshift 流掩掉全表，并输出 `HY_MASK_SEED`；
+运行时第一次调用时验封印（密文全表 + 密文抽样），然后一次性解掩到私有缓冲，
+之后所有查表走 `hy_tab_ptr`。
 
-**生成端是自洽的**——用 Python 独立重算文件上的三个值，与 header 全部一致：
+**踩到的坑（值得记）**：第一版是原地解掩 `const_cast<uint8_t*>(kHyTab)`，
+`-O0` 完全正确、`-O2` 稳定输出错密文（两次运行结果相同，所以不是毒化路径）。
+根因是往 `const` 对象里写属 UB，优化器据此假定表内容不变。
+改成 `static uint8_t hy_tab_buf[HY_TABLE_BYTES]` + 指针间接后，`-O2` 通过。
+`HY_DEBUG` 下可直接对照：解掩后前 4 KiB 的 FNV 与生成端明文一致（`8102236c`）。
+
+实测（key 未公开的那一代）：
 ```
-file full seal : 0x07b7943b == hdr    MATCH
-file s4096     : 0xdba47282 == hdr    MATCH
-unmasked s4096 : 0x2be3fb3a == hdr    MATCH
+wbaes_dl_clean / wbaes_dl_max   vector-match PASS, roundtrip PASS
+extract_key.py wbaes_dl_clean   → recovery failed: no candidate key
+                                  （0.79 s，连输入双射都找到了，仍解不出）
 ```
 
-**但运行时没通过**：二进制自检输出随机值（`vector-match: FAIL`，两次运行密文不同 ⇒ 走的是毒化路径），
-说明 `hy_table_intact()` 在运行时返回了 0。最可疑的是对 `const` 表的原地写入与封印检查的相对顺序，
-尚未定位。按本仓库"不留半成品"的纪律，**这部分改动已回退**，导出目录里没有对应产物。
-
-要接着做，下一步应该先写一个只做 unmask + 打印三个封印值的最小程序，
-把"文件侧正确、运行侧不对"的差缩小到具体的检查点，再接回 demo。
+**买到的**：静态读表失效——表区是密文，提取器连第 0 轮表结构都拼不出来。
+**买不到的**：解密到私有缓冲后，调试器 dump 内存照样拿到明文表；
+`HY_MASK_SEED` 就在二进制里，写个 15 行解掩器即可绕过静态防护。
+这是抬高静态分析成本，不是防提取。

@@ -8,3 +8,5 @@ src/build-vm/
 .vm-test/
 .vscode/
 *.ipa
+exported-binaries/wbaes-challenge/macos/wbaes_dl_clean
+exported-binaries/wbaes-challenge/macos/wbaes_dl_max
