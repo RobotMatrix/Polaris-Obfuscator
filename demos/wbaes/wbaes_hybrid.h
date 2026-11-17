@@ -19,7 +19,40 @@ static const uint32_t HY_DEC_ENTRY = HY_PAIRS;
 static const uint32_t HY_DEC_STEP = HY_ROUND + HY_PAIRS;
 static const uint32_t HY_DEC_BYTES = HY_DEC_ENTRY + HY_DEC_STEPS * HY_DEC_STEP + HY_PAIRS;
 static const uint32_t HY_OFF_DEC = HY_ENC_BYTES;
-static const uint32_t HY_TOTAL = HY_ENC_BYTES + HY_DEC_BYTES;
+static const uint32_t HY_TABLES = HY_ENC_BYTES + HY_DEC_BYTES;
+
+// Round-family schedule. The generator writes one family byte per (direction,
+// round) here, inside the sealed table, so the reader never assumes that all
+// nine rounds share one shape. Masked on disk like every other table byte.
+static const uint32_t HY_SCHED_OFF = HY_TABLES;
+static const uint32_t HY_SCHED_STRIDE = 16u;
+static const uint32_t HY_SCHED_BYTES = 64u;
+static const uint32_t HY_TOTAL = HY_TABLES + HY_SCHED_BYTES;
+
+// Families. Every one computes the same round function; they differ in how the
+// linear layer and the key constant are carried into the table path.
+static const int HY_FAM_PAIR = 0; // two 16-bit pair tables + four recode byte tables
+static const int HY_FAM_T32 = 1;  // four 32-bit byte-indexed tables XORed + recode
+static const int HY_FAM_T8 = 2;   // 16 coefficient byte tables XOR-accumulated + recode
+static const int HY_FAM_T32K = 3; // four 32-bit tables, key+offset in one output, no recode
+
+// Table kinds inside one column slot. Distinct per family so the tag - and with
+// it the index scatter - never repeats between shapes.
+static const int HY_K_PAIR_L = 0;  // 0,1 pair halves; 2..5 recode rows
+static const int HY_K_PAIR_Z = 2;
+static const int HY_K_T32_W = 16;  // 16..19 wide
+static const int HY_K_T32_R = 20;  // 20..23 recode
+static const int HY_K_T8_C = 32;   // 32..47 coefficient tables
+static const int HY_K_T8_R = 48;   // 48..51 recode
+static const int HY_K_T32K_W = 64; // 64..67 wide
+
+// Sub-layout inside one column slot. All four families fit in HY_COL, so the
+// slot geometry (and therefore the seal, the mask walk and HY_TOTAL per round)
+// stays what it was.
+static const uint32_t HY_W1024 = 1024u; // 256 byte-indexed uint32 entries
+static const uint32_t HY_W256 = 256u;
+static const uint32_t HY_T32_R_OFF = 4u * HY_W1024;
+static const uint32_t HY_T8_R_OFF = 16u * HY_W256;
 
 inline uint32_t hy_env_mix(int pagesize, int ncpu, int cls) {
     return (uint32_t)pagesize ^ ((uint32_t)ncpu << 16) ^ ((uint32_t)cls * 0x01000193u) ^ 0xA5C31E87u;
@@ -123,21 +156,81 @@ inline int hy_pick(int src_kind, int dst) {
     return dst;
 }
 
+// 256-entry tables are indexed by one byte, so they cannot use hy_scatter's
+// 16-bit Feistel. An odd multiplier mod 256 is a bijection and costs one
+// multiply; positions inside a small table are permuted per tag just like the
+// 64K tables are.
+inline uint8_t hy_scatter8(uint8_t x, uint32_t env, uint32_t tag) {
+    uint32_t k = env ^ (tag * 0x9E3779B1u) ^ 0xA5C31E87u;
+    uint32_t a = (k | 1u) & 255u;
+    uint32_t b = (k >> 8) & 255u;
+    return (uint8_t)(a * (uint32_t)x + b);
+}
+inline uint32_t hy_load32t(const uint8_t *tab, uint32_t off, uint8_t logical, uint32_t env, uint32_t tag) {
+    const uint8_t *p = tab + off + (uint32_t)hy_scatter8(logical, env, tag) * 4u;
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+inline uint8_t hy_load8t(const uint8_t *tab, uint32_t off, uint8_t logical, uint32_t env, uint32_t tag) {
+    return tab[off + hy_scatter8(logical, env, tag)];
+}
+inline void hy_store32t(uint8_t *tab, uint32_t off, uint8_t logical, uint32_t env, uint32_t tag, uint32_t w) {
+    uint8_t *p = tab + off + (uint32_t)hy_scatter8(logical, env, tag) * 4u;
+    p[0] = (uint8_t)w;
+    p[1] = (uint8_t)(w >> 8);
+    p[2] = (uint8_t)(w >> 16);
+    p[3] = (uint8_t)(w >> 24);
+}
+inline void hy_store8t(uint8_t *tab, uint32_t off, uint8_t logical, uint32_t env, uint32_t tag, uint8_t v) {
+    tab[off + hy_scatter8(logical, env, tag)] = v;
+}
+
+// One column of one round, whatever shape the schedule picked for that round.
 inline void hy_mc_round(const uint8_t *tab, uint32_t base, int round, int dir, int src_kind,
                         const uint8_t in[16], uint8_t out[16], uint32_t env) {
+    const int fam = (int)tab[HY_SCHED_OFF + (uint32_t)dir * HY_SCHED_STRIDE + (uint32_t)round];
     for (int col = 0; col < 4; col++) {
-        uint8_t b0 = in[hy_pick(src_kind, 0 + 4 * col)];
-        uint8_t b1 = in[hy_pick(src_kind, 1 + 4 * col)];
-        uint8_t b2 = in[hy_pick(src_kind, 2 + 4 * col)];
-        uint8_t b3 = in[hy_pick(src_kind, 3 + 4 * col)];
-        uint32_t off = base + (uint32_t)col * HY_COL;
-        uint32_t left = hy_load32(tab, off, (uint16_t)(b0 | (b1 << 8)), env, hy_tag(dir, round, col, 0));
-        uint32_t right = hy_load32(tab, off + HY_U32, (uint16_t)(b2 | (b3 << 8)), env, hy_tag(dir, round, col, 1));
-        for (int row = 0; row < 4; row++) {
-            uint8_t pl = (uint8_t)((left >> (8 * row)) & 255);
-            uint8_t pr = (uint8_t)((right >> (8 * row)) & 255);
-            uint32_t zoff = off + HY_U32 + HY_U32 + (uint32_t)row * HY_U8;
-            out[row + 4 * col] = hy_load8(tab, zoff, (uint16_t)(pl | (pr << 8)), env, hy_tag(dir, round, col, 2 + row));
+        const uint32_t cb = base + (uint32_t)col * HY_COL;
+        uint8_t b[4];
+        for (int k = 0; k < 4; k++) b[k] = in[hy_pick(src_kind, k + 4 * col)];
+        if (fam == HY_FAM_T32 || fam == HY_FAM_T32K) {
+            const int kw = (fam == HY_FAM_T32K) ? HY_K_T32K_W : HY_K_T32_W;
+            uint32_t w = 0;
+            for (int k = 0; k < 4; k++)
+                w ^= hy_load32t(tab, cb + (uint32_t)k * HY_W1024, b[k], env,
+                                hy_tag(dir, round, col, kw + k));
+            if (fam == HY_FAM_T32K) {
+                // Key word and output offset are already in one table's 32-bit
+                // output: this round has no key step and no recode step.
+                for (int row = 0; row < 4; row++) out[row + 4 * col] = (uint8_t)(w >> (8 * row));
+            } else {
+                for (int row = 0; row < 4; row++)
+                    out[row + 4 * col] =
+                        hy_load8t(tab, cb + HY_T32_R_OFF + (uint32_t)row * HY_W256,
+                                  (uint8_t)(w >> (8 * row)), env,
+                                  hy_tag(dir, round, col, HY_K_T32_R + row));
+            }
+        } else if (fam == HY_FAM_T8) {
+            uint8_t acc[4] = {0, 0, 0, 0};
+            for (int k = 0; k < 4; k++)
+                for (int row = 0; row < 4; row++)
+                    acc[row] ^= hy_load8t(tab, cb + (uint32_t)(k * 4 + row) * HY_W256, b[k], env,
+                                          hy_tag(dir, round, col, HY_K_T8_C + k * 4 + row));
+            for (int row = 0; row < 4; row++)
+                out[row + 4 * col] =
+                    hy_load8t(tab, cb + HY_T8_R_OFF + (uint32_t)row * HY_W256, acc[row], env,
+                              hy_tag(dir, round, col, HY_K_T8_R + row));
+        } else {
+            uint32_t left = hy_load32(tab, cb, (uint16_t)(b[0] | (b[1] << 8)), env,
+                                      hy_tag(dir, round, col, HY_K_PAIR_L));
+            uint32_t right = hy_load32(tab, cb + HY_U32, (uint16_t)(b[2] | (b[3] << 8)), env,
+                                       hy_tag(dir, round, col, HY_K_PAIR_L + 1));
+            for (int row = 0; row < 4; row++) {
+                uint8_t pl = (uint8_t)((left >> (8 * row)) & 255);
+                uint8_t pr = (uint8_t)((right >> (8 * row)) & 255);
+                uint32_t zoff = cb + HY_U32 + HY_U32 + (uint32_t)row * HY_U8;
+                out[row + 4 * col] = hy_load8(tab, zoff, (uint16_t)(pl | (pr << 8)), env,
+                                              hy_tag(dir, round, col, HY_K_PAIR_Z + row));
+            }
         }
     }
 }

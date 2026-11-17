@@ -22,6 +22,19 @@ static uint32_t hy_seal_hash(uint32_t stride) {
     return h;
 }
 static int hy_table_unmasked = 0;
+// The round schedule is data in the table, so it can be damaged like any other
+// byte; the generator writes a per-direction check byte next to it. A wrong
+// schedule would make a round read a neighbour's layout and produce a wrong
+// ciphertext that both DFA traversals agree on, which is why it is checked here.
+static int hy_sched_valid(void) {
+    for (uint32_t d = 0; d < 2; d++) {
+        const uint8_t *g = HYKTAB + HY_SCHED_OFF + d * HY_SCHED_STRIDE;
+        uint8_t x = (uint8_t)d;
+        for (int r = 0; r < HY_MC_ROUNDS; r++) x ^= g[r];
+        if (g[HY_MC_ROUNDS] != x) return 0;
+    }
+    return 1;
+}
 static void hy_table_unmask(void) {
     // Four words that only make sense together; nothing here is a function of
     // the key, and no single immediate equals the seed.
@@ -43,6 +56,7 @@ static int hy_table_intact(void) {
     hy_table_unmask();
     hy_table_unmasked = 1;
     if (hy_seal_hash(4096) != HY_TABLE_SEAL_S4096_P) return 0; // wrong seed
+    if (!hy_sched_valid()) return 0;                           // round schedule damaged
 #ifdef HY_DEBUG
     {
         uint32_t h = 2166136261u;
@@ -66,6 +80,8 @@ static void hy_encrypt_once(const uint8_t in[16], uint8_t out[16], uint32_t env,
     uint8_t s[16], n[16];
     for (int i = 0; i < 16; i++) s[i] = HY_P0[i][in[i]]; // round-0 input bijection
     for (int r = 0; r < HY_MC_ROUNDS; r++) {
+        // hy_mc_round reads this round's family out of the table: the nine rounds
+        // do not have to share a table shape, and the loop does not know which.
         hy_mc_round(HYKTAB, hy_enc_col(r, 0), r, 0, 1, s, n, env);
         for (int i = 0; i < 16; i++) s[i] = n[i];
     }

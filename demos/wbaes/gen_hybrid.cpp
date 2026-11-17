@@ -188,51 +188,179 @@ static int table_has_key(const uint8_t *buf, size_t n, const uint8_t k[16]) {
     return 0;
 }
 
-static void fill_xor_round(uint8_t *tab, uint32_t base, int dir, int round, int src_kind,
-                           uint8_t rk_in_pre[16], int use_pre,
-                           const uint8_t (*InPinv)[256], int use_in_perm,
-                           const uint8_t rk_after[16],
-                           uint8_t OutP[16][256],
-                           uint8_t Q[4][4][2][256], uint8_t Qi[4][4][2][256],
-                           uint32_t env, int sbox_fwd) {
+// ---- per-round family schedule -------------------------------------------------
+// Which shape each round uses. Every family computes the identical function, so
+// the ciphertext cannot depend on this array - that is exactly what the checks
+// below verify. HY_FAM_T32K folds the key word and the output offset into one
+// table's 32-bit output and therefore has no recode step; the only place a
+// random output bijection could sit is gone, so those rounds get an affine one
+// (a*x^b), which commutes with the XOR of the four lookups. Every other family
+// keeps a full random bijection on both sides, because there the encoding is
+// applied by a table entry rather than by an arithmetic identity.
+static const int SCHED_ENC[9] = {HY_FAM_T32, HY_FAM_T8, HY_FAM_T32K, HY_FAM_PAIR, HY_FAM_T32,
+                                 HY_FAM_T8, HY_FAM_PAIR, HY_FAM_T32K, HY_FAM_T32};
+static const int SCHED_DEC[9] = {HY_FAM_PAIR, HY_FAM_T32, HY_FAM_T8, HY_FAM_PAIR, HY_FAM_T32K,
+                                 HY_FAM_T32, HY_FAM_T8, HY_FAM_PAIR, HY_FAM_T32K};
+
+static void rand_affine(uint8_t a[16], uint8_t b[16]) {
+    for (int i = 0; i < 16; i++) {
+        uint8_t v;
+        do { v = (uint8_t)rnd32(); } while (!v); // a == 0 would not be a bijection
+        a[i] = v;
+        b[i] = (uint8_t)rnd32();
+    }
+}
+
+static void fill_affine(uint8_t P[16][256], uint8_t Pi[16][256], const uint8_t a[16], const uint8_t b[16]) {
+    for (int i = 0; i < 16; i++)
+        for (int x = 0; x < 256; x++) {
+            uint8_t v = (uint8_t)(gmul(a[i], (uint8_t)x) ^ b[i]);
+            P[i][x] = v;
+            Pi[i][v] = (uint8_t)x;
+        }
+}
+
+// What one round needs to know, independent of which family implements it.
+struct RndSpec {
+    const uint8_t (*inp)[256];  // input decoding per source byte; null = identity
+    const uint8_t *rk_pre;      // XORed before SubBytes (round 0 only); null = none
+    const uint8_t *rk_after;    // constant added after the linear layer
+    const uint8_t (*outp)[256]; // output encoding per destination byte
+    const uint8_t *aff_a;       // HY_FAM_T32K output encoding a*x^b
+    const uint8_t *aff_b;
+    int src_kind;
+    int sbox_fwd;               // 1: SubBytes then MC; 0: identity then InvMC
+};
+
+static uint8_t round_byte(const RndSpec &s, int src, uint8_t enc) {
+    uint8_t v = s.inp ? s.inp[src][enc] : enc;
+    if (s.rk_pre) v ^= s.rk_pre[src];
+    return s.sbox_fwd ? sbox(v) : v;
+}
+
+// FAM_PAIR: two 16-bit pair tables feed a Q network, four byte tables invert Q,
+// add the round constant and apply the output encoding. Kept exactly as it was,
+// because this is the shape the earlier generations were verified on.
+static void fill_col_pair(uint8_t *tab, uint32_t cb, int dir, int round, int col,
+                          const RndSpec &sp, uint32_t env) {
+    const uint8_t (*M)[4] = sp.sbox_fwd ? MC : IMC;
+    uint8_t Q[4][2][256], Qi[4][2][256];
+    for (int row = 0; row < 4; row++)
+        for (int side = 0; side < 2; side++) rand_perm(Q[row][side], Qi[row][side]);
+    for (int side = 0; side < 2; side++) {
+        const int rows[2] = {side * 2, side * 2 + 1};
+        for (int b0 = 0; b0 < 256; b0++)
+            for (int b1 = 0; b1 < 256; b1++) {
+                uint8_t sb[2];
+                for (int t = 0; t < 2; t++)
+                    sb[t] = round_byte(sp, hy_pick(sp.src_kind, rows[t] + 4 * col),
+                                       (uint8_t)(t ? b1 : b0));
+                uint32_t word = 0;
+                for (int row = 0; row < 4; row++) {
+                    uint8_t partial = (uint8_t)(gmul(sb[0], M[row][rows[0]]) ^ gmul(sb[1], M[row][rows[1]]));
+                    word |= (uint32_t)Q[row][side][partial] << (8 * row);
+                }
+                hy_store32(tab, cb + (side ? HY_U32 : 0u), (uint16_t)(b0 | (b1 << 8)), env,
+                           hy_tag(dir, round, col, HY_K_PAIR_L + side), word);
+            }
+    }
+    for (int row = 0; row < 4; row++) {
+        const int dst = row + 4 * col;
+        for (int a = 0; a < 256; a++)
+            for (int b = 0; b < 256; b++) {
+                uint8_t mixed = (uint8_t)(Qi[row][0][a] ^ Qi[row][1][b] ^ sp.rk_after[dst]);
+                hy_store8(tab, cb + 2u * HY_U32 + (uint32_t)row * HY_U8, (uint16_t)(a | (b << 8)), env,
+                          hy_tag(dir, round, col, HY_K_PAIR_Z + row), sp.outp[dst][mixed]);
+            }
+    }
+    burn(Q, sizeof(Q));
+    burn(Qi, sizeof(Qi));
+}
+
+// FAM_T32 / FAM_T32K: four 32-bit lookups per column, each indexed by one
+// encoded state byte, XORed together. The key is added in the recode table's
+// index (T32) or into one table's output (T32K).
+static void fill_col_t32(uint8_t *tab, uint32_t cb, int dir, int round, int col, int fam,
+                         const RndSpec &sp, uint32_t env) {
+    const uint8_t (*M)[4] = sp.sbox_fwd ? MC : IMC;
+    const int kd = 0; // designated source carrying the column constant in T32K
+    for (int k = 0; k < 4; k++) {
+        const int src = hy_pick(sp.src_kind, k + 4 * col);
+        for (int enc = 0; enc < 256; enc++) {
+            const uint8_t sb = round_byte(sp, src, (uint8_t)enc);
+            uint32_t word = 0;
+            for (int row = 0; row < 4; row++) {
+                const int dst = row + 4 * col;
+                uint8_t v = gmul(sb, M[row][k]);
+                if (fam == HY_FAM_T32K) {
+                    // a*(c ^ rk) ^ b == a*c ^ (a*rk ^ b): GF multiply distributes
+                    // over XOR, so the affine output encoding survives the XOR of
+                    // the four tables and the constant term rides in one of them.
+                    v = gmul(sp.aff_a[dst], v);
+                    if (k == kd) v ^= (uint8_t)(gmul(sp.aff_a[dst], sp.rk_after[dst]) ^ sp.aff_b[dst]);
+                }
+                word |= (uint32_t)v << (8 * row);
+            }
+            hy_store32t(tab, cb + (uint32_t)k * HY_W1024, (uint8_t)enc, env,
+                        hy_tag(dir, round, col,
+                               (fam == HY_FAM_T32K ? HY_K_T32K_W : HY_K_T32_W) + k),
+                        word);
+        }
+    }
+    if (fam == HY_FAM_T32K) return;
+    for (int row = 0; row < 4; row++) {
+        const int dst = row + 4 * col;
+        for (int x = 0; x < 256; x++)
+            hy_store8t(tab, cb + HY_T32_R_OFF + (uint32_t)row * HY_W256, (uint8_t)x, env,
+                       hy_tag(dir, round, col, HY_K_T32_R + row),
+                       sp.outp[dst][(uint8_t)(x ^ sp.rk_after[dst])]);
+    }
+}
+
+// FAM_T8: 16 coefficient byte tables per column, XOR-accumulated per output
+// byte. No 32-bit load anywhere in this shape.
+static void fill_col_t8(uint8_t *tab, uint32_t cb, int dir, int round, int col,
+                        const RndSpec &sp, uint32_t env) {
+    const uint8_t (*M)[4] = sp.sbox_fwd ? MC : IMC;
+    for (int k = 0; k < 4; k++) {
+        const int src = hy_pick(sp.src_kind, k + 4 * col);
+        for (int row = 0; row < 4; row++)
+            for (int enc = 0; enc < 256; enc++)
+                hy_store8t(tab, cb + (uint32_t)(k * 4 + row) * HY_W256, (uint8_t)enc, env,
+                           hy_tag(dir, round, col, HY_K_T8_C + k * 4 + row),
+                           gmul(round_byte(sp, src, (uint8_t)enc), M[row][k]));
+    }
+    for (int row = 0; row < 4; row++) {
+        const int dst = row + 4 * col;
+        for (int x = 0; x < 256; x++)
+            hy_store8t(tab, cb + HY_T8_R_OFF + (uint32_t)row * HY_W256, (uint8_t)x, env,
+                       hy_tag(dir, round, col, HY_K_T8_R + row),
+                       sp.outp[dst][(uint8_t)(x ^ sp.rk_after[dst])]);
+    }
+}
+
+static void fill_round(uint8_t *tab, uint32_t base, int dir, int round, int fam,
+                       const RndSpec &sp, uint32_t env) {
     for (int col = 0; col < 4; col++) {
-        for (int side = 0; side < 2; side++) {
-            for (int b0 = 0; b0 < 256; b0++) {
-                for (int b1 = 0; b1 < 256; b1++) {
-                    uint8_t sb[2];
-                    int rows[2] = {side * 2, side * 2 + 1};
-                    for (int t = 0; t < 2; t++) {
-                        int dst = rows[t] + 4 * col;
-                        int src = hy_pick(src_kind, dst);
-                        uint8_t enc = (t == 0) ? (uint8_t)b0 : (uint8_t)b1;
-                        uint8_t clear = use_in_perm ? InPinv[src][enc] : enc;
-                        uint8_t v = use_pre ? (uint8_t)(clear ^ rk_in_pre[src]) : clear;
-                        sb[t] = sbox_fwd ? sbox(v) : v;
-                    }
-                    uint32_t word = 0;
-                    const uint8_t (*M)[4] = sbox_fwd ? MC : IMC;
-                    for (int row = 0; row < 4; row++) {
-                        uint8_t partial = (uint8_t)(gmul(sb[0], M[row][rows[0]]) ^ gmul(sb[1], M[row][rows[1]]));
-                        uint8_t q = Q[col][row][side][partial];
-                        word |= (uint32_t)q << (8 * row);
-                    }
-                    uint16_t logical = (uint16_t)(b0 | (b1 << 8));
-                    uint32_t off = base + (uint32_t)col * HY_COL + (side ? HY_U32 : 0);
-                    hy_store32(tab, off, logical, env, hy_tag(dir, round, col, side), word);
-                }
-            }
+        const uint32_t cb = base + (uint32_t)col * HY_COL;
+        if (fam == HY_FAM_PAIR) fill_col_pair(tab, cb, dir, round, col, sp, env);
+        else if (fam == HY_FAM_T8) fill_col_t8(tab, cb, dir, round, col, sp, env);
+        else fill_col_t32(tab, cb, dir, round, col, fam, sp, env);
+    }
+}
+
+// The schedule goes into the table so the reader is driven by data: a family
+// byte per (dir, round) plus a check byte, all sealed and masked with the rest.
+static void write_sched(uint8_t *tab, const int enc[9], const int dec[9]) {
+    for (int d = 0; d < 2; d++) {
+        const int *s = d == 0 ? enc : dec;
+        uint8_t *g = tab + HY_SCHED_OFF + (uint32_t)d * HY_SCHED_STRIDE;
+        uint8_t x = (uint8_t)d;
+        for (int r = 0; r < 9; r++) {
+            g[r] = (uint8_t)s[r];
+            x ^= (uint8_t)s[r];
         }
-        for (int row = 0; row < 4; row++) {
-            int dst = row + 4 * col;
-            for (int a = 0; a < 256; a++) {
-                for (int b = 0; b < 256; b++) {
-                    uint8_t mixed = (uint8_t)(Qi[col][row][0][a] ^ Qi[col][row][1][b] ^ rk_after[dst]);
-                    uint8_t enc = OutP[dst][mixed];
-                    uint32_t zoff = base + (uint32_t)col * HY_COL + HY_U32 + HY_U32 + (uint32_t)row * HY_U8;
-                    hy_store8(tab, zoff, (uint16_t)(a | (b << 8)), env, hy_tag(dir, round, col, 2 + row), enc);
-                }
-            }
-        }
+        g[9] = x;
     }
 }
 
@@ -304,8 +432,15 @@ static int generate(const char *out_path, uint32_t env, uint8_t key[16]) {
     }
 
     uint8_t P[9][16][256], Pi[9][16][256];
-    for (int r = 0; r < 9; r++)
-        for (int i = 0; i < 16; i++) rand_perm(P[r][i], Pi[r][i]);
+    uint8_t Pa[9][16], Pb[9][16];
+    for (int r = 0; r < 9; r++) {
+        if (SCHED_ENC[r] == HY_FAM_T32K) {
+            rand_affine(Pa[r], Pb[r]);
+            fill_affine(P[r], Pi[r], Pa[r], Pb[r]);
+        } else {
+            for (int i = 0; i < 16; i++) rand_perm(P[r][i], Pi[r][i]);
+        }
+    }
 
     // Round 0 previously took the plaintext byte straight as the table index, so
     // each entry equalled S(pt ^ k0) and a table reader could recover the key.
@@ -315,22 +450,22 @@ static int generate(const char *out_path, uint32_t env, uint8_t key[16]) {
     for (int i = 0; i < 16; i++) rand_perm(P0[i], P0i[i]);
 
     std::vector<uint8_t> tab(HY_TOTAL, 0);
+    write_sched(tab.data(), SCHED_ENC, SCHED_DEC);
 
     for (int r = 0; r < 9; r++) {
-        uint8_t Q[4][4][2][256], Qi[4][4][2][256];
-        for (int c = 0; c < 4; c++)
-            for (int row = 0; row < 4; row++)
-                for (int side = 0; side < 2; side++) rand_perm(Q[c][row][side], Qi[c][row][side]);
-        uint8_t zeros[16] = {};
         uint8_t rk_next[16];
         derive_rk(r + 1, key, rk_next);
-        fill_xor_round(tab.data(), hy_enc_col(r, 0), 0, r, 1,
-                       r == 0 ? key : zeros, r == 0,
-                       r == 0 ? (const uint8_t (*)[256])P0i : Pi[r - 1], 1,
-                       rk_next, P[r], Q, Qi, env, 1);
+        RndSpec sp;
+        sp.inp = (r == 0) ? (const uint8_t (*)[256])P0i : (const uint8_t (*)[256])Pi[r - 1];
+        sp.rk_pre = (r == 0) ? key : nullptr;
+        sp.rk_after = rk_next;
+        sp.outp = (const uint8_t (*)[256])P[r];
+        sp.aff_a = Pa[r];
+        sp.aff_b = Pb[r];
+        sp.src_kind = 1;
+        sp.sbox_fwd = 1;
+        fill_round(tab.data(), hy_enc_col(r, 0), 0, r, SCHED_ENC[r], sp, env);
         burn16(rk_next);                   // 本轮密钥随表写入完成即焚
-        burn(Q, sizeof(Q));                // Q 网络编码随表固化, 缓冲即焚
-        burn(Qi, sizeof(Qi));
     }
     {
         uint8_t rk10[16];
@@ -349,6 +484,8 @@ static int generate(const char *out_path, uint32_t env, uint8_t key[16]) {
         // P/Pi 编码链最后消费点已过, 全部焚毁 (~73KB)
         burn(P, sizeof(P));
         burn(Pi, sizeof(Pi));
+        burn(Pa, sizeof(Pa));
+        burn(Pb, sizeof(Pb));
     }
 
     auto table_enc = [&](const uint8_t in[16], uint8_t out[16]) {
@@ -368,8 +505,15 @@ static int generate(const char *out_path, uint32_t env, uint8_t key[16]) {
     for (int r = 0; r < 10; r++)
         for (int i = 0; i < 16; i++) rand_perm(D[r][i], Di[r][i]);
     uint8_t Mperm[9][16][256], Minv[9][16][256];
-    for (int r = 0; r < 9; r++)
-        for (int i = 0; i < 16; i++) rand_perm(Mperm[r][i], Minv[r][i]);
+    uint8_t Ma[9][16], Mb[9][16];
+    for (int r = 0; r < 9; r++) {
+        if (SCHED_DEC[r] == HY_FAM_T32K) {
+            rand_affine(Ma[r], Mb[r]);
+            fill_affine(Mperm[r], Minv[r], Ma[r], Mb[r]);
+        } else {
+            for (int i = 0; i < 16; i++) rand_perm(Mperm[r][i], Minv[r][i]);
+        }
+    }
 
     {
         uint8_t rk10[16];
@@ -389,22 +533,23 @@ static int generate(const char *out_path, uint32_t env, uint8_t key[16]) {
 
     for (int step = 0; step < 9; step++) {
         int fwd = 9 - step;
-        uint8_t Q[4][4][2][256], Qi[4][4][2][256];
-        for (int c = 0; c < 4; c++)
-            for (int row = 0; row < 4; row++)
-                for (int side = 0; side < 2; side++) rand_perm(Q[c][row][side], Qi[c][row][side]);
         // InvMC(x ^ rk) = InvMC(x) ^ InvMC(rk)。常量折进联合表。
         uint8_t rk_fwd[16], folded[16];
         derive_rk(fwd, key, rk_fwd);
         memcpy(folded, rk_fwd, 16);
         burn16(rk_fwd);                    // 拷入 folded 后即焚
         mix(folded, IMC);
-        uint8_t no_pre[16] = {};
-        fill_xor_round(tab.data(), hy_dec_mc(step), 1, step, 0,
-                       no_pre, 0, Di[fwd], 1, folded, Mperm[step], Q, Qi, env, 0);
+        RndSpec sp;
+        sp.inp = (const uint8_t (*)[256])Di[fwd];
+        sp.rk_pre = nullptr;
+        sp.rk_after = folded;
+        sp.outp = (const uint8_t (*)[256])Mperm[step];
+        sp.aff_a = Ma[step];
+        sp.aff_b = Mb[step];
+        sp.src_kind = 0;
+        sp.sbox_fwd = 0;
+        fill_round(tab.data(), hy_dec_mc(step), 1, step, SCHED_DEC[step], sp, env);
         burn16(folded);                    // 折叠常量随本轮表写入完成即焚
-        burn(Q, sizeof(Q));                // Q 网络编码即焚
-        burn(Qi, sizeof(Qi));
 
         uint8_t outv[16][256];
         for (int dst = 0; dst < 16; dst++) {
@@ -429,6 +574,8 @@ static int generate(const char *out_path, uint32_t env, uint8_t key[16]) {
         burn(Di, sizeof(Di));
         burn(Mperm, sizeof(Mperm));
         burn(Minv, sizeof(Minv));
+        burn(Ma, sizeof(Ma));
+        burn(Mb, sizeof(Mb));
     }
 
     auto table_dec = [&](const uint8_t in[16], uint8_t out[16]) {
@@ -541,6 +688,15 @@ static int generate(const char *out_path, uint32_t env, uint8_t key[16]) {
         fclose(inf);
         printf("round-0 input bijection: emitted hy_in.h\n");
     }
-    printf("table-check PASS\nseal-check PASS\nwrote %s (%u bytes)\n", out_path, HY_TOTAL);
+    printf("table-check PASS\nseal-check PASS\n");
+    {
+        static const char *nm[4] = {"F0", "F1", "F2", "F3"};
+        printf("round families enc:");
+        for (int r = 0; r < 9; r++) printf(" %s", nm[SCHED_ENC[r]]);
+        printf("\n              dec:");
+        for (int r = 0; r < 9; r++) printf(" %s", nm[SCHED_DEC[r]]);
+        printf("\n");
+    }
+    printf("wrote %s (%u bytes)\n", out_path, HY_TOTAL);
     return 0;
 }
