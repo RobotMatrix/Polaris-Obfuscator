@@ -195,3 +195,29 @@ build 自检            → vector-match PASS / roundtrip PASS（两代都过）
 ```
 **边界**：这只挡住"按明文下标直接搜"的提取器。双射表是二进制里的数据，
 读出来取逆之后同一攻击应当复活——这一点尚未用改造过的提取器实测，属于预期而非结论。
+
+## 11. dl4 的换钥（2026-11-17，实测）
+
+换钥流程本身没变（§3 的 1–4 步），只是新一代的表形状（每个 lane 一层随机双射 +
+每行两张 64K 组合表 + 256 项随机边界，见 `AFFINE-ROUNDS.md` 第八节）。本次：
+
+```
+$ python3 rotate_key.py
+key      : 755e563b1dffd249ef552c1bb778de29
+test_pt  : 6bc1bee22e409f96e93d7e117393172a
+test_ct  : abe296eea2625f251ba57ed0b408272c
+offsets  : K=[49, 7, 27, 16] C=[45, 45, 35, 56] CH=[23, 54, 53, 12]
+
+$ ./gen_hybrid hy_table.bin
+env: pagesize=16384 ncpu=10 cls=128
+table-check PASS / seal-check PASS
+wrote hy_table.bin (69206080 bytes)          # 0.92 s
+
+$ ./wbaes_dl4_clean   # 和 wbaes_dl4_max
+vector-match: PASS / roundtrip: PASS
+```
+
+`openssl enc -aes-128-ecb -K 755e… -nopad` 独立复核得到同一密文。
+产物：`exported-binaries/wbaes-challenge/macos/wbaes_dl4_{clean,max}`，`strip -S` 后
+69,798,304 / 69,814,832 B，校验和进 `sha256.txt`。
+
