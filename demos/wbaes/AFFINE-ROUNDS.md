@@ -47,3 +47,23 @@ for (int r = 0; r < HY_MC_ROUNDS; r++)
 上一轮把 `P0i` 加到解密尾部就触发过 `return 9`（回环自检失败），原因是**内部语义与外部编码混在一起**。
 轮间仿射比 P0 更危险：它同时碰 10 个轮边界、加密与解密两条路径、以及 DFA 双算的两份缓冲。
 按仓库铁律，改动必须整块落地并跑通自检，不允许"先加一半、等下次"。
+
+## 五、宽表融合的第一步：32 位 T-box 参考模型（已实测）
+
+`demos/wbaes/fused_round_ref.cpp` 把一轮 AES 折成"四次 32 位查表 + XOR"：
+
+```
+T[p][x] = MC(·, row) · S(x)          p = 4*col + row，输出 32 位
+out_col = T[p0][in[p0]] ^ T[p1][in[p1]] ^ T[p2][in[p2]] ^ T[p3][in[p3]] ^ rk_col
+```
+
+关键性质：**表路径里没有 SubBytes、没有 ShiftRows、没有 MixColumns 矩阵**——
+线性层被烘进表的 32 位输出，索引置换就是 ShiftRows。
+
+实测（2000 组随机输入/轮密钥，与明文轮逐字节比对）：
+```
+PASS: fused 32-bit T-box round == SubBytes+ShiftRows+MixColumns+AddRoundKey on 2000 vectors
+```
+
+这是融合的判据基线：先证明"折进表里"是对的，再谈把它接进 `gen_hybrid` 的生成流程
+（接的时候还要成对处理：输出侧随机仿射 + 下一轮输入侧取逆，以及加密/解密两条路径）。
