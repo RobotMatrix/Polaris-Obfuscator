@@ -47,7 +47,8 @@ reports/        每次运行的证据包（run.json + summary.md）
 - 阶段 4 G3/G4 博弈：完成，G3 在 w≤16 全成功、G4 仅 w=8 满足 4 KiB
 - 阶段 4A C6 证据层：完成（`c6.h/c6.cpp`，18 条断言，三平面 + 链式证据 + 状态机）
 - 阶段 4B C7 多样性：完成实验，**负结果**（16 实例均 16 次查询被恢复，多样性不加成本）
-- M3 起（LLVM pass、C2、阶段 3/4 博弈、Native VM）：未开始
+- 阶段 5 前置 DFA 实测：**失败**（9 条密文取钥，外部报告已本地复核）
+- M3 起（LLVM pass、C2、Native VM）：未开始
 - 证据：`reports/M0/`、`reports/M1/`、`reports/G0/`、`reports/G1-model/`、
   `reports/G1-model-addendum/`
 - 决策：`DECISIONS.md`（ADR-006 判定与选项、ADR-007 方案 B 结果与建议）
