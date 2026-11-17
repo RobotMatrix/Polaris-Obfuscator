@@ -44,7 +44,21 @@ ENC_BYTES = MC_SIZE + PAIRS
 DEC_ENTRY = PAIRS
 DEC_STEP = ROUND + PAIRS
 DEC_BYTES = DEC_ENTRY + HY_MC_ROUNDS * DEC_STEP + PAIRS
-HY_TOTAL = ENC_BYTES + DEC_BYTES  # 69_206_016
+HY_TABLES = ENC_BYTES + DEC_BYTES  # 69_206_016
+
+# dl3 adds a round-family schedule block after the tables: one family byte per
+# (direction, round) plus a check byte, sealed and masked with the rest.
+SCHED_OFF = HY_TABLES
+SCHED_STRIDE = 16
+SCHED_BYTES = 64
+HY_TOTAL = HY_TABLES + SCHED_BYTES  # 69_206_080; dl/dl2 lacked the block
+
+FAM_PAIR, FAM_T32, FAM_T8, FAM_T32K = 0, 1, 2, 3
+K_T32_W, K_T32_R = 16, 20
+K_T8_C, K_T8_R = 32, 48
+K_T32K_W = 64
+W1024 = 256 * 4
+W256 = 256
 
 MC = ((2, 3, 1, 1), (1, 2, 3, 1), (1, 1, 2, 3), (3, 1, 1, 2))
 S4 = (0x6, 0xB, 0x5, 0xC, 0x1, 0xF, 0x0, 0xE, 0x9, 0x2, 0x7, 0xD, 0xA, 0x4, 0x3, 0x8)
@@ -173,6 +187,84 @@ def read_row(table, env, col, side, row, reader=None):
         y = logical >> 8
         out[x * 256 + y] = rd(p + row)
     return out
+
+
+# ---- dl3: rounds whose tables are indexed by one byte ----------------------
+def hy_scatter8(x, env, tag):
+    """wbaes_hybrid.h hy_scatter8: odd multiplier mod 256, positions permuted per tag."""
+    k = (env ^ ((tag * 0x9E3779B1) & 0xFFFFFFFF) ^ 0xA5C31E87) & 0xFFFFFFFF
+    return ((((k | 1) & 255) * x) + ((k >> 8) & 255)) & 0xFF
+
+
+def round_base(direction, rnd):
+    if direction == 0:
+        return rnd * ROUND
+    return ENC_BYTES + DEC_ENTRY + rnd * DEC_STEP
+
+
+def sched_family(get, direction, rnd):
+    """The family byte the generator wrote for this (direction, round)."""
+    return get(SCHED_OFF + direction * SCHED_STRIDE + rnd)
+
+
+def read_wide_row(get, env, direction, rnd, col, k, kind_base, row):
+    """One output row of a 256-entry 32-bit table, indexed by the encoded byte."""
+    off = round_base(direction, rnd) + col * COL + k * W1024
+    tag = hy_tag(direction, rnd, col, kind_base + k)
+    return [get(off + hy_scatter8(enc, env, tag) * 4 + row) for enc in range(256)]
+
+
+def read_t8_row(get, env, direction, rnd, col, k, row):
+    """One 256-entry coefficient byte table (F2): MC[row][k] * S(clear)."""
+    off = round_base(direction, rnd) + col * COL + (k * 4 + row) * W256
+    tag = hy_tag(direction, rnd, col, K_T8_C + k * 4 + row)
+    return [get(off + hy_scatter8(enc, env, tag)) for enc in range(256)]
+
+
+INV_SBOX = [0] * 256
+for _i, _v in enumerate(SBOX):
+    INV_SBOX[_v] = _i
+
+
+def tbox_rows(get, env, direction, rnd, col, k, fam):
+    """The four output rows of the table that source k feeds, indexed by enc byte."""
+    if fam == FAM_T8:
+        return [read_t8_row(get, env, direction, rnd, col, k, row) for row in range(4)]
+    kb = K_T32_W if fam == FAM_T32 else K_T32K_W
+    return [read_wide_row(get, env, direction, rnd, col, k, kb, row) for row in range(4)]
+
+
+def recover_key_tbox(get, env, p0, fam):
+    """Round-0 byte-indexed tables hand over the key; no search is needed.
+
+    F1/F2 store MC[row][k] * S(P0i[enc] ^ key). MixColumns has a 1 in every row,
+    so one output row per source returns S(x ^ k) verbatim: undo the round-0
+    input bijection, apply the inverse S-box, and the key byte is immediate. The
+    other three rows then have to agree on all 256 entries or the table is not
+    the one we think it is.
+
+    F3 multiplies every lane by its affine output encoding as well, so its rows
+    are a * scalar ^ offset away from S(x ^ k); solving that is not implemented.
+    """
+    if fam == FAM_T32K:
+        raise SystemExit("round 0 is FAM_T32K: lanes carry an affine scalar")
+    if p0 is None:
+        raise SystemExit("round 0 is byte-indexed: HY_P0 is needed to undo the input bijection")
+    key = bytearray(16)
+    for col in range(4):
+        for k in range(4):
+            src = hy_sr_src(k + 4 * col)
+            rows = tbox_rows(get, env, 0, 0, col, k, fam)
+            one = 2 if k < 2 else 0  # MC[2][0]=MC[2][1]=1, MC[0][2]=MC[0][3]=1
+            key[src] = INV_SBOX[rows[one][p0[src][0]]]
+            for row in range(4):
+                m = MC[row][k]
+                for a in range(256):
+                    if rows[row][p0[src][a]] != gmul(m, SBOX[a ^ key[src]]):
+                        raise SystemExit(
+                            f"t-box mismatch col {col} k {k} row {row} x {a:02x}: "
+                            "table is not MC[row][k]*S(x^k)")
+    return bytes(key)
 
 
 def relabel(B, p0_0, p0_1):
@@ -545,8 +637,9 @@ def main(argv=None):
     with open(args.binary, "rb") as f:
         digest = hashlib.sha256(f.read()).hexdigest()
     cputype, seg, sect, off, size = find_section(args.binary)
-    if size != HY_TOTAL:
+    if size not in (HY_TOTAL, HY_TABLES):
         raise SystemExit(f"{seg},{sect} is {size} bytes, expected HY_TOTAL={HY_TOTAL}")
+    has_sched = size == HY_TOTAL  # dl/dl2 predate the schedule block
     with open(args.binary, "rb") as f:
         f.seek(off)
         table = f.read(size)
@@ -582,28 +675,53 @@ def main(argv=None):
         for off, cand in p0cands:
             modes.append((s, cand, f"mask seed 0x{s:08x} + input bijection @{off}"))
 
-    key, seed_used, mode = None, None, None
+    key, seed_used, mode, get, tbox = None, None, None, None, False
     for s, cand, label in modes:
         reader = make_reader(table, s)
+        get = reader if reader is not None else table.__getitem__
+        fam0 = sched_family(get, 0, 0) if has_sched else FAM_PAIR
         try:
-            k = recover_key(table, env, cand, reader)
+            if fam0 in (FAM_T32, FAM_T8, FAM_T32K):
+                # dl3: round 0 is a byte-indexed T-box, so the pair-table search
+                # below does not describe it at all - read it the way it is built.
+                k = recover_key_tbox(get, env, cand, fam0)
+                label = f"{label}, round 0 family {fam0}"
+                tbox = True
+            else:
+                k = recover_key(table, env, cand, reader)
+                if not rows_consistent(table, env, k, cand, reader):
+                    continue
+                tbox = False
         except SystemExit:
-            continue
-        if not rows_consistent(table, env, k, cand, reader):
             continue
         key, seed_used, mode = k, s, label
         break
     if key is None:
         raise SystemExit("recovery failed: no candidate key (wrong env, or a hardening we do not undo)")
     print(f"mode    : {mode}")
+    if has_sched:
+        names = {FAM_PAIR: "F0", FAM_T32: "F1", FAM_T8: "F2", FAM_T32K: "F3"}
+        fams = [sched_family(get, d, r) for d in (0, 1) for r in range(HY_MC_ROUNDS)]
+        print("schedule: enc " + " ".join(names.get(f, "??") for f in fams[:HY_MC_ROUNDS]))
+        print("          dec " + " ".join(names.get(f, "??") for f in fams[HY_MC_ROUNDS:]))
     if seed_used is not None:
-        print(f"mask seed vs FNV-1a(key): 0x{fnv1a16(key):08x} -> "
-              f"{'match' if fnv1a16(key) == seed_used else 'MISMATCH'}")
-    for col in range(4):
-        for side in range(2):
-            dst0 = 4 * col + 2 * side
-            print(f"  col {col} side {side}: key[{hy_sr_src(dst0):2d}]=0x{key[hy_sr_src(dst0)]:02x} "
-                  f"key[{hy_sr_src(dst0 + 1):2d}]=0x{key[hy_sr_src(dst0 + 1)]:02x}")
+        fnv = fnv1a16(key)
+        if fnv == seed_used:
+            print(f"mask seed vs FNV-1a(key): 0x{fnv:08x} -> match")
+        else:
+            print(f"mask seed is not FNV-1a(key) (0x{seed_used:08x} vs 0x{fnv:08x}): "
+                  "seed is independent, key proven by table structure + test vector")
+    if tbox:
+        for col in range(4):
+            pairs = " ".join(f"key[{hy_sr_src(k + 4 * col):2d}]=0x{key[hy_sr_src(k + 4 * col)]:02x}"
+                             for k in range(4))
+            print(f"  col {col}: {pairs}")
+    else:
+        for col in range(4):
+            for side in range(2):
+                dst0 = 4 * col + 2 * side
+                print(f"  col {col} side {side}: key[{hy_sr_src(dst0):2d}]=0x{key[hy_sr_src(dst0)]:02x} "
+                      f"key[{hy_sr_src(dst0 + 1):2d}]=0x{key[hy_sr_src(dst0 + 1)]:02x}")
     print(f"AES-128 key: {key.hex()}")
 
     if args.verify:
