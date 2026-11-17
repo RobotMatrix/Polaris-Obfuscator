@@ -178,3 +178,20 @@ key reproduces the shipped binary: YES
 
 **注意**：`gen_hybrid` 每跑一次都会生成不同的表（内部随机置换），
 所以 `hy_table.bin` 与 `hy_seal.h` 必须来自同一次生成，二进制也必须用这一次的表重编。
+
+## 10. 第 0 轮输入侧双射（2026-11-17，实测前后对照）
+
+§7 的短板是第 0 轮直接把明文当表下标，于是表项等于 `S(pt^k0)`。现在 `gen_hybrid`
+给第 0 轮也加了一层输入双射：表按下标 `P0(pt)` 排列，运行时在第一次查表前套一次 `P0`
+（`hy_in.h`，16×256 表，随表一起烘进二进制）。内部语义不变，第 0 轮仍然看到明文，
+所以解密路径不需要额外变换。
+
+前后对照（同一把钥 `62bc…`，同一 `extract_key.py`）：
+```
+旧构建 wbaes_max      → AES-128 key: 62bce36db18696c154751334adb74da7  （约 2 s）
+新构建 wbaes_max_in   → recovery failed: no candidate pair
+新构建 wbaes_clean_in → recovery failed: no candidate pair
+build 自检            → vector-match PASS / roundtrip PASS（两代都过）
+```
+**边界**：这只挡住"按明文下标直接搜"的提取器。双射表是二进制里的数据，
+读出来取逆之后同一攻击应当复活——这一点尚未用改造过的提取器实测，属于预期而非结论。
