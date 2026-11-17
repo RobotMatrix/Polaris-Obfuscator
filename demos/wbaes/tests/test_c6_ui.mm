@@ -13,8 +13,10 @@ extern "C" {
 }
 
 #define WBAES_NO_MAIN 1
-#include "demo_wbaes_noasm.cpp"
+#define WBAES_BAKED 1   // 发布路径: 十轮全表 (kHyTab, iPhone8 env 16384/6/128), 无 S 盒/无轮密钥异或
+#include "demo_wbaes.cpp"
 #undef WBAES_NO_MAIN
+#undef WBAES_BAKED
 
 static char g_results[8192];
 static WBAES g_wb;
@@ -38,6 +40,26 @@ static void run_all_tests(void) {
     int fails = 0;
     int ok;
     char line[160];
+
+    // 0. DEBUG: 固定向量自检上屏 (定位真机 UI 上下文失败用, 排查后删除)
+    {
+        uint8_t pt[16] = {0x6b,0xc1,0xbe,0xe2,0x2e,0x40,0x9f,0x96,
+                          0xe9,0x3d,0x7e,0x11,0x73,0x93,0x17,0x2a};
+        uint8_t ct_exp[16] = {0xde,0x23,0x99,0x2a,0xa3,0xc7,0x42,0x7f,
+                              0x3a,0xd4,0x0f,0xda,0x83,0x73,0x0d,0x07};
+        uint8_t ct1[16], ct2[16], rt[16];
+        g_wb.encrypt(pt, ct1);
+        g_wb.encrypt(pt, ct2);
+        g_wb.decrypt(ct1, rt);
+        snprintf(line, sizeof(line),
+                 "[DBG] v=%s rt=%s det=%d ready=%d psn=%08x env=%08x ct=%02x%02x%02x%02x\n",
+                 memcmp(ct1, ct_exp, 16) == 0 ? "P" : "F",
+                 memcmp(rt, pt, 16) == 0 ? "P" : "F",
+                 memcmp(ct1, ct2, 16) == 0,
+                 g_s5_ready, g_poison, g_env,
+                 ct1[0], ct1[1], ct1[2], ct1[3]);
+        strcat(g_results, line);
+    }
 
     // 1. hashtable
     {

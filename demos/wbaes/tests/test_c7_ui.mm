@@ -6,8 +6,10 @@
 #include <cstdlib>
 
 #define WBAES_NO_MAIN 1
-#include "demo_wbaes_noasm.cpp"
+#define WBAES_BAKED 1   // 发布路径: 十轮全表 (kHyTab, iPhone8 env 16384/6/128), 无 S 盒/无轮密钥异或
+#include "demo_wbaes.cpp"
 #undef WBAES_NO_MAIN
+#undef WBAES_BAKED
 
 static char g_results[8192];
 static WBAES g_wb;

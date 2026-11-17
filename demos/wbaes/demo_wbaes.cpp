@@ -30,8 +30,8 @@
 //
 // Polaris 混淆: 查表热路径 sub/bcf/fla + MIR (asm 标记)
 //
-// 烘焙发布路径 (WBAES_BAKED)：首尾两轮逐字节吸收份额，中间轮只查表。
-// 表输出的编码烤在下一张表的下标里。密钥不放成对份额，也不拼成 16 字节。
+// 烘焙发布路径 (WBAES_BAKED)：十轮都在外部表里。运行时只做下标散布后的查表，
+// 不计算 S 盒，也不把轮密钥异或进状态。表项是随机置换后的列混合结果。
 // =============================================================================
 
 #include <cstdio>
@@ -50,17 +50,15 @@
 #include "wbaes_hybrid.h"
 namespace wbaes_key {
 static uint32_t g_key_tampered = 0;
-static const uint8_t test_pt[16] = {
-    0x6b,0xc1,0xbe,0xe2,0x2e,0x40,0x9f,0x96,
-    0xe9,0x3d,0x7e,0x11,0x73,0x93,0x17,0x2a};
-static const uint8_t test_ct[16] = {
-    0xde,0x23,0x99,0x2a,0xa3,0xc7,0x42,0x7f,
-    0x3a,0xd4,0x0f,0xda,0x83,0x73,0x0d,0x07};
+#include "wbaes_testvec.h"
 }
 extern "C" {
 extern const uint32_t kMidEnc[];
 extern const uint32_t kMidDec[];
 extern const uint32_t kSharePool[];
+}
+extern "C" {
+extern const uint8_t kHyTab[];  // baked hybrid table (hy_tab.S .incbin)
 }
 #endif
 
@@ -152,6 +150,16 @@ static uint64_t wb_prng_next() {
     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
     z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
     return z ^ (z >> 31);
+}
+
+#if defined(__APPLE__)
+extern "C" uint32_t arc4random(void);
+#endif
+// 运行期随机 (陷阱抽查 / tamper 垃圾输出): 走系统熵源, 不推进 wb_prng_state。
+// splitmix64 全程可逆 — 垃圾输出若来自密钥派生 PRNG, 攻击者读若干输出字节
+// 即可反推状态 → 重推 init 期全部仿射编码。运行期抽取与派生流隔离后该链闭合。
+static inline uint32_t wb_runtime_rand() {
+    return arc4random();
 }
 
 // 裸矩阵前向仿射 (无常量): y = M·x
@@ -360,6 +368,11 @@ static void build_block_plan(uint64_t seed) {
         j = (int)(plan_next() % (uint64_t)(i + 1));
         t = DWB_PLAN[i]; DWB_PLAN[i] = DWB_PLAN[j]; DWB_PLAN[j] = t;
     }
+    // 密钥派生 seed 状态用完即焚 (plan 构建后不再续流)
+    {
+        volatile uint64_t *vp = &g_plan_rng;
+        *vp = 0;
+    }
 }
 
 #ifndef WBAES_BAKED
@@ -398,6 +411,11 @@ static void rk_next_word(uint8_t w[16]) {
     w[8] = w[12]; w[9] = w[13]; w[10] = w[14]; w[11] = w[15];
     w[12] = n0; w[13] = n1; w[14] = n2; w[15] = n3;
     g_rk_step++;
+    // g() 输出 (轮密钥衍生物) 用完即焚
+    {
+        volatile uint8_t *vt = t;
+        for (int i = 0; i < 4; i++) vt[i] = 0;
+    }
 }
 // 递推到下一轮 (4 字): 调用后 w[0..15] = 完整下一轮密钥
 static void rk_next_round(uint8_t w[16]) {
@@ -410,8 +428,17 @@ static uint64_t prng_seed_from(int lane);
 #if defined(__APPLE__)
 #include <sys/types.h>
 #include <sys/sysctl.h>
-#include <sys/ptrace.h>
 #include <unistd.h>
+#include <TargetConditionals.h>
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+// iOS SDK 不公开 sys/ptrace.h; libSystem 里有符号, 手动声明
+#ifndef PT_DENY_ATTACH
+#define PT_DENY_ATTACH 31
+#endif
+extern "C" int ptrace(int _request, pid_t _pid, void *_addr, int _data);
+#else
+#include <sys/ptrace.h>
+#endif
 // 反调试 v2 (静默降级): 检测到调试器 → 置污染位走错误分支, 不退出进程.
 // 攻击者 attach 后看到"正常运行", 但密钥派生已污染 → 表失真 → 输出乱码,
 // 与分片改写/DFA 防护触发的失败完全不可区分 (攻击者无从判断哪层防护命中).
@@ -739,14 +766,15 @@ void WBAES::init() {
     g_poison = 0;
 #endif
     {
-        int pagesize = 0, ncpu = 0, cls = 0;
-        size_t nsz = sizeof(int);
+        // hw.cachelinesize 是 8 字节 sysctl, int 缓冲会 ENOMEM → 读成 0 (与生成端一致地修)
+        unsigned long long pagesize = 0, ncpu = 0, cls = 0;
+        size_t nsz = sizeof(pagesize);
         sysctlbyname("hw.pagesize", &pagesize, &nsz, nullptr, 0);
-        nsz = sizeof(int);
+        nsz = sizeof(ncpu);
         sysctlbyname("hw.ncpu", &ncpu, &nsz, nullptr, 0);
-        nsz = sizeof(int);
+        nsz = sizeof(cls);
         sysctlbyname("hw.cachelinesize", &cls, &nsz, nullptr, 0);
-        g_env = hy_env_mix(pagesize, ncpu, cls);
+        g_env = hy_env_mix((int)pagesize, (int)ncpu, (int)cls);
     }
     g_s5_ready = 1;
     return;
@@ -761,9 +789,9 @@ void WBAES::init() {
 #endif
     wbaes_key::verify_shards();            // 最早执行: 分片完整性 (写 g_key_tampered)
     build_block_plan(wbaes_key::fnv1a(wbaes_key::KBLK_A[0], 72) ^ ((uint64_t)wbaes_key::fnv1a(wbaes_key::CBLK_A[0], 72) << 32));
-    const uint32_t sk = (uint32_t)wb_prng_next() ^ (uint32_t)(uintptr_t)this;
+    uint32_t sk = (uint32_t)wb_prng_next() ^ (uint32_t)(uintptr_t)this;
     if (!g_wbaes_tls_init) { pthread_key_create(&g_wbaes_tls_key, nullptr); g_wbaes_tls_init = 1; }
-    const uint32_t half_b = (uint32_t)wb_prng_next();   // TLS 半 B: 两链共享
+    uint32_t half_b = (uint32_t)wb_prng_next();   // TLS 半 B: 两链共享
     g_tls_half_b = half_b;
     // 会话随机 kk 遍历序: XOR 可交换 → 输出不变; Unicorn trace 查表序列每会话不同
     {
@@ -776,6 +804,26 @@ void WBAES::init() {
     }
     init_tables(t1, prng_seed_from(0), sk, half_b);   // 链 1
     init_tables(t2, prng_seed_from(0), sk, half_b);   // 链 2: 同编码等价轨
+    // 会话半值栈副本用完即焚 (T.session_half_a / TLS 内的正本按设计存续)
+    {
+        volatile uint32_t *vs = &sk, *vh = &half_b;
+        *vs = 0; *vh = 0;
+    }
+    // 密钥派生 PRNG 状态用完即焚: init 后运行期抽取走 wb_runtime_rand (系统熵源),
+    // 不再续流; 留着可逆的 splitmix 状态 = 留着重推全部仿射编码的钥匙
+    {
+        volatile uint64_t *vp = &wb_prng_state;
+        *vp = 0;
+    }
+#ifdef WBAES_DYNAMIC_KEY
+    // 注入分片用完即焚: 表已建, 二次 init 必须重新注入 (g_dyn_ready=0 强制)
+    for (int s = 0; s < 4; s++)
+        for (int b = 0; b < 4; b++) {
+            volatile uint8_t *p1 = &g_dyn_part[s][b], *p2 = &g_dyn_cover[s][b];
+            *p1 = 0; *p2 = 0;
+        }
+    g_dyn_ready = 0;
+#endif
 #endif
 }
 
@@ -809,7 +857,7 @@ static void init_tables(WBAESTables &t, uint64_t seed, uint32_t sk, uint32_t hal
         }
         for (int i = 0; i < 4; i++) g_kk_order[i] = ord[i];
     }
-    const uint32_t sk_eff = sk ^ half_b;   // 完整会话 key (读写对称, 两链共享 half_b)
+    uint32_t sk_eff = sk ^ half_b;   // 完整会话 key (读写对称, 两链共享 half_b; 函数尾焚毁)
     // 陷阱表: 填充加密哨兵 — 正常运行永不查询; 攻击者盲改表区若波及 → 可检测
     {
         const uint32_t sent = 0x57AB1E5Au ^ sk_eff;
@@ -851,7 +899,7 @@ static void init_tables(WBAESTables &t, uint64_t seed, uint32_t sk, uint32_t hal
     }
     // ---- S 盒数学生成 (零数据): SBox(x) = affine(x^-1), FIPS-197 3.2 定义式 ----
     {
-        uint8_t sb_std[256], iv_std[256];          // 栈上瞬时, init 结束即灭
+        uint8_t sb_std[256], iv_std[256];          // 栈上瞬时
         for (int i = 0; i < 256; i++) {
             sb_std[i] = sbox_affine_bit(gf_inv((uint8_t)i));
             iv_std[sb_std[i]] = (uint8_t)i;
@@ -859,6 +907,11 @@ static void init_tables(WBAESTables &t, uint64_t seed, uint32_t sk, uint32_t hal
         for (int i = 0; i < 256; i++) {
             SBOX_S[i] = aff_fwd(&g_sbox_aff, sb_std[i], 1);
             INV_S[i]  = aff_fwd(&g_inv_aff,  iv_std[i], 1);
+        }
+        // 标准 SBox/InvSBox 序列是著名扫描指纹 — 已从数据段消除, 栈副本同样烧毁
+        {
+            volatile uint8_t *p1 = sb_std, *p2 = iv_std;
+            for (int i = 0; i < 256; i++) { p1[i] = 0; p2[i] = 0; }
         }
     }
     // 反调试毒化点 A (链 1): 读数进入交叉链
@@ -931,6 +984,11 @@ static void init_tables(WBAESTables &t, uint64_t seed, uint32_t sk, uint32_t hal
             for (int j = 0; j < 4; j++)
                 for (int x = 0; x < 256; x++)
                     T.FT[kk][j][x] = WBAESTables::enc((uint32_t)(x ^ w[4 * j + kk]) << (24 - 8 * kk), sk_eff, (uintptr_t)&T.FT[kk][j][x], 2);
+        // 窗口用后即焚: FT 是加密方向最后一次用 RK10, 与解密块同一纪律
+        {
+            volatile uint8_t *vw = w;
+            for (int i = 0; i < 16; i++) vw[i] = 0;
+        }
     }
 
     // ============ 解密方向 (窗口重置, 正向二次递推) ============
@@ -974,6 +1032,13 @@ static void init_tables(WBAESTables &t, uint64_t seed, uint32_t sk, uint32_t hal
             for (int i = 0; i < 16; i++) vw[i] = 0;
         }
     }
+    // 会话密钥与链 seed 的栈副本用完即焚 (volatile 写阻优化器删除)
+    {
+        volatile uint32_t *vk = &sk_eff;
+        *vk = 0;
+        volatile uint64_t *vd = &seed;
+        *vd = 0;
+    }
 }
 #endif // WBAES_BAKED
 
@@ -995,22 +1060,22 @@ void WBAES::encrypt(const uint8_t in[16], uint8_t out[16]) const {
 #else
     // 陷阱抽查: 随机选一个 decoy 项, 解密应等于哨兵 — 被篡改 → 毒化
     {
-        const int di = (int)(wb_prng_next() % 16);
-        const int dz = (int)(wb_prng_next() % 256);
+        const int di = (int)(wb_runtime_rand() % 16);
+        const int dz = (int)(wb_runtime_rand() % 256);
         if (WBAESTables::dec(&t1.DECOY[di][dz], t1.session_half_a, 5) !=
             (t1.DECOY_SENTINEL ^ (uint32_t)(di * 256 + dz)))
             wbaes_key::g_key_tampered |= 0x8000u;
     }
 #endif
     if (wbaes_key::g_key_tampered & 0x8000u) {
-        for (int i = 0; i < 16; i++) out[i] = (uint8_t)(wb_prng_next() & 0xFF);
+        for (int i = 0; i < 16; i++) out[i] = (uint8_t)(wb_runtime_rand() & 0xFF);
         return;                  // 走错误分支: PRNG 垃圾, 非 fault cypher
     }
     // 轮级双算 (DFA 深防): 故障在 core 内部即被拦截
     // 调用栈化: core 入口指针由栈变量运行时计算 (非直接 BL 符号)
     uint8_t ct[16];
     if (enc_core(t1, t2, in, ct) != 0) {
-        for (int i = 0; i < 16; i++) out[i] = (uint8_t)(wb_prng_next() & 0xFF);
+        for (int i = 0; i < 16; i++) out[i] = (uint8_t)(wb_runtime_rand() & 0xFF);
         return;
     }
 #ifdef WBAES_BAKED
@@ -1020,7 +1085,7 @@ void WBAES::encrypt(const uint8_t in[16], uint8_t out[16]) const {
     // 回环自检: encrypt 后 decrypt 验证 — fault 泄漏到输出的故障密文
     uint8_t back[16];
     if (dec_core(t1, t2, ct, back) != 0 || memcmp(back, in, 16) != 0) {
-        for (int i = 0; i < 16; i++) out[i] = (uint8_t)(wb_prng_next() & 0xFF);
+        for (int i = 0; i < 16; i++) out[i] = (uint8_t)(wb_runtime_rand() & 0xFF);
         return;
     }
     memcpy(out, ct, 16);
@@ -1031,11 +1096,11 @@ __attribute((__annotate__(("substitution,linearmba,aliasaccess,boguscfg,flatten,
 void WBAES::decrypt(const uint8_t in[16], uint8_t out[16]) const {
     anti_debug_check(1);
     if (wbaes_key::g_key_tampered & 0x8000u) {
-        for (int i = 0; i < 16; i++) out[i] = (uint8_t)(wb_prng_next() & 0xFF);
+        for (int i = 0; i < 16; i++) out[i] = (uint8_t)(wb_runtime_rand() & 0xFF);
         return;
     }
     if (dec_core(t1, t2, in, out) != 0) {
-        for (int i = 0; i < 16; i++) out[i] = (uint8_t)(wb_prng_next() & 0xFF);
+        for (int i = 0; i < 16; i++) out[i] = (uint8_t)(wb_runtime_rand() & 0xFF);
     }
 }
 
@@ -1289,6 +1354,25 @@ int WBAES::dump_tables(const char *path) const {
 // 自验: pycryptodome 预计算向量 (wbaes_key.h) + 加解密回环
 // -----------------------------------------------------------------------------
 int main(int argc, char **argv) {
+#ifdef WBAES_IOS_RESULT_FILE
+    // 真机验证: 结果写沙盒 Documents (PT_DENY_ATTACH 下 devicectl --console 不可靠)
+    {
+        const char *home = getenv("HOME");
+        char p[512];
+        snprintf(p, sizeof p, "%s/Documents/result.txt", home ? home : "/tmp");
+        if (!freopen(p, "w", stdout)) fprintf(stderr, "result file open failed\n");
+        setvbuf(stdout, nullptr, _IONBF, 0);
+        // 上报本机 env 原始参数 (非密钥, 供生成端对齐)
+        unsigned long long e_ps = 0, e_nc = 0, e_cl = 0;
+        size_t sz = sizeof(e_ps);
+        sysctlbyname("hw.pagesize", &e_ps, &sz, nullptr, 0);
+        sz = sizeof(e_nc);
+        sysctlbyname("hw.ncpu", &e_nc, &sz, nullptr, 0);
+        sz = sizeof(e_cl);
+        sysctlbyname("hw.cachelinesize", &e_cl, &sz, nullptr, 0);
+        printf("device-env: pagesize=%llu ncpu=%llu cls=%llu\n", e_ps, e_nc, e_cl);
+    }
+#endif
     anti_debug_check(2);   // writeup 攻击环 4: 调试器 → 静默走错误分支 (不退出)
     WBAES wb;
     wb.init();

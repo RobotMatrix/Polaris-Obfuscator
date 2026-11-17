@@ -71,10 +71,11 @@ static void test_decoy(void) {
     static WBAES wb4;
     wb4.init();
     volatile uint8_t *dz = (volatile uint8_t *)&wb4.t1.DECOY[0][0];
-    for (int k = 0; k < 512; k++) dz[k] ^= 0x10;   // DECOY[0..1][*] 全翻 (di 命中率 1/8)
+    for (int k = 0; k < 2048; k++) dz[k] ^= 0x10;   // DECOY[0..1][*] 全翻 (di 命中率 1/8)
     int poisoned = 0;
     uint8_t o2[16];
-    for (int k = 0; k < 64; k++) {
+    // 运行期抽查下标走系统熵源 (不可预测), 256 次重试 → 漏检率 (7/8)^256 ≈ 5e-15
+    for (int k = 0; k < 256; k++) {
         wb4.encrypt(pt, o2);
         if (memcmp(o2, ct_ok, 16) != 0) { poisoned = 1; break; }
     }
