@@ -43,8 +43,8 @@ clang++ -O2 -std=c++17 -I$W $W/gen_hybrid.cpp -o gen_hybrid
 
 # 3) 进链接并重新编译白盒可执行文件
 cp $W/hy_tab.S .
-clang++ -O2 -std=c++17 -DWBAES_BAKED -DWBAES_NO_MIR -I$W \
-        $W/demo_wbaes.cpp hy_tab.S -o wbaes_baked_keyrot
+clang++ -O2 -std=c++17 -DWBAES_BAKED -DWBAES_NO_MIR -I. -I$W \
+        $W/demo_wbaes.cpp hy_tab.S -o wbaes_baked_keyrot   # -I. 用于生成出的 hy_seal.h
 
 # 4) 运行自检
 ./wbaes_baked_keyrot
@@ -167,3 +167,14 @@ key reproduces the shipped binary: YES
 细节与剩余风险见 `DFA-ANALYSIS.md`。**注意**：本文 §7 的表级提取短板**没有修**——
 第 0 轮缺输入侧编码的问题依旧，`extract_key.py` 仍可在数秒内取回密钥；
 做了 DFA 双算不等于解决了静态提取，两者是不同攻击面。
+
+## 9. 表完整性与 DFA 双算（2026-11-17）
+
+- `gen_hybrid` 现在同时写出 `hy_seal.h`（全表 FNV-1a + stride 4096 抽样值），
+  编译时需加 `-I.` 指向生成本目录；缺这个文件会编译失败（不给"静默用旧表"的机会）。
+- 运行时首次调用做一次全表校验（69 MB，约数十毫秒），之后每次调用做抽样校验。
+- 实测翻转表区一个字节：输出变随机垃圾，`vector-match: FAIL`。
+- 已知边界：校验代码本身可被 patch；抽样只覆盖 stride 4096 上的位置。
+
+**注意**：`gen_hybrid` 每跑一次都会生成不同的表（内部随机置换），
+所以 `hy_table.bin` 与 `hy_seal.h` 必须来自同一次生成，二进制也必须用这一次的表重编。
