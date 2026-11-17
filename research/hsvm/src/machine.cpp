@@ -267,6 +267,10 @@ bool Machine::step() {
   case Opcode::Nop:
     break;
   case Opcode::Movi:
+    if (!regOk(in.dst)) {
+      fault("movi destination out of range");
+      return true;
+    }
     regs_[in.dst] = in.imm;
     break;
   case Opcode::Mov:

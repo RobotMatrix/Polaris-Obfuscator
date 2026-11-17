@@ -497,3 +497,22 @@ LLVM IR 放在 V-08 的 Polaris pass 里。代价：这里不能取性能口径�
 **踩到的坑**：`Machine::run()` 默认 `maxSteps = 1e6`，把解释器悄悄截断，导致首次测量 `MISMATCH`
 且耗时与规模无关（1.79/1.79/1.80 s）。教训：性能比较必须先断言两侧结果相同；
 `hsvm_bench` 结果不同时返回 1，ctest `bench_match` 只断言 `MATCH`，不断言耗时。
+
+## ADR-032 性质测试抓到 Movi 越界写，三方随机比对 1000 例无分歧（2026-11-17）
+
+`tools/hsvm_fuzz.cpp`（ctest `fuzz_threeway`）随机生成字节码，三方（解释器 / oracle / lowering）
+逐步比对寄存器、pc、状态位，内存整块比在结束时与故障时。
+
+**它抓到的真 bug**：`Movi` 是解释器里**唯一没有 `regOk` 检查**的 opcode
+（`src/machine.cpp` 原为 `regs_[in.dst] = in.imm;`），而 `dst` 是 u8、可达 255，
+于是损坏字节码会越界写 `std::vector<uint32_t>` —— 未定义行为，不是"结果不对"。
+已修：解释器、`semantics.h`、`lower.cpp` 三处一致加检查；`test_semantics` 38 → 42 条断言。
+
+结果：seed 20260117 与 1/2/3/424242 各 200 个程序，`diverged=0`，
+合计约 24 万步、130 次故障、43 次正常停机。ctest 27 个测试全绿。
+
+**为什么固定用例抓不到**：没人会在手写用例里写 `movi r16, x`；
+而字节码本身就是攻击者可控输入，越是"没人这么写"的路径越该被随机化覆盖。
+
+**未覆盖**：`Ld/St` 的未对齐分支（生成器的立即数都是 64 的倍数）；
+真编译器 pass 没有纳入随机测试（每次要调 clang）；`diverged=0` 不等于语义完全正确。

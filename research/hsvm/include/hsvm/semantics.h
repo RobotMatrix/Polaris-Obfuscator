@@ -58,6 +58,10 @@ inline bool semStep(SemState &s, const MirOp &op) {
     s.pc += 1;
     return true;
   case Opcode::Movi:
+    if (!semRegOk(s, op.dst)) {
+      s.faulted = true;
+      return false;
+    }
     s.regs[op.dst] = op.imm;
     s.pc += 1;
     return true;

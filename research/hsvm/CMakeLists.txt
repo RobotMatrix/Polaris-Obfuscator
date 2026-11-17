@@ -65,6 +65,10 @@ add_executable(hsvm_affine_recover tools/hsvm_affine_recover.cpp)
 target_link_libraries(hsvm_affine_recover PRIVATE hsvm_core)
 target_compile_options(hsvm_affine_recover PRIVATE -Wall -Wextra)
 
+add_executable(hsvm_fuzz tools/hsvm_fuzz.cpp src/lower.cpp src/mir.cpp)
+target_link_libraries(hsvm_fuzz PRIVATE hsvm_core)
+add_test(NAME fuzz_threeway COMMAND hsvm_fuzz --count 200)
+
 add_executable(hsvm_bench tools/hsvm_bench.cpp)
 target_link_libraries(hsvm_bench PRIVATE hsvm_core)
 

@@ -128,6 +128,10 @@ int main() {
     CHECK(s.regs[15] == 42, "top register keeps its value");
     SemState bad = fresh(mem);
     CHECK(!semStep(bad, mk(Opcode::Mov, 0, 16)), "register 16 faults");
+    SemState badMovi = fresh(mem);
+    CHECK(!semStep(badMovi, mk(Opcode::Movi, 16, 0, 0, 1)),
+          "movi with an out-of-range destination faults");
+    CHECK(badMovi.faulted, "movi fault is recorded");
     CHECK(bad.faulted, "register fault is recorded");
     SemState wide = fresh(mem);
     wide.regCount = 64;
