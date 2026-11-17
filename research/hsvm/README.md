@@ -51,7 +51,12 @@ reports/        每次运行的证据包（run.json + summary.md）
 - C6 抗 DFA 第一步：转移冗余比对已实现（`setFaultCheckEnabled`，2× 代价）
 - 阶段 5 切片 1：bytecode→MirOp 无损提升已实现（ctest `mir`）
 - 阶段 5 切片 2a：16 opcode 可执行语义 + 边界断言（ctest `semantics`，38 条）
-- 阶段 5 切片 2b：MIR→LLVM IR lowering 未开始
+- V-03 解释器 ↔ oracle 逐步差分（ctest `diff`，13 条）
+- V-04 寄存器类 lowering + 三方差分 + 变异检验（ctest `lower_regs`，15 条）
+- V-05 全 16 opcode lowering，真实程序三方比对（ctest `lower_full`，19 条）
+- V-07 原生代码发射（C）+ clang 差分，退出码 0/3/5（ctest `emit_c`，18 条）
+- V-08/V-09 Polaris pass `-passes=hsvm` 接入，clang 重建到 HEAD
+- V-10 pass 覆盖全部 opcode，四个真实程序端到端与 oracle 一致（ctest `vmp_gate`）
 - M3 起（LLVM pass、C2）：未开始
 - 证据：`reports/M0/`、`reports/M1/`、`reports/G0/`、`reports/G1-model/`、
   `reports/G1-model-addendum/`
