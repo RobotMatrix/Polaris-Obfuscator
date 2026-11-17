@@ -97,9 +97,17 @@ PreservedAnalyses HSVMLowering::run(Module &M, ModuleAnalysisManager &AM) {
   // Both are required; without them the pass is simply not applicable.
   if (!BC || !F || !BC->hasInitializer())
     return PreservedAnalyses::all();
-  if (!F->getFunctionType()->getReturnType()->isIntegerTy(32) ||
-      F->getFunctionType()->getNumParams() != 0)
-    report_fatal_error("hsvm_entry must have type i32 ()");
+  // i32 () takes its initial register fill from @hsvm_init; i32 (i32) takes it
+  // from the argument, which is what lets a caller feed runtime input and stops
+  // the optimiser from folding the whole program away.
+  if (!F->getFunctionType()->getReturnType()->isIntegerTy(32))
+    report_fatal_error("hsvm_entry must return i32");
+  const unsigned numParams = F->getFunctionType()->getNumParams();
+  if (numParams > 1)
+    report_fatal_error("hsvm_entry must take zero or one i32 argument");
+  if (numParams == 1 &&
+      !F->getFunctionType()->getParamType(0)->isIntegerTy(32))
+    report_fatal_error("hsvm_entry argument must be i32");
 
   Constant *Init = BC->getInitializer();
   auto *ArrTy = dyn_cast<ArrayType>(Init->getType());
@@ -122,8 +130,11 @@ PreservedAnalyses HSVMLowering::run(Module &M, ModuleAnalysisManager &AM) {
   if (GlobalVariable *GI = M.getNamedGlobal("hsvm_init"))
     if (auto *CI = dyn_cast_or_null<ConstantInt>(GI->getInitializer()))
       initRegs = static_cast<uint32_t>(CI->getZExtValue());
+  Value *InitVal = EB.getInt32(initRegs);
+  if (numParams == 1)
+    InitVal = F->getArg(0);
   for (uint32_t i = 0; i < kRegs; ++i)
-    EB.CreateStore(EB.getInt32(initRegs),
+    EB.CreateStore(InitVal,
                    EB.CreateGEP(RegsTy, Regs, {EB.getInt32(0), EB.getInt32(i)}));
   // The interpreter's memory starts zeroed; an alloca does not, so fill it.
   ArrayType *MemTy = ArrayType::get(Type::getInt8Ty(Ctx), kMemBytes);

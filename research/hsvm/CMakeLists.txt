@@ -65,6 +65,9 @@ add_executable(hsvm_affine_recover tools/hsvm_affine_recover.cpp)
 target_link_libraries(hsvm_affine_recover PRIVATE hsvm_core)
 target_compile_options(hsvm_affine_recover PRIVATE -Wall -Wextra)
 
+add_executable(hsvm_bench tools/hsvm_bench.cpp)
+target_link_libraries(hsvm_bench PRIVATE hsvm_core)
+
 add_executable(hsvm_dump_program tools/hsvm_dump_program.cpp src/mir.cpp)
 target_link_libraries(hsvm_dump_program PRIVATE hsvm_core)
 
@@ -139,6 +142,12 @@ add_test(NAME emit_c COMMAND test_emit)
 
 # Requires the rebuilt Polaris clang: absent clang is a hard failure, not a skip.
 add_test(NAME vmp_gate COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/verify_vmp_gate.sh)
+
+# Result equality only; the reported speedup is informational and machine
+# dependent, so it is not asserted.
+add_test(NAME bench_match COMMAND hsvm_bench 20000 ${CMAKE_CURRENT_BINARY_DIR}/hsvm_bench_ctest)
+set_tests_properties(bench_match PROPERTIES ENVIRONMENT
+  "HSV_CLANG=${CMAKE_SOURCE_DIR}/../../src/build/bin/clang")
 
 add_executable(test_modenc tests/test_modenc.cpp)
 target_link_libraries(test_modenc PRIVATE hsvm_core)

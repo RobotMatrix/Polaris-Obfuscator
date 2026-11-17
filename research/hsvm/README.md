@@ -57,6 +57,7 @@ reports/        每次运行的证据包（run.json + summary.md）
 - V-07 原生代码发射（C）+ clang 差分，退出码 0/3/5（ctest `emit_c`，18 条）
 - V-08/V-09 Polaris pass `-passes=hsvm` 接入，clang 重建到 HEAD
 - V-10 pass 覆盖全部 opcode，四个真实程序端到端与 oracle 一致（ctest `vmp_gate`）
+- V-12 契约扩展 `i32 (i32)`，compiled-vs-interpreted 测量 1654.84×（ctest `bench_match`，只断言结果一致）
 - M3 起（LLVM pass、C2）：未开始
 - 证据：`reports/M0/`、`reports/M1/`、`reports/G0/`、`reports/G1-model/`、
   `reports/G1-model-addendum/`
