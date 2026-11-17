@@ -114,3 +114,56 @@ ciphertext: 24a06689…   expected: de23992a…   vector-match: FAIL   ← 换�
   当前文件 1402 行，相对 HEAD 的差异为：`wbaes_testvec.h` 引用、`kHyTab` 外部声明，
   以及换钥前的未提交改动。**恢复部分取自 HEAD 版本，若该段内原有未提交修改，
   已被 HEAD 内容覆盖，请用 `git diff demos/wbaes/demo_wbaes.cpp` 复核。**
+
+## 7. 表级密钥提取复核（extract_key.py）
+
+`extract_key.py` 只读二进制本身（`__DATA,__hytab` 段），不读 `wbaes_key.h`，
+用来回答"这张表还藏不藏得住密钥"。
+
+```bash
+python3 extract_key.py .../hybrid-baked/macos/wbaes_baked_keyrot_ec326393 --verify
+```
+
+结果（2026-11-17 复核）：
+
+```
+section : __DATA,__hytab fileoff=32768 size=69206016
+env     : pagesize=16384 ncpu=10 cls=128 -> 0x25c99707
+AES-128 key: ec326393a354ed3ee5d1735964fd8a32
+local AES-128 ECB: 24a06689d532680695416c13b93c7405   == 二进制自检密文
+key reproduces the shipped binary: YES
+```
+
+原理：第 0 轮用主密钥且**没有输入编码**（`gen_hybrid` 对 `r==0` 传
+`InPinv=nullptr`），表项即 `Q(col,row,side)[ S(x^k0) ^ S(y^k1) ]`。按
+`S(x^k0)^S(y^k1)` 分组必须同值，这个一致性把每 64K 表变成 256×256 的候选搜索，
+8 张表（4 列 × 2 侧）在数秒内还原 16 字节。分片散置、decoy、FNV 校验都不参与
+这条路径。
+
+**加固建议**：给第 0 轮也加输入侧编码（像非 baked 路径 `wb_idx`/`nl_byte` 那样
+打散下标，或在 sbox 前套双射），使表项不再等于 `S(x^k0)^S(y^k1)`；否则拿到二进制
+即可复现上述提取。
+
+**同一工具在旧表上的对照**：用仓库当前的 `hy_table.bin`（旧钥表）重建的 demo
+提取出 `d796fc6e49595e5f366a5e55744431be`，其本机 AES 结果与二进制输出的
+`de23992aa3c7427f3ad40fda83730d07` 一致——说明提取的是"这张表实际用的密钥"，
+与自检向量里的新钥无关。也说明当前工作树的 `hy_table.bin` 仍是换钥前的表，
+重建产物会 `vector-match: FAIL`。
+
+
+## 8. DFA 加固（2026-11-17，`wbaes_hybrid.inc`）
+
+烘焙路径原先只有单次遍历、无输出校验，这正是外部 DFA 报告能用"1 条正确 + 8 条故障密文"
+取回密钥的原因。现在 `hy_encrypt` 与 `hy_decrypt` 都拆成 `*_once` + 外层双次遍历：
+
+- 两份密文（明文）比对不同 → 置 `g_key_tampered |= 0x8000` 并输出随机垃圾，
+  **不输出任何一份**，切断差分样本；
+- 代价：2× 表访存；
+- 测试钩子 `-DWBAES_DFA_SELFTEST` 只在测试构建里翻转一个状态比特，
+  用来证明检测确实生效（该构建下 `vector-match: FAIL` 且输出为随机值）。
+
+正常构建自检仍为 `vector-match: PASS` / `roundtrip: PASS`，产物 `wbaes_baked_dfa`（69,781,520 B）。
+
+细节与剩余风险见 `DFA-ANALYSIS.md`。**注意**：本文 §7 的表级提取短板**没有修**——
+第 0 轮缺输入侧编码的问题依旧，`extract_key.py` 仍可在数秒内取回密钥；
+做了 DFA 双算不等于解决了静态提取，两者是不同攻击面。
