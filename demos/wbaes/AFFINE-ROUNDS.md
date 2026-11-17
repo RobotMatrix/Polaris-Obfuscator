@@ -83,36 +83,44 @@ PASS: fused 32-bit T-box round == SubBytes+ShiftRows+MixColumns+AddRoundKey on 2
 ```
 PASS: 4 round families agree on 2000 vectors (plain / t32 / t8 / keyed)
 ```
+这四族现在已按轮调度进 `gen_hybrid.cpp`（下一节）。
 
 **踩到的坑（值得记住）**：F3 最初把轮密钥并进表的**索引**（`S(x ^ k)`），三族全错。
 原因是 SubBytes 非线性——常数在 S 之前 XOR 进去不会以常数的形式出来。
 正确做法是并进表的**输出**：每列指定一个源，把整列密钥字 XOR 到那张表的 32 位值上，
 运行时就没有密钥 XOR 这一步了。这也说明"仿射/线性技巧"在 S 盒两侧不能随意搬。
 
-## 七、接线与导出：交接清单（未完成，勿误读为已交付）
+## 七、接线与导出：已完成（2026-11-17）
 
-模型层已证明（`fused_round_ref.cpp` / `round_families_ref.cpp`，各 2000 组随机向量 PASS），
-生成器**尚未接线**。接线的验收与导出步骤如下，按顺序执行，任一步失败即停：
+模型层（`fused_round_ref.cpp` / `round_families_ref.cpp`，各 2000 组随机向量 PASS）已经接进生成器：
 
 ```
-1. gen_hybrid：按轮选择实现族
-   - F1/F3：输出 32 位宽表（uint32_t [16][256]），hy_tag 需要新增"族"维度；
-   - F2：输出 16 张带 MC 系数的字节表；
-   - 解密路径镜像（IMC 版四族），DFA 双算保持两份独立缓冲。
-2. 自检（三条全过才允许导出）
-   a. 融合前后密文逐字节一致（固定向量 6bc1bee2…，本代应为 bb28990b…）
-   b. demo 回环自检 PASS
-   c. extract_key.py 能出钥 → 证明表一致性没被破坏（出不来＝表建错，先修表）
-3. 导出
-   cd /tmp/wbaes-export && cp <新生成器与头> . \
-     && clang++ -O2 -std=c++17 -I. -Idemos/wbaes gen_hybrid.cpp -o gen_hybrid_new \
-     && ./gen_hybrid_new hy_table.bin \
-     && clang++ -O2 -DWBAES_BAKED -DWBAES_NO_MIR -I. -I<repo>/demos/wbaes demo_wbaes.cpp hy_tab.S -o wbaes_dl3_clean \
-     && (同一命令行加 -mllvm -passes=alias,gvenc,indcall,indbr,mba,sub,bcf,fla 得 dl3_max)
-4. 落盘：strip -S，写 sha256.txt，README 更新表规模与密钥列；
-   旧的 dl / dl2 八个产物保留为历史对照，不删除。
+gen_hybrid.cpp    SCHED_ENC / SCHED_DEC（各 9 项）+ 四个族的填充函数
+                  fill_col_pair / fill_col_t32(F1,F3) / fill_col_t8(F2)
+                  表尾 64 B 调度块：每 (dir,round) 一个族字节 + 校验字节
+wbaes_hybrid.h    hy_mc_round 按调度字节分派四种读法；hy_scatter8 给 256 项表做位置散布
+wbaes_hybrid.inc  hy_sched_valid() 在解掩后校验调度块（坏调度 → 0x8000，不给错密文）
 ```
 
-当前可复现性已验证：用仓库当前源码重新生成得到的密文就是 `bb28990b4f52d7dc4c8e5cbb2839e653`，
-与目录中 `wbaes_dl2_*` 一致，说明"生成 → 烘焙 → 二进制"这条链路是确定性的，
-接线完成后一条命令即可重出产物。
+每族占用的子表都在原有列槽（`HY_COL`）里面，所以槽几何、封印、掩码走查都没变；
+表只长了 64 B 的调度块（69,206,016 → 69,206,080）。
+
+**验收（三条全过）**：
+- 族逐个强制 + 混合调度，密文都逐字节等于 `bb28990b4f52d7dc4c8e5cbb2839e653`：
+  生成端 `table-check PASS` / `seal-check PASS`，`return 9` 回环自检通过；
+- demo `vector-match: PASS` / `roundtrip: PASS`；`-DWBAES_DFA_SELFTEST` 构建仍然
+  只输出垃圾（`vector-match: FAIL`），说明双旅程比对还拦得住单字节故障；
+- `extract_key.py` 在换钥后的新产物上出钥（见下），所以表是一致的。
+
+**换钥 + 导出（dl3）**：`rotate_key.py` 换成 `fd85cd856e314ea791a828d5dab81d06`，
+自检密文 `e5a25174e8b329127bcaac8f3297e16e`；clean/max 两个产物 vector-match 与 roundtrip 均 PASS。
+
+**必须同时写清的一点（异化的代价）**：F1/F2/F3 的宽表/系数表存的是
+`MC[row][k]·S(x^k)`，没有 F0 那种 Q 网络随机双射，所以提取反而更容易——
+`extract_key.py` 现在支持这三种形状，28 s 出钥（dl2 是 5 s，多出来的时间是掩码 keystream
+要走到表尾读调度块）。详见 `DATA-LAYER.md` 第七节。异构买到的是"代码/表形状不统一"，
+不是提取难度；不要把 dl3 当加固版本宣传。
+
+F3（`HY_FAM_T32K`）是唯一必须放弃完整输出双射的族：没有重编码步，输出编码只能是仿射
+`a·x^b`，否则四张表的 XOR 无法保持编码。调度里只放了 2 轮（enc 2、7 / dec 4、8）。
+
