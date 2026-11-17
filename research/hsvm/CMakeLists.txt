@@ -114,6 +114,10 @@ add_executable(test_mir tests/test_mir.cpp src/mir.cpp)
 target_link_libraries(test_mir PRIVATE hsvm_core)
 add_test(NAME mir COMMAND test_mir)
 
+add_executable(test_semantics tests/test_semantics.cpp)
+target_link_libraries(test_semantics PRIVATE hsvm_core)
+add_test(NAME semantics COMMAND test_semantics)
+
 add_executable(test_modenc tests/test_modenc.cpp)
 target_link_libraries(test_modenc PRIVATE hsvm_core)
 target_compile_options(test_modenc PRIVATE -Wall -Wextra)

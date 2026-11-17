@@ -341,3 +341,18 @@ ARX 族是密钥恢复问题，未测。
 
 诚实标注：本条产出是**规格**，不是实现。阶段 5 的剩余工作量估计 1–2 周工程
 （800–1200 行 lowering + 600–900 行状态布局 + 重编 clang）。
+
+## ADR-023 阶段 5 切片 2a：16 opcode 可执行语义（2026-11-17）
+
+`include/hsvm/semantics.h` 把 `slice2-semantics.md` 变成可执行代码：`SemState` +
+`semStep`，纯函数、不依赖解释器，作为后续 lowering 的对照 oracle。
+fault 是语义的一部分（越界寄存器、越界/未对齐地址 → `faulted` 并停止）。
+
+`tests/test_semantics.cpp` 38 条断言，覆盖 16 条 opcode 与全部边界：
+32 位回绕（`0-1`、`0x10001*0x10001`）、位移掩码（`Shl 1,33` = 2）、
+逻辑右移（`0x80000000 >> 31` = 1）、内存小端往返、未对齐与越界 fault、
+有符号跳转位移（`Jmp -2`）、`Brz` 取/不取、停机指令后不再执行、寄存器 63 合法 / 64 故障。
+注册为 ctest `semantics`（共 20 个测试）。
+
+**未做**：MIR → LLVM IR lowering 本身、寄存器分配、pass 接入、重建 clang。
+切片 2 的完成判据现有一条可执行的尺子：lowering 后的实现与 `semStep` 逐条差分一致。
