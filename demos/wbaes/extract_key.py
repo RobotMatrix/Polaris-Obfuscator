@@ -172,6 +172,108 @@ def read_row(table, env, col, side, row):
     return out
 
 
+def relabel(B, p0_0, p0_1):
+    """Undo a round-0 input bijection: B'[a][b] = B[P0[a]][P0[b]]."""
+    out = bytearray(N)
+    for a in range(256):
+        base = p0_0[a] * 256
+        row = a * 256
+        for b in range(256):
+            out[row + b] = B[base + p0_1[b]]
+    return out
+
+
+def find_input_bijection(data):
+    """Locate HY_P0 (16 x 256 permutations) emitted by gen_hybrid into __TEXT,__const."""
+    hits = []
+    try:
+        _, _, _, coff, csize = find_section_bytes(data, "__const")
+    except SystemExit:
+        return hits
+    window = data[coff:coff + csize]
+    for start in range(0, max(0, csize - 4096) + 1):
+        blk = window[start:start + 4096]
+        if len(blk) < 4096:
+            break
+        if all(len(set(blk[i * 256:(i + 1) * 256])) == 256 for i in range(16)):
+            hits.append((coff + start, [blk[i * 256:(i + 1) * 256] for i in range(16)]))
+    return hits
+
+
+_MUL = {1: list(range(256)), 2: [gmul(i, 2) for i in range(256)], 3: [gmul(i, 3) for i in range(256)]}
+
+
+def rows_consistent(table, env, key, p0=None):
+    """All 32 row tables must be conflict-free for the recovered key."""
+    for col in range(4):
+        for side in range(2):
+            dst0 = 4 * col + 2 * side
+            k0, k1 = key[hy_sr_src(dst0)], key[hy_sr_src(dst0 + 1)]
+            a = [SBOX[x ^ k0] for x in range(256)]
+            b = [SBOX[y ^ k1] for y in range(256)]
+            # (1,1) plus a second coefficient pair per side: two distinct rows are
+            # enough to reject a bogus key without reading all four.
+            for row in (2, 0):
+                m0, m1 = MC[row][side * 2], MC[row][side * 2 + 1]
+                left = [_MUL[m0][v] for v in a]
+                right = [_MUL[m1][v] for v in b]
+                B = read_row(table, env, col, side, row)
+                if p0 is not None:
+                    B = relabel(B, p0[hy_sr_src(dst0)], p0[hy_sr_src(dst0 + 1)])
+                seen = {}
+                for i in range(N):
+                    p = left[i >> 8] ^ right[i & 255]
+                    v = B[i]
+                    cur = seen.get(p)
+                    if cur is None:
+                        seen[p] = v
+                    elif cur != v:
+                        return False
+    return True
+
+
+def recover_key(table, env, p0=None):
+    """Eight round-0 tables -> 16 key bytes; p0 undoes an input bijection if present."""
+    key = bytearray(16)
+    for col in range(4):
+        for side in range(2):
+            row = 2 if side == 0 else 0        # MixColumns row whose coefficients are (1,1)
+            dst0 = 4 * col + 2 * side
+            B = read_row(table, env, col, side, row)
+            if p0 is not None:
+                B = relabel(B, p0[hy_sr_src(dst0)], p0[hy_sr_src(dst0 + 1)])
+            k0, k1 = recover_pair(B)
+            key[hy_sr_src(dst0)] = k0
+            key[hy_sr_src(dst0 + 1)] = k1
+    return bytes(key)
+
+
+def find_section_bytes(data, want_sect):
+    """Same walk as find_section(), for callers that already hold the file bytes."""
+    magic = data[:4]
+    if magic == b"\xcf\xfa\xed\xfe":
+        endian = "<"
+    elif magic == b"\xfe\xed\xfa\xcf":
+        endian = ">"
+    else:
+        raise SystemExit("not a thin 64-bit Mach-O")
+    ncmds, sizeofcmds = struct.unpack_from(endian + "II", data, 16)
+    off = 32
+    for _ in range(ncmds):
+        cmd, cmdsize = struct.unpack_from(endian + "II", data, off)
+        if cmd == 0x19:
+            nsects = struct.unpack_from(endian + "I", data, off + 64)[0]
+            base = off + 72
+            for i in range(nsects):
+                s = data[base + i * 80: base + (i + 1) * 80]
+                if s[:16].rstrip(b"\x00") == want_sect.encode():
+                    segname = s[16:32].rstrip(b"\x00").decode()
+                    return 0, segname, want_sect, struct.unpack_from(endian + "I", s, 48)[0], \
+                        struct.unpack_from(endian + "Q", s, 40)[0]
+        off += cmdsize
+    raise SystemExit(f"no {want_sect} section found")
+
+
 def recover_pair(B):
     """B indexed [x*256+y]; returns (k0, k1) for B[x][y] = Q(S(x^k0) ^ S(y^k1))."""
     xs = range(256)
@@ -277,17 +379,36 @@ def main(argv=None):
     print(f"section : {seg},{sect} fileoff={off} size={size} (cputype 0x{cputype:08x})")
     print(f"env     : pagesize={ps} ncpu={nc} cls={cl} -> 0x{env:08x}")
 
-    key = bytearray(16)
+    data = open(args.binary, "rb").read()
+    key, p0, mode = None, None, "plain round-0 index"
+    try:
+        key = recover_key(table, env)
+        if not rows_consistent(table, env, key):
+            key = None
+    except SystemExit:
+        key = None
+    if key is None:
+        cands = find_input_bijection(data)
+        print(f"plain recovery failed; round-0 input bijections found: {[c[0] for c in cands]}")
+        for off, cand in cands:
+            try:
+                k = recover_key(table, env, cand)
+            except SystemExit as e:
+                print(f"  bijection @{off}: {e}")
+                continue
+            if rows_consistent(table, env, k, cand):
+                key, p0 = k, cand
+                mode = f"round-0 input bijection @file offset {off}"
+                break
+            print(f"  bijection @{off}: rows inconsistent, skipping")
+    if key is None:
+        raise SystemExit("recovery failed: no candidate key (wrong env, or a hardening we do not undo)")
+    print(f"mode    : {mode}")
     for col in range(4):
         for side in range(2):
-            row = 2 if side == 0 else 0        # MixColumns row whose pair is (1,1)
-            B = read_row(table, env, col, side, row)
-            k0, k1 = recover_pair(B)
             dst0 = 4 * col + 2 * side
-            key[hy_sr_src(dst0)] = k0
-            key[hy_sr_src(dst0 + 1)] = k1
-            print(f"  col {col} side {side}: key[{hy_sr_src(dst0):2d}]=0x{k0:02x} "
-                  f"key[{hy_sr_src(dst0 + 1):2d}]=0x{k1:02x}")
+            print(f"  col {col} side {side}: key[{hy_sr_src(dst0):2d}]=0x{key[hy_sr_src(dst0)]:02x} "
+                  f"key[{hy_sr_src(dst0 + 1):2d}]=0x{key[hy_sr_src(dst0 + 1)]:02x}")
     print(f"AES-128 key: {key.hex()}")
 
     if args.verify:

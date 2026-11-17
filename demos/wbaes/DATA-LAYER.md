@@ -54,3 +54,23 @@ $ clang++ -S -emit-llvm demo_wbaes.cpp | grep kHyTab
 
 **成本**：启动时全表解密 69 MB 约数毫秒；按页惰性解密则几乎没有常驻开销，但每个查表要加一次
 「页已解密？」判断。
+
+## 五、生成端加密的尝试（未完成，代码已回退）
+
+按上面的方案做了一版：`gen_hybrid` 在写文件前用 key 派生的 xorshift 流异或全表，
+并额外输出 `HY_MASK_SEED`、`HY_TABLE_SEAL`（密文全表）、`HY_TABLE_SEAL_S4096`（密文抽样）、
+`HY_TABLE_SEAL_S4096_P`（明文抽样）；运行时先验密文封印，再原地解掩，再用明文抽样复核。
+
+**生成端是自洽的**——用 Python 独立重算文件上的三个值，与 header 全部一致：
+```
+file full seal : 0x07b7943b == hdr    MATCH
+file s4096     : 0xdba47282 == hdr    MATCH
+unmasked s4096 : 0x2be3fb3a == hdr    MATCH
+```
+
+**但运行时没通过**：二进制自检输出随机值（`vector-match: FAIL`，两次运行密文不同 ⇒ 走的是毒化路径），
+说明 `hy_table_intact()` 在运行时返回了 0。最可疑的是对 `const` 表的原地写入与封印检查的相对顺序，
+尚未定位。按本仓库"不留半成品"的纪律，**这部分改动已回退**，导出目录里没有对应产物。
+
+要接着做，下一步应该先写一个只做 unmask + 打印三个封印值的最小程序，
+把"文件侧正确、运行侧不对"的差缩小到具体的检查点，再接回 demo。
