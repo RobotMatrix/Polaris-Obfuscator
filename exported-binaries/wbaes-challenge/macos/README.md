@@ -9,12 +9,33 @@
 | `wbaes_clean_in` | `-O2` | 有 | **ec32…（仓库公开键）** | `24a06689…` |
 | `wbaes_max_in` | `-O2` + 8 pass | 有 | **ec32…（仓库公开键）** | `24a06689…` |
 
-| `wbaes_dl_clean` | `-O2`，表已掩码 | 有 | `98d2…`（未公开） | `bb28990b…` |
-| `wbaes_dl_max` | `-O2` + 8 pass，表已掩码 | 有 | `98d2…`（未公开） | `bb28990b…` |
+| `wbaes_dl_clean` | `-O2`，表已掩码 | 有 | `98d2…`（**已提取**） | `bb28990b…` |
+| `wbaes_dl_max` | `-O2` + 8 pass，表已掩码 | 有 | `98d2…`（**已提取**） | `bb28990b…` |
 
 `*_dl` 两代是**数据层加密**版本：表在二进制里是密文，运行时验封印后解掩到私有缓冲。
-`extract_key.py` 在它们上面 0.79 s 即失败（`recovery failed: no candidate key`），
-连输入双射都能定位，但读不出表结构。**这两个才是当前最硬的靶子。**
+**这套防护已实测攻破**（约 4.9 s，`extract_key.py` 现在自带）：
+
+```
+extract_key.py wbaes_dl_max --verify
+  candidate mask seeds (MOVZ/MOVK in __text): ['0x31d80fe2']
+  mode    : mask seed 0x31d80fe2 + input bijection @11663
+  mask seed vs FNV-1a(key): 0x31d80fe2 -> match
+  AES-128 key: 98d272d16d6cc9d6ecd48a26c0ca69d3
+  key reproduces the shipped binary: YES
+```
+
+攻击面是三件事叠在一起失效的：
+
+1. 掩码本身是 `xorshift32` 的 XOR 流，种子 `HY_MASK_SEED` 以 `MOVZ/MOVK`
+   立即数形式躺在 `__text`（本文件 0x100001858），顺着 xorshift 指令三连
+   （`lsl #13` / `lsr #17` / `lsl #5`）往前找 11 条指令就能捞出来。
+2. 种子就是 `FNV-1a(密钥)`——**它是密钥的函数**，一旦拿到就等于给密钥留了个
+   32 位校验位（提取结果与它一致即为独立验证）。
+3. 解掩后仍是同一套表结构，双射取逆 + 64K 表一致性检查照旧。
+
+结论：数据层掩码在"密钥派生种子 + 常量留在代码里"的组合下只是把攻击从 3.7 s
+拖到 4.9 s。真正要提高成本，掩码种子必须与密钥无关且不可由二进制推出
+（例如外部提供、或每次会话协商），否则它只是又一层混淆。
 
 **注意（此前的文档错误，已更正）**：`*_in` 两个文件生成时用的是仓库里的 `ec32…` 密钥
 （自检密文 `24a06689…`），不是 `62bc…`。原 README 把 `*_in` 的 expected 写成了 `e6f48459…`，

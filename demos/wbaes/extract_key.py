@@ -254,7 +254,7 @@ def scan_mask_seed_exact(data):
         dc, nc, ic, mc, sc = fields(c)
         if not (da == na == ma == db == nb == mb == dc == nc == mc):
             continue
-        if (sa, ia, sb, ib, sc, ic) != (0, 13, 1, 17, 2, 5):
+        if (sa, ia, sb, ib, sc, ic) != (0, 13, 1, 17, 0, 5):
             continue                      # x ^= x<<13; x ^= x>>17; x ^= x<<5
         for j in range(1, 12):
             if i - j - 1 < 0:
