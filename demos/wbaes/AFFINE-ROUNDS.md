@@ -88,3 +88,31 @@ PASS: 4 round families agree on 2000 vectors (plain / t32 / t8 / keyed)
 原因是 SubBytes 非线性——常数在 S 之前 XOR 进去不会以常数的形式出来。
 正确做法是并进表的**输出**：每列指定一个源，把整列密钥字 XOR 到那张表的 32 位值上，
 运行时就没有密钥 XOR 这一步了。这也说明"仿射/线性技巧"在 S 盒两侧不能随意搬。
+
+## 七、接线与导出：交接清单（未完成，勿误读为已交付）
+
+模型层已证明（`fused_round_ref.cpp` / `round_families_ref.cpp`，各 2000 组随机向量 PASS），
+生成器**尚未接线**。接线的验收与导出步骤如下，按顺序执行，任一步失败即停：
+
+```
+1. gen_hybrid：按轮选择实现族
+   - F1/F3：输出 32 位宽表（uint32_t [16][256]），hy_tag 需要新增"族"维度；
+   - F2：输出 16 张带 MC 系数的字节表；
+   - 解密路径镜像（IMC 版四族），DFA 双算保持两份独立缓冲。
+2. 自检（三条全过才允许导出）
+   a. 融合前后密文逐字节一致（固定向量 6bc1bee2…，本代应为 bb28990b…）
+   b. demo 回环自检 PASS
+   c. extract_key.py 能出钥 → 证明表一致性没被破坏（出不来＝表建错，先修表）
+3. 导出
+   cd /tmp/wbaes-export && cp <新生成器与头> . \
+     && clang++ -O2 -std=c++17 -I. -Idemos/wbaes gen_hybrid.cpp -o gen_hybrid_new \
+     && ./gen_hybrid_new hy_table.bin \
+     && clang++ -O2 -DWBAES_BAKED -DWBAES_NO_MIR -I. -I<repo>/demos/wbaes demo_wbaes.cpp hy_tab.S -o wbaes_dl3_clean \
+     && (同一命令行加 -mllvm -passes=alias,gvenc,indcall,indbr,mba,sub,bcf,fla 得 dl3_max)
+4. 落盘：strip -S，写 sha256.txt，README 更新表规模与密钥列；
+   旧的 dl / dl2 八个产物保留为历史对照，不删除。
+```
+
+当前可复现性已验证：用仓库当前源码重新生成得到的密文就是 `bb28990b4f52d7dc4c8e5cbb2839e653`，
+与目录中 `wbaes_dl2_*` 一致，说明"生成 → 烘焙 → 二进制"这条链路是确定性的，
+接线完成后一条命令即可重出产物。
