@@ -1,0 +1,12 @@
+{
+  "coverage": 1.0,
+  "covered": 16,
+  "cross_run_common": 0,
+  "cross_run_mismatch": 0,
+  "elapsed_s": 9.4e-05,
+  "inconsistent_slots": 0,
+  "mismatch": 0,
+  "queries": 16,
+  "recovered_slots": 16,
+  "slots": 16
+}

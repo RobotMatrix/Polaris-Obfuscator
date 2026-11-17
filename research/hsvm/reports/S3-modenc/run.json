@@ -1,0 +1,29 @@
+{
+  "attacker_model": "A2",
+  "censored": false,
+  "created_at": "2026-11-17T08:14:58Z",
+  "evidence": [
+    "tools/hsvm_normalize.cpp",
+    "reports/S3-modenc/normalization.json"
+  ],
+  "gate": "S3",
+  "git_commit": "10394237732a666f0a097611b90c7e193ca1e478",
+  "metrics": {
+    "s3_lanes_max": 3.0,
+    "s3_module_cost_supported": 0.0,
+    "s3_points": 3.0,
+    "s3_queries_match_2pow_w": 1.0,
+    "s3_queries_w16": 65536.0,
+    "s3_queries_w24": 16777216.0,
+    "s3_queries_w8": 256.0,
+    "s3_verified_samples": 173640.0
+  },
+  "params_hash": "e7fb97c4ca8f982c",
+  "protocol_sha256": "f964755dcd2587ee0772d210fd1597024f40bbba20c7c194c02c991983515c1f",
+  "queries_used": 16843008,
+  "raw_log": "normalization.json",
+  "run_id": "s3-module-normalization",
+  "seeds": [
+    12345
+  ]
+}

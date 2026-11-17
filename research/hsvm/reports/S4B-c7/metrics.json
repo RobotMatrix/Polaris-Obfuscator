@@ -1,0 +1,10 @@
+{
+  "a1_covered_all": 1,
+  "a1_mismatch_total": 0,
+  "a1_queries_max": 16,
+  "a1_queries_min": 16,
+  "diversity_supported": 0,
+  "gamma_p5_max": 0.996094,
+  "gamma_p5_min": 0.976562,
+  "instances": 16
+}

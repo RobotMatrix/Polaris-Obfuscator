@@ -1,0 +1,10 @@
+{
+  "lanes_max": 3,
+  "module_cost_supported": 0,
+  "points": 3,
+  "queries_match_2pow_w": true,
+  "queries_w16": 65536,
+  "queries_w24": 16777216,
+  "queries_w8": 256,
+  "verified_samples": 173640
+}

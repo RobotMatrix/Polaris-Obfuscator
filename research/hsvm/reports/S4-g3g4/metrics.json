@@ -1,0 +1,19 @@
+{
+  "censored_games": [
+    24
+  ],
+  "completed_games": [
+    8,
+    16
+  ],
+  "model_bound_bytes": 4096,
+  "w16_compact_bytes": 524288,
+  "w16_g3_pass": 1,
+  "w16_g4_pass": 0,
+  "w24_censored": 1,
+  "w24_queries": 1048576,
+  "w8_compact_bytes": 2048,
+  "w8_g3_pass": 1,
+  "w8_g4_pass": 1,
+  "w8_queries": 256
+}

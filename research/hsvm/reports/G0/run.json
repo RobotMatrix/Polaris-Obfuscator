@@ -1,0 +1,39 @@
+{
+  "attacker_model": "A2",
+  "censored": false,
+  "created_at": "2026-11-17T07:25:22Z",
+  "evidence": [
+    "attacks/a1_trace_diff.py",
+    "attacks/a2_memread.py",
+    "reports/G0/truth.json"
+  ],
+  "gate": "G0",
+  "git_commit": "10394237732a666f0a097611b90c7e193ca1e478",
+  "metrics": {
+    "a1_coverage": 1.0,
+    "a1_covered": 16.0,
+    "a1_cross_run_common": 16.0,
+    "a1_cross_run_mismatch": 0.0,
+    "a1_elapsed_s": 0.000116,
+    "a1_inconsistent_slots": 0.0,
+    "a1_mismatch": 0.0,
+    "a1_queries": 32.0,
+    "a1_recovered_slots": 16.0,
+    "a1_slots": 16.0,
+    "a2_coverage": 1.0,
+    "a2_covered": 16.0,
+    "a2_elapsed_s": 9.7e-05,
+    "a2_mismatch": 0.0,
+    "a2_queries": 16.0,
+    "a2_recovered_slots": 16.0,
+    "a2_slots": 16.0
+  },
+  "params_hash": "c5724bc3cf403a42",
+  "protocol_sha256": "f964755dcd2587ee0772d210fd1597024f40bbba20c7c194c02c991983515c1f",
+  "queries_used": 16,
+  "raw_log": "trace.jsonl",
+  "run_id": "g0-linear-12345",
+  "seeds": [
+    12345
+  ]
+}

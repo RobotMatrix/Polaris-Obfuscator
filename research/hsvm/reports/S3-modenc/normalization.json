@@ -1,0 +1,11 @@
+{
+  "experiment": "module-normalization",
+  "points": [
+    {"lanes": 1, "w": 8, "modules": 1, "queries": 256, "verified": 3, "ms": 0.0, "enumerable": true},
+    {"lanes": 2, "w": 16, "modules": 2, "queries": 65536, "verified": 676, "ms": 0.4, "enumerable": true},
+    {"lanes": 3, "w": 24, "modules": 3, "queries": 16777216, "verified": 172961, "ms": 125.8, "enumerable": true}
+  ],
+  "claim": "module encodings add attacker cost",
+  "supported": false,
+  "reason": "queries equal 2^w for every lane count: the attacker pays for the window size, never for the number of modules"
+}

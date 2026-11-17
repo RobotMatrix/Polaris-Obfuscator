@@ -1,0 +1,28 @@
+{
+  "attacker_model": "A2",
+  "censored": false,
+  "created_at": "2026-11-17T07:31:53Z",
+  "evidence": [
+    "scripts/run_g1_model.py",
+    "reports/G1-model/grid.json",
+    "reports/G1-model/verdict.json"
+  ],
+  "gate": "G1",
+  "git_commit": "10394237732a666f0a097611b90c7e193ca1e478",
+  "metrics": {
+    "g1_best_ratio": 5.6171,
+    "g1_coverage_ok": 48.0,
+    "g1_pass": 0.0,
+    "g1_perf_ok": 0.0,
+    "g1_points": 48.0,
+    "g1_security_ok": 16.0
+  },
+  "params_hash": "245dec5608227503",
+  "protocol_sha256": "f964755dcd2587ee0772d210fd1597024f40bbba20c7c194c02c991983515c1f",
+  "queries_used": 0,
+  "raw_log": "grid.json",
+  "run_id": "g1-model-grid",
+  "seeds": [
+    12345
+  ]
+}

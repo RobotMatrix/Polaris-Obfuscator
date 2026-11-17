@@ -1,0 +1,27 @@
+{
+  "attacker_model": "A2",
+  "censored": false,
+  "created_at": "2026-11-17T07:49:43Z",
+  "evidence": [
+    "tools/hsvm_floor.cpp",
+    "reports/G0v2/floor.json",
+    "reports/G0v2/raw/w8_c8_r1_table_bench.json"
+  ],
+  "gate": "G0v2",
+  "git_commit": "10394237732a666f0a097611b90c7e193ca1e478",
+  "metrics": {
+    "g0v2_best_floor_ns": 10.612,
+    "g0v2_best_ratio": 2.527,
+    "g0v2_cap_ratio": 3.0,
+    "g0v2_pass": 1.0,
+    "g0v2_points": 16.0
+  },
+  "params_hash": "e1f18ca5bec2db5f",
+  "protocol_sha256": "a9929c6c09042b7cbffd01e0cf72f8a571b8a5dc10ad4113ab2a1f51999fadb5",
+  "queries_used": 0,
+  "raw_log": "floor.json",
+  "run_id": "g0v2-floor",
+  "seeds": [
+    12345
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "all_conditions": [],
+  "best_ratio": 10.5126,
+  "coverage_ok": 12,
+  "gate": "G1-model",
+  "pass": false,
+  "perf_ok": 0,
+  "points": 12,
+  "reason": "no point satisfies step_cost_ratio <= 3; no point satisfies coverage, non-affine, performance and non-enumerability together",
+  "security_ok": 8
+}

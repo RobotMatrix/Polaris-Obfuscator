@@ -1,0 +1,69 @@
+{
+  "bound_bytes": 4096,
+  "conclusion": {
+    "note": "packed size c*2^w bits is a lower bound for any table-shaped model; family-aware models (e.g. recovering ARX keys) are a different game and are not measured here",
+    "table_g4_possible_up_to_w": 8
+  },
+  "rows": [
+    {
+      "c": 8,
+      "naive_fits_bound": true,
+      "naive_u64_bytes": 2048,
+      "packed_bytes": 256,
+      "packed_fits_bound": true,
+      "table_bits": 2048,
+      "table_g4_possible": true,
+      "w": 8
+    },
+    {
+      "c": 16,
+      "naive_fits_bound": false,
+      "naive_u64_bytes": 524288,
+      "packed_bytes": 131072,
+      "packed_fits_bound": false,
+      "table_bits": 1048576,
+      "table_g4_possible": false,
+      "w": 16
+    },
+    {
+      "c": 24,
+      "naive_fits_bound": false,
+      "naive_u64_bytes": 134217728,
+      "packed_bytes": 50331648,
+      "packed_fits_bound": false,
+      "table_bits": 402653184,
+      "table_g4_possible": false,
+      "w": 24
+    },
+    {
+      "c": 32,
+      "naive_fits_bound": false,
+      "naive_u64_bytes": 34359738368,
+      "packed_bytes": 17179869184,
+      "packed_fits_bound": false,
+      "table_bits": 137438953472,
+      "table_g4_possible": false,
+      "w": 32
+    },
+    {
+      "c": 48,
+      "naive_fits_bound": false,
+      "naive_u64_bytes": 2251799813685248,
+      "packed_bytes": 1688849860263936,
+      "packed_fits_bound": false,
+      "table_bits": 13510798882111488,
+      "table_g4_possible": false,
+      "w": 48
+    },
+    {
+      "c": 64,
+      "naive_fits_bound": false,
+      "naive_u64_bytes": 147573952589676412928,
+      "packed_bytes": 147573952589676412928,
+      "packed_fits_bound": false,
+      "table_bits": 1180591620717411303424,
+      "table_g4_possible": false,
+      "w": 64
+    }
+  ]
+}

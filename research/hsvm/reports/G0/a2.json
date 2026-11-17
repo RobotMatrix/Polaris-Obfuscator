@@ -1,0 +1,9 @@
+{
+  "coverage": 1.0,
+  "covered": 16,
+  "elapsed_s": 9.7e-05,
+  "mismatch": 0,
+  "queries": 16,
+  "recovered_slots": 16,
+  "slots": 16
+}

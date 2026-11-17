@@ -1,0 +1,15 @@
+{
+  "best_floor_ns": 10.612,
+  "best_point": "w8_c8_r1_table_0",
+  "best_ratio": 2.527,
+  "cap_ratio": 3.0,
+  "caveat": "a pass licenses the C2 build; it does not certify the final kernel, which must still meet the cap when fused",
+  "feasible_points": [
+    "w8_c8_r1_table_0"
+  ],
+  "gate": "G0v2",
+  "method": "sum of isolated component timings (optimistic lower bound)",
+  "pass": true,
+  "points": 16,
+  "reason": "ok"
+}

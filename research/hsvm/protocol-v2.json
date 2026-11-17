@@ -1,0 +1,120 @@
+{
+  "protocol_version": "2.0-draft",
+  "supersedes": "1.0",
+  "created": "2026-11-17",
+  "source_document": "writing-block-v1.3-errata.md",
+  "rationale": "v1.0 terminated on cost: no registered point reached step_cost_ratio <= 3, and the ARX addendum moved the bottleneck from psi to the O(w) window read. v2 keeps the cost cap and the lean baseline unchanged, moves C2 before the security judgement so that a thin (small-w, low-c) point can be considered, and makes the first gate a cost-floor derivation rather than another implementation round. If the floor exceeds the cap, the route is refuted before any C2 code is written.",
+  "route": "c2_first_thin_window",
+  "preregistered_expectation": "The analytic floor for w=8, c=8, r_bar=1 is about 25 word operations per step against a ~10-operation plain instruction, i.e. >= 2.5x; with any real psi work the measured floor is expected to land between 3x and 6x. If the measured floor exceeds 12.6 ns per step (3x of 4.2 ns), C2 is never implemented and this route terminates at G0v2.",
+  "cost_gate": {
+    "baseline": "lean register-machine VM: research/hsvm Machine, Plain mode, 16 x 32-bit registers, 4 KiB memory, no tracing",
+    "baseline_ns_per_instr": 4.2,
+    "cap_ratio": 3.0,
+    "metric": "step_cost_ratio",
+    "floor_derivation_required": true,
+    "floor_components": [
+      "window_read_w",
+      "scatter_c_times_r_bar",
+      "psi_rounds",
+      "mask_xor_n_over_64",
+      "dispatch"
+    ],
+    "floor_method": "analytic component count plus measured per-component timing on the same host; both reported; the larger of the two is used"
+  },
+  "security_gate": {
+    "attacker_models": ["A2-static", "A2-dynamic"],
+    "claimed_model": "A2-static",
+    "encoded_query_budget": 1099511627776,
+    "enumeration_metric": "probes needed to build a complete psi oracle through the C2 interface",
+    "max_probes": 1099511627776,
+    "must_measure_on": "the C2 build, never inferred from the unencoded model",
+    "a2_dynamic_note": "A2-dynamic reads the encoded state and the baked encoding at runtime; step-wise affine encoding is expected to fall to BGE-style linear algebra. The v2 claim is therefore restricted to A2-static, and any A2-dynamic success is reported as a known boundary, not as a gate failure."
+  },
+  "hypothesis": {
+    "attacker_model": "A2-static",
+    "statement": "exists a thin point (w <= 32, c <= 16, r_bar <= 2) plus a step-wise affine C2 encoding such that measured step_cost_ratio <= 3, the encoded-domain psi oracle needs more than 2^40 probes, and BGE/DCA on the encoding fails within 2^32 queries",
+    "query_budget": 1099511627776,
+    "model_size_bound_bytes": 4096,
+    "instances": 16,
+    "confidence": 0.95,
+    "semantic_threshold": 0.99,
+    "success_rate_threshold": 0.1,
+    "test_distribution": {
+      "normal": 0.6,
+      "boundary": 0.25,
+      "adaptive": 0.15,
+      "description": "unchanged from v1.0"
+    }
+  },
+  "stage1": {
+    "query_budget": 4294967296,
+    "interpolation_success_threshold": 0.01,
+    "gamma_p5_threshold": 0.5,
+    "gamma_states_per_instance": 4096,
+    "gamma_kernel_dirs": 256,
+    "affine_test": "exhaustive over pi_A(K) when its dimension <= 16, otherwise sampled with reported sample count",
+    "performance": {
+      "r_plain_max": 3.0,
+      "r_commercial_max": 1.5,
+      "commercial_baseline": "undecided",
+      "runs_per_measurement": 30,
+      "statistic": "median with p5/p95 reported"
+    },
+    "v2_scope": "cost and coverage only; interpolation/security moved to the security_gate and judged on the C2 build"
+  },
+  "stage2_encoding": {
+    "family": "step-wise affine with local support (block-diagonal plus elementary transforms)",
+    "max_ns_per_step": 12.6,
+    "attacks": ["BGE", "DCA", "affine-equivalence"],
+    "query_budget": 4294967296,
+    "positive_control_required": true
+  },
+  "params_grid": {
+    "n": [512],
+    "m": [256],
+    "w": [8, 16, 32],
+    "c": [8, 16],
+    "r_bar": [1, 2],
+    "rounds": [0, 2, 4],
+    "psi": ["table", "spn", "arx"]
+  },
+  "chosen_point": null,
+  "seeds": [1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010,
+            1011, 1012, 1013, 1014, 1015, 1016],
+  "workload": [
+    {"name": "crc32", "weight": 0.2, "source": "demos/wbaes/tests/c_project/crc32.c"},
+    {"name": "base64", "weight": 0.2, "source": "demos/wbaes/tests/c_project/base64.c"},
+    {"name": "bignum", "weight": 0.3, "source": "demos/wbaes/tests/c_project/bignum.c"},
+    {"name": "hashtable", "weight": 0.2, "source": "demos/wbaes/tests/c_project/hashtable.c"},
+    {"name": "aes_round", "weight": 0.1, "source": "demos/wbaes/demo_wbaes.cpp (round function only)"}
+  ],
+  "query_counting": "one effective query = one attacker-chosen input plus one observed transition; a trace of L steps counts as L queries",
+  "a2_memory_scope": "attacker may read and write the VM state buffer, bytecode, dispatch tables and checkpoints; may replace call targets and hook the step boundary; may not modify the kernel code image (that is A3)",
+  "stop_rules": [
+    "g0v2_cost_floor_above_cap",
+    "stage2_whitebox_recovers_psi_or_compact_model",
+    "encoded_oracle_below_2pow40_probes",
+    "core_hypothesis_success_rate_at_least_0_10"
+  ],
+  "reporting": {
+    "required_fields": [
+      "run_id",
+      "gate",
+      "created_at",
+      "git_commit",
+      "params_hash",
+      "protocol_sha256",
+      "attacker_model",
+      "seeds",
+      "metrics",
+      "queries_used",
+      "censored",
+      "raw_log",
+      "evidence"
+    ],
+    "censoring": "if the registered budget was not exhausted, the report must set censored=true and may only state 'no success within the used budget'",
+    "separate_attacker_levels": true,
+    "separate_baselines": ["r_plain", "r_commercial"],
+    "note": "v1 reports keep the v1 hash and are not re-judged under v2"
+  }
+}

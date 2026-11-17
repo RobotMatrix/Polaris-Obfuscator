@@ -1,0 +1,10 @@
+{
+  "games": [
+    {"w": 8, "c": 8, "budget": 1048576, "queries": 256, "censored": false, "recovered": true, "agreement": 1.000, "compact_bytes": 2048, "fits_model_bound": true, "g3_pass": true, "g4_pass": true},
+    {"w": 16, "c": 16, "budget": 1048576, "queries": 65536, "censored": false, "recovered": true, "agreement": 1.000, "compact_bytes": 524288, "fits_model_bound": false, "g3_pass": true, "g4_pass": false},
+    {"w": 24, "c": 24, "budget": 1048576, "queries": 1048576, "censored": true, "recovered": false, "agreement": 0.000, "compact_bytes": 134217728, "fits_model_bound": false, "g3_pass": false, "g4_pass": false}
+  ],
+  "model_bound_bytes": 4096,
+  "min_agreement": 0.990,
+  "note": "censored games carry no success claim (ADR-004)"
+}
