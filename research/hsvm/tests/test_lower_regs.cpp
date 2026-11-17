@@ -144,22 +144,32 @@ Result threeWay(const std::vector<uint8_t> &code, uint32_t initRegs) {
 int main() {
   const std::vector<uint8_t> prog = regProgram();
 
-  // The lowering must refuse what it does not implement, and change nothing.
+  // The lowering covers all sixteen opcodes now; what must still be refused is
+  // anything outside the ISA, and a refusal must append nothing.
   {
     std::vector<IrOp> ir;
     MirOp ld;
     ld.op = Opcode::Ld;
-    CHECK(!lowerOp(ld, &ir), "ld is refused by the register-class lowering");
-    CHECK(ir.empty(), "a refusal appends nothing");
+    CHECK(lowerOp(ld, &ir) && ir.size() == 1 && ir[0].kind == IrKind::Load,
+          "ld lowers to a load");
+    ir.clear();
     MirOp jmp;
     jmp.op = Opcode::Jmp;
-    CHECK(!lowerOp(jmp, &ir), "jmp is refused by the register-class lowering");
+    CHECK(lowerOp(jmp, &ir) && ir.size() == 1 && ir[0].kind == IrKind::Jmp,
+          "jmp lowers to a jump");
+    ir.clear();
     MirOp sto;
     sto.op = Opcode::Halt;
-    CHECK(!lowerOp(sto, &ir), "stop instruction is refused until V-05");
+    CHECK(lowerOp(sto, &ir) && ir.size() == 1 && ir[0].kind == IrKind::Stop,
+          "the stop instruction lowers to a stop");
+    ir.clear();
     MirOp nop;
     nop.op = Opcode::Nop;
     CHECK(lowerOp(nop, &ir) && ir.empty(), "nop lowers to zero operations");
+    MirOp bogus;
+    bogus.op = static_cast<Opcode>(0x10);
+    CHECK(!lowerOp(bogus, &ir), "an opcode outside the ISA is refused");
+    CHECK(ir.empty(), "a refusal appends nothing");
   }
 
   for (uint32_t init : {0x12345678u, 0u, 0xFFFFFFFFu}) {

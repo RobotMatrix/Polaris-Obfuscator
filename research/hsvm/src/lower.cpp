@@ -15,12 +15,10 @@ bool lowerOp(const MirOp &in, std::vector<IrOp> *out) {
     return true; // zero ops, but still a successful lowering
   case Opcode::Movi:
     o.kind = IrKind::Const;
-    out->push_back(o);
-    return true;
+    break;
   case Opcode::Mov:
     o.kind = IrKind::Copy;
-    out->push_back(o);
-    return true;
+    break;
   case Opcode::Add:
     o.kind = IrKind::Add;
     break;
@@ -45,8 +43,25 @@ bool lowerOp(const MirOp &in, std::vector<IrOp> *out) {
   case Opcode::Shr:
     o.kind = IrKind::Shr;
     break;
+  case Opcode::Ld:
+    o.kind = IrKind::Load;
+    break;
+  case Opcode::St:
+    o.kind = IrKind::Store;
+    break;
+  case Opcode::Jmp:
+    o.kind = IrKind::Jmp;
+    break;
+  case Opcode::Brz:
+    o.kind = IrKind::Brz;
+    break;
+  case Opcode::Halt:
+    o.kind = IrKind::Stop;
+    break;
   default:
-    return false; // Ld/St/Jmp/Brz: not in this slice
+    // An opcode outside the ISA must never be approximated: silence here would
+    // turn a corrupt bytecode into a plausible-looking copy.
+    return false;
   }
   out->push_back(o);
   return true;
@@ -55,8 +70,56 @@ bool lowerOp(const MirOp &in, std::vector<IrOp> *out) {
 bool irExec(SemState &s, const std::vector<IrOp> &ops) {
   if (s.halted || s.faulted)
     return false;
+  bool pcHandled = false;
   for (const IrOp &o : ops) {
     switch (o.kind) {
+    case IrKind::Jmp:
+      s.pc = static_cast<uint32_t>(static_cast<int64_t>(s.pc) +
+                                   static_cast<int32_t>(o.imm));
+      pcHandled = true;
+      break;
+    case IrKind::Stop:
+      s.halted = true;
+      pcHandled = true; // pc stays where it is
+      break;
+    case IrKind::Brz:
+      if (!semRegOk(s, o.a)) {
+        s.faulted = true;
+        return false;
+      }
+      if (s.regs[o.a] == 0)
+        s.pc = static_cast<uint32_t>(static_cast<int64_t>(s.pc) +
+                                     static_cast<int32_t>(o.imm));
+      else
+        s.pc += 1;
+      pcHandled = true;
+      break;
+    case IrKind::Load: {
+      if (!semRegOk(s, o.dst) || !semRegOk(s, o.a)) {
+        s.faulted = true;
+        return false;
+      }
+      const uint32_t addr = s.regs[o.a] + o.imm;
+      if (!semMemOk(s, addr)) {
+        s.faulted = true;
+        return false;
+      }
+      s.regs[o.dst] = semLoad32(s, addr);
+      break;
+    }
+    case IrKind::Store: {
+      if (!semRegOk(s, o.a) || !semRegOk(s, o.b)) {
+        s.faulted = true;
+        return false;
+      }
+      const uint32_t addr = s.regs[o.a] + o.imm;
+      if (!semMemOk(s, addr)) {
+        s.faulted = true;
+        return false;
+      }
+      semStore32(s, addr, s.regs[o.b]);
+      break;
+    }
     case IrKind::Const:
       if (!semRegOk(s, o.dst)) {
         s.faulted = true;
@@ -86,8 +149,8 @@ bool irExec(SemState &s, const std::vector<IrOp> &ops) {
       case IrKind::And: r = x & y; break;
       case IrKind::Or: r = x | y; break;
       case IrKind::Mul: r = x * y; break;
-      case IrKind::Shl: r = x << (y & 63u); break;
-      case IrKind::Shr: r = x >> (y & 63u); break;
+      case IrKind::Shl: r = x << (y & 31u); break;
+      case IrKind::Shr: r = x >> (y & 31u); break;
       default: break;
       }
       s.regs[o.dst] = r;
@@ -95,7 +158,8 @@ bool irExec(SemState &s, const std::vector<IrOp> &ops) {
     }
     }
   }
-  s.pc += 1;
+  if (!pcHandled)
+    s.pc += 1;
   return true;
 }
 

@@ -390,3 +390,20 @@ regs / mem / pc / 停机标志 / 故障标志，分歧时报 step、pc、指令�
   掩码在位级上不可观测。故 `&31` 是防御性写法，不是可测行为，报告已如实标注。
 
 **未做**：访存/分支 lowering、真实程序三方比对、LLVM IR 发射。
+
+## ADR-026 V-05 全 opcode lowering 与真实程序三方比对（2026-11-17）
+
+`src/lower.cpp` 覆盖 16 个 opcode（新增 `Load/Store/Jmp/Brz/Stop`）；
+`tests/test_lower_full.cpp`（ctest `lower_full`，19 断言）在 `sum/crc/copy_xor/allops`
+上三方锁步：解释器 ↔ oracle ↔ lowering，每步比全部寄存器 + 4 KiB 内存按字 + pc + 状态位。
+
+**两个被测试抓出的缺陷**：
+1. V-05 重写 `lowerOp` 时漏了 `default`，ISA 外的 opcode 会落到 `push_back` 并变成默认的
+   `Copy`——损坏字节码被"成功"降级。断言红了之后补 `default: return false`。
+2. `ff18f7275` 中混入了变异实验的 `& 63u`（应该是 `& 31u`）：回滚时我恢复了含变异的临时
+   备份。本轮改正。**今后变异检验的回滚以 `git diff` 为准，不信临时文件。**
+
+**终止语义**：把寄存器全填大值，`sum/crc/copy_xor` 的循环计数也被填大，8192 步内不停机；
+只有 `sum` 从零寄存器起跑 6 步会命中停机指令。报告按此如实记录，不拿"8192 步一致"当终止证明。
+
+**未做**：LLVM IR 发射（V-07）、跨平台验证、性能口径实测。
