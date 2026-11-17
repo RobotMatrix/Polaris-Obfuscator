@@ -34,6 +34,7 @@ enum HsvOp : uint8_t {
 
 constexpr uint32_t kRegs = 16;
 constexpr uint32_t kInstrBytes = 8;
+constexpr uint32_t kMemBytes = 4096;
 
 struct Decoded {
   uint8_t op = 0;
@@ -115,9 +116,19 @@ PreservedAnalyses HSVMLowering::run(Module &M, ModuleAnalysisManager &AM) {
   BasicBlock *Entry = BasicBlock::Create(Ctx, "hsvm.entry", F);
   IRBuilder<> EB(Entry);
   AllocaInst *Regs = EB.CreateAlloca(RegsTy, nullptr, "hsvm.regs");
+  // Optional initial register value: @hsvm_init (i32 constant). Without it the
+  // file starts zeroed, which is what the interpreter does for a zeroed fill.
+  uint32_t initRegs = 0;
+  if (GlobalVariable *GI = M.getNamedGlobal("hsvm_init"))
+    if (auto *CI = dyn_cast_or_null<ConstantInt>(GI->getInitializer()))
+      initRegs = static_cast<uint32_t>(CI->getZExtValue());
   for (uint32_t i = 0; i < kRegs; ++i)
-    EB.CreateStore(EB.getInt32(0),
+    EB.CreateStore(EB.getInt32(initRegs),
                    EB.CreateGEP(RegsTy, Regs, {EB.getInt32(0), EB.getInt32(i)}));
+  // The interpreter's memory starts zeroed; an alloca does not, so fill it.
+  ArrayType *MemTy = ArrayType::get(Type::getInt8Ty(Ctx), kMemBytes);
+  AllocaInst *Mem = EB.CreateAlloca(MemTy, nullptr, "hsvm.mem");
+  EB.CreateMemSet(Mem, EB.getInt8(0), kMemBytes, MaybeAlign(4));
 
   // One block per instruction, plus a fall-off-the-end block.
   std::vector<BasicBlock *> blocks;
@@ -125,6 +136,7 @@ PreservedAnalyses HSVMLowering::run(Module &M, ModuleAnalysisManager &AM) {
   for (uint32_t pc = 0; pc < slots; ++pc)
     blocks.push_back(BasicBlock::Create(Ctx, "hsvm." + std::to_string(pc), F));
   BasicBlock *OutOfRange = BasicBlock::Create(Ctx, "hsvm.pc_oob", F);
+  BasicBlock *FaultBlk = BasicBlock::Create(Ctx, "hsvm.fault", F);
   EB.CreateBr(blocks.empty() ? OutOfRange : blocks[0]);
 
   auto loadReg = [&](IRBuilder<> &B, uint8_t idx) {
@@ -134,6 +146,18 @@ PreservedAnalyses HSVMLowering::run(Module &M, ModuleAnalysisManager &AM) {
   };
   auto storeReg = [&](IRBuilder<> &B, uint8_t idx, Value *v) {
     B.CreateStore(v, B.CreateGEP(RegsTy, Regs, {B.getInt32(0), B.getInt32(idx)}));
+  };
+
+  auto memByte = [&](IRBuilder<> &B, Value *addr) {
+    return B.CreateGEP(MemTy, Mem, {B.getInt32(0), addr});
+  };
+  // Byte address must be 4-aligned and leave room for a word; otherwise the
+  // interpreter faults and so must we.
+  auto checkAddr = [&](IRBuilder<> &B, Value *addr, BasicBlock *Ok,
+                       BasicBlock *Bad) {
+    Value *hi = B.CreateICmpUGT(addr, B.getInt32(kMemBytes - 4));
+    Value *mis = B.CreateICmpNE(B.CreateAnd(addr, B.getInt32(3)), B.getInt32(0));
+    B.CreateCondBr(B.CreateOr(hi, mis), Bad, Ok);
   };
 
   for (uint32_t pc = 0; pc < slots; ++pc) {
@@ -195,13 +219,72 @@ PreservedAnalyses HSVMLowering::run(Module &M, ModuleAnalysisManager &AM) {
     case Hsv_Halt:
       B.CreateRet(loadReg(B, 0));
       break;
+    case Hsv_Ld: {
+      if (d.dst >= kRegs || d.a >= kRegs)
+        report_fatal_error("hsvm: register index out of range");
+      Value *addr = B.CreateAdd(loadReg(B, d.a), B.getInt32(d.imm));
+      BasicBlock *Cont = BasicBlock::Create(Ctx, "hsvm.ld", F);
+      checkAddr(B, addr, Cont, FaultBlk);
+      IRBuilder<> CB(Cont);
+      Value *v = CB.getInt32(0);
+      for (uint32_t k = 0; k < 4; ++k) {
+        Value *bp = CB.CreateAdd(addr, CB.getInt32(k));
+        Value *byte = CB.CreateZExt(CB.CreateLoad(Type::getInt8Ty(Ctx), memByte(CB, bp)),
+                                    Type::getInt32Ty(Ctx));
+        if (k != 0)
+          byte = CB.CreateShl(byte, 8 * k);
+        v = CB.CreateOr(v, byte);
+      }
+      storeReg(CB, d.dst, v);
+      CB.CreateBr(Next);
+      break;
+    }
+    case Hsv_St: {
+      if (d.a >= kRegs || d.b >= kRegs)
+        report_fatal_error("hsvm: register index out of range");
+      Value *addr = B.CreateAdd(loadReg(B, d.a), B.getInt32(d.imm));
+      Value *val = loadReg(B, d.b);
+      BasicBlock *Cont = BasicBlock::Create(Ctx, "hsvm.st", F);
+      checkAddr(B, addr, Cont, FaultBlk);
+      IRBuilder<> CB(Cont);
+      for (uint32_t k = 0; k < 4; ++k) {
+        Value *shifted = (k == 0) ? val : CB.CreateLShr(val, 8 * k);
+        Value *byte = CB.CreateTrunc(shifted, Type::getInt8Ty(Ctx));
+        Value *bp = CB.CreateAdd(addr, CB.getInt32(k));
+        CB.CreateStore(byte, memByte(CB, bp));
+      }
+      CB.CreateBr(Next);
+      break;
+    }
+    case Hsv_Jmp: {
+      const int64_t target = static_cast<int64_t>(pc) + static_cast<int32_t>(d.imm);
+      BasicBlock *T = (target < 0 || target >= static_cast<int64_t>(slots))
+                          ? OutOfRange
+                          : blocks[static_cast<size_t>(target)];
+      B.CreateBr(T);
+      break;
+    }
+    case Hsv_Brz: {
+      if (d.a >= kRegs)
+        report_fatal_error("hsvm: register index out of range");
+      const int64_t target = static_cast<int64_t>(pc) + static_cast<int32_t>(d.imm);
+      BasicBlock *T = (target < 0 || target >= static_cast<int64_t>(slots))
+                          ? OutOfRange
+                          : blocks[static_cast<size_t>(target)];
+      Value *z = B.CreateICmpEQ(loadReg(B, d.a), B.getInt32(0));
+      B.CreateCondBr(z, T, Next);
+      break;
+    }
     default:
-      // Memory and control flow are not lowered yet: refuse loudly.
-      report_fatal_error(Twine("hsvm: opcode not lowered yet: ") + opName(d.op));
+      // An opcode outside the ISA: refuse loudly rather than miscompile.
+      report_fatal_error(Twine("hsvm: unknown opcode: ") + opName(d.op));
     }
   }
 
   IRBuilder<> OB(OutOfRange);
   OB.CreateRet(OB.getInt32(0xFFFFFFFFu));
+  // Distinct sentinels so a caller can tell the two abnormal paths apart.
+  IRBuilder<> FB(FaultBlk);
+  FB.CreateRet(FB.getInt32(0xFFFFFFFEu));
   return PreservedAnalyses::none();
 }

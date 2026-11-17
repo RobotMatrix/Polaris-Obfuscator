@@ -65,6 +65,9 @@ add_executable(hsvm_affine_recover tools/hsvm_affine_recover.cpp)
 target_link_libraries(hsvm_affine_recover PRIVATE hsvm_core)
 target_compile_options(hsvm_affine_recover PRIVATE -Wall -Wextra)
 
+add_executable(hsvm_dump_program tools/hsvm_dump_program.cpp src/mir.cpp)
+target_link_libraries(hsvm_dump_program PRIVATE hsvm_core)
+
 add_executable(hsvm_ddt tools/hsvm_ddt.cpp)
 target_link_libraries(hsvm_ddt PRIVATE hsvm_core)
 target_compile_options(hsvm_ddt PRIVATE -Wall -Wextra)
@@ -133,6 +136,9 @@ add_test(NAME lower_full COMMAND test_lower_full)
 add_executable(test_emit tests/test_emit.cpp src/emit_c.cpp src/lower.cpp src/mir.cpp)
 target_link_libraries(test_emit PRIVATE hsvm_core)
 add_test(NAME emit_c COMMAND test_emit)
+
+# Requires the rebuilt Polaris clang: absent clang is a hard failure, not a skip.
+add_test(NAME vmp_gate COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/verify_vmp_gate.sh)
 
 add_executable(test_modenc tests/test_modenc.cpp)
 target_link_libraries(test_modenc PRIVATE hsvm_core)

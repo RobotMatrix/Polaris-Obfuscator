@@ -442,3 +442,23 @@ LLVM IR 放在 V-08 的 Polaris pass 里。代价：这里不能取性能口径�
 含 `ld` 的程序被拒绝且信息明确。
 
 **未做**：访存/分支 lowering、真实程序端到端、把 gate 接进 ctest（V-10）、性能口径。
+
+## ADR-029 V-10 pass 覆盖全 opcode，真实程序端到端打通（2026-11-17）
+
+`HSVMLowering` 现在降低全部 16 个 opcode（新增 `Ld/St/Jmp/Brz`），故障与 pc 越界分别返回
+`0xFFFFFFFE` / `0xFFFFFFFF`，以便在单值返回通道上区分两种异常。契约新增可选 `@hsvm_init`
+（i32 常量）设定初始寄存器值。
+
+新增 `tools/hsvm_dump_program`（导出 C 源码 + 用 oracle 算期望）与
+`scripts/verify_vmp_gate.sh`（已接进 ctest，名字 `vmp_gate`）。gate 通过：
+`sum/zero → r0=0`、`sum/small → r0=6`、`crc/zero → fault`、`copy_xor/zero → fault`、
+`allops/fault → fault`、ISA 外 opcode 被拒绝。
+
+**两个真问题**（都先红后修）：
+1. pass 把寄存器初始化成 0，而 oracle 从 `initRegs` 起跑——两边跑的不是同一个程序，
+   表现为 `sum/small` 期望 `r0=6` 实际 `r0=0`。加 `@hsvm_init` 修复。
+2. `-O1` 会折叠全常量程序（`sum` 初值 0x12345678 需 20 万步以上，原生瞬间返回）。
+   这不是 lowering 的错，是选错判据；gate 改为只比对折叠后仍可观测的结局。
+
+**未做**：pass 侧无步数预算概念（只有 oracle 会截断）；性能口径未测；
+`crc`/`copy_xor` 目前只覆盖故障路径，未覆盖正常跑完。
