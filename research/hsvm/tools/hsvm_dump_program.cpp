@@ -89,6 +89,8 @@ int main(int argc, char **argv) {
                "  printf(\"r0=%%u\\n\", v);\n"
                "  return 0;\n"
                "}\n"
+               "unsigned char *hsvm_table __attribute__((used)) = 0;\n"
+               "unsigned long long hsvm_table_len __attribute__((used)) = 0;\n"
                "const unsigned char hsvm_bytecode[%zu] __attribute__((used)) = {",
                prog->size(), prog->size());
   for (size_t i = 0; i < prog->size(); ++i)

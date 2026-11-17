@@ -554,3 +554,16 @@ ctest 28 个测试全绿。
 `report_fatal_error` 大声拒绝。gate 新增 `tld/bounds` 用例（命中 / 越界 / 未对齐三种结果），
 `verify_vmp_gate.sh` 通过。仍未放开 allops 与随机测试到 17 条（它们需要宿主表接线），
 这是下一步，不是遗漏。
+
+### ADR-034 补充：放开到 17 条的阻塞点（2026-11-17）
+
+试过把 `programs.cpp` / `hsvm_fuzz` / `test_linear` 全放开到 `kNumOpcodes`（17），结果两个红：
+- `emit_c`：`emitC()` 对 `Tld` 返回空串（C 发射器还没有这条 opcode）→ "emission produced source" 失败；
+- `linear`：allops 含 `Tld` 但线性模式的 Machine 没有宿主表 → 步数与预期不符。
+
+已准备好的部分（保留在代码里，不生效但就位）：`hsvm_fuzz` 的 Engine 给三方引擎接同一张 64 B 表
+（`Machine::setTable` + `SemState::table/tableBytes`），`hsvm_dump_program` 输出的 C 里带
+`hsvm_table`/`hsvm_table_len`（null/0，故 allops 仍按预期 fault）。
+
+**因此仍限 16 条**，直到 `emitC` 补上 `Tld`（发出有界检查 + `*(uint32_t*)(hsvm_table+addr)`）并给
+线性模式测试接表。这是唯一的剩余项，判据：三处改回 `kNumOpcodes` 后 ctest 仍 28/28。

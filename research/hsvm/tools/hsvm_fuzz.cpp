@@ -64,7 +64,6 @@ std::vector<uint8_t> randomProgram(std::mt19937_64 &rng, uint32_t *initRegs) {
     return static_cast<uint8_t>((rng() % 16) == 0 ? 16 + (rng() % 8) : (rng() % 16));
   };
   for (uint32_t i = 0; i < len; ++i) {
-    // Tld is excluded: the fuzz harness has no host table wired yet.
     const uint8_t op = static_cast<uint8_t>(rng() % 16u);
     uint32_t imm = static_cast<uint32_t>(rng());
     const Opcode o = static_cast<Opcode>(op);
@@ -118,6 +117,18 @@ Program runEngine(const std::vector<uint8_t> &code, uint32_t initRegs,
   return out; // unused; the real drivers are below
 }
 
+// ISA v2: Tld reads this table. All three engines must see the same pointer and
+// the same length, otherwise a Tld would fault in one and hit in another.
+static std::vector<uint8_t> &tldTable() {
+  static std::vector<uint8_t> t(64);
+  static bool init = false;
+  if (!init) {
+    for (size_t i = 0; i < t.size(); ++i) t[i] = static_cast<uint8_t>(i * 5 + 3);
+    init = true;
+  }
+  return t;
+}
+
 struct Engine {
   Machine m;
   SemState state;
@@ -134,6 +145,11 @@ struct Engine {
     mem.assign(Machine::kMemBytes, 0);
     state.mem = mem.data();
     state.memBytes = Machine::kMemBytes;
+    // ISA v2: the same host table for the interpreter, the oracle and (through
+    // the shared SemState) the lowering engine.
+    m.setTable(tldTable().data(), static_cast<uint32_t>(tldTable().size()));
+    state.table = tldTable().data();
+    state.tableBytes = static_cast<uint32_t>(tldTable().size());
     state.regCount = m.regCount();
     for (uint32_t i = 0; i < state.regCount; ++i)
       state.regs[i] = initRegs;

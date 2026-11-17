@@ -47,9 +47,21 @@ std::vector<std::string> runTrajectory(uint64_t seed, uint8_t memByte) {
   return out;
 }
 
+// ISA v2: allops now contains Tld, so the machine needs a host table.
+static const uint8_t *tldTable() {
+  static uint8_t t[64];
+  static bool init = false;
+  if (!init) {
+    for (int i = 0; i < 64; ++i) t[i] = static_cast<uint8_t>(i * 3 + 1);
+    init = true;
+  }
+  return t;
+}
+
 void testStepIsOneXor() {
   Machine vm(mkParams(4242), VmMode::Linear);
   vm.loadProgram(programAllOps());
+  vm.setTable(tldTable(), 64);
   vm.fillRegs(0xA5A5A5A5u);
   vm.run(1000);
 
