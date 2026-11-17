@@ -258,6 +258,36 @@ PreservedAnalyses HSVMLowering::run(Module &M, ModuleAnalysisManager &AM) {
       CB.CreateBr(Next);
       break;
     }
+    case Hsv_Tld: {
+      if (d.dst >= kRegs || d.a >= kRegs) {
+        B.CreateBr(FaultBlk);
+        break;
+      }
+      Module &Mod = *F->getParent();
+      GlobalVariable *TP = Mod.getGlobalVariable("hsvm_table");
+      GlobalVariable *TL = Mod.getGlobalVariable("hsvm_table_len");
+      if (!TP || !TL)
+        report_fatal_error(
+            "hsvm: Tld needs @hsvm_table (pointer) and @hsvm_table_len (i64)");
+      Value *addr32 = B.CreateAdd(loadReg(B, d.a), B.getInt32(d.imm));
+      Value *tbl = B.CreateLoad(PointerType::get(Ctx, 0), TP);
+      Value *len = B.CreateLoad(Type::getInt64Ty(Ctx), TL);
+      Value *addr = B.CreateZExt(addr32, Type::getInt64Ty(Ctx));
+      Value *fits = B.CreateICmpULE(B.CreateAdd(addr, B.getInt64(4)), len);
+      Value *aligned = B.CreateICmpEQ(B.CreateAnd(addr32, B.getInt32(3)),
+                                      B.getInt32(0));
+      Value *nonnull = B.CreateICmpNE(tbl, ConstantPointerNull::get(
+                                               PointerType::get(Ctx, 0)));
+      BasicBlock *Cont = BasicBlock::Create(Ctx, "hsvm.tld", F);
+      Value *ok = B.CreateAnd(B.CreateAnd(fits, aligned), nonnull);
+      B.CreateCondBr(ok, Cont, FaultBlk);
+      IRBuilder<> CB(Cont);
+      Value *p = CB.CreateAdd(tbl, addr);
+      Value *v = CB.CreateLoad(Type::getInt32Ty(Ctx), p);
+      storeReg(CB, d.dst, v);
+      CB.CreateBr(Next);
+      break;
+    }
     case Hsv_St: {
       if (d.a >= kRegs || d.b >= kRegs) {
         B.CreateBr(FaultBlk);

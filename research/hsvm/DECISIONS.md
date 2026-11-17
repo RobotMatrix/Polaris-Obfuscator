@@ -549,5 +549,8 @@ ctest 28 个测试全绿。
 - 编译器 pass 遇到 `Tld` 仍 `report_fatal_error`（大声拒绝，不静默近似）；
 - 因此 `vmp_gate` 的六个用例语义未变。
 
-下一步（一个完整增量）：pass 用 `@hsvm_table` 指针 + `@hsvm_table_len` 发射有界检查，
-C 发射器同步，再放开 allops/fuzz 到 17 条，并补 gate 用例（Tld 命中 / 越界 / 未对齐）。
+**本轮已补齐（同日）**：pass 发射 `Tld`——从 `@hsvm_table`（指针）与 `@hsvm_table_len`（i64）取值，
+按 `addr+4 <= len && (addr&3)==0 && table != null` 判定，否则走 fault 块；缺这两个全局时
+`report_fatal_error` 大声拒绝。gate 新增 `tld/bounds` 用例（命中 / 越界 / 未对齐三种结果），
+`verify_vmp_gate.sh` 通过。仍未放开 allops 与随机测试到 17 条（它们需要宿主表接线），
+这是下一步，不是遗漏。

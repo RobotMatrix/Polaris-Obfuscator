@@ -65,6 +65,25 @@ run_case crc       0          0       crc/zero
 run_case copy_xor  0          0       copy_xor/zero
 run_case allops    305419896  0       allops/fault
 
+# ISA v2: Tld reads the host table. Three outcomes must hold: a hit returns the
+# word at that offset, an offset whose word runs past the table faults, and a
+# misaligned offset faults.
+cp "$REPO/research/hsvm/tests/gate/tld_case.c" "$WORK/tld_case.c"
+if ! "$CLANG" -O1 -mllvm -passes=hsvm "$WORK/tld_case.c" -o "$WORK/tld_case" 2>"$WORK/tld.err"; then
+  printf '  FAIL %-18s compile: %s\n' "tld/bounds" "$(head -1 "$WORK/tld.err")"
+  fail=1
+else
+  out="$("$WORK/tld_case")"
+  if printf '%s' "$out" | grep -q "hit    : .*PASS" &&
+     printf '%s' "$out" | grep -q "oob    : .*PASS" &&
+     printf '%s' "$out" | grep -q "unalign: .*PASS"; then
+    printf '  ok   %-18s hit + out-of-range + misaligned\n' "tld/bounds"
+  else
+    printf '  FAIL %-18s %s\n' "tld/bounds" "$(printf '%s' "$out" | tr '\n' ' ')"
+    fail=1
+  fi
+fi
+
 # Refusal: an opcode outside the ISA (0x20) must abort the build.
 python3 - "$WORK" <<'PY'
 import sys
