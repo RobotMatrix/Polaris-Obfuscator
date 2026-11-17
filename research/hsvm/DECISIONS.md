@@ -375,3 +375,18 @@ regs / mem / pc / 停机标志 / 故障标志，分歧时报 step、pc、指令�
 
 教训：oracle 不依赖解释器是对的，但 oracle 的**常量**必须由解释器校准；
 写死 64 寄存器这类错误只有差分测试能抓出来。
+
+## ADR-025 V-04 寄存器类 lowering，三方差分与变异检验（2026-11-17）
+
+`lower.h/lower.cpp` 定义最小 IR（`Const/Copy/Add..Shr`），一条字节码降 0–1 条 `IrOp`；
+`Nop` 降 0 条，`Ld/St/Jmp/Brz/停机指令` 一律拒绝（false，不追加），拒绝语义显式可测。
+
+`tests/test_lower_regs.cpp`：`Machine(Plain)` ↔ `semStep` ↔ `lowerOp+irExec` 三方锁步，
+16 条指令覆盖 11 个寄存器类 opcode，三种初值，14 条断言全绿。
+
+**变异检验**（第一次做，发现两个问题）：
+- 把 `Shl` 改成 `Shr` → 测试在 step 9 / pc 8 / r9 定位到分歧，说明比对是活的；
+- 把掩码 `&31` 改成 `&63` → **仍然全绿**：ARM64/x86 的移位对位移量取模 32，
+  掩码在位级上不可观测。故 `&31` 是防御性写法，不是可测行为，报告已如实标注。
+
+**未做**：访存/分支 lowering、真实程序三方比对、LLVM IR 发射。
