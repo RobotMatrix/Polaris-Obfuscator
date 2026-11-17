@@ -1,0 +1,9 @@
+{
+  "experiment": "affine-normalisation-linear",
+  "queries": 9,
+  "additivity_violations": 0,
+  "linear_mismatches": 0,
+  "nonlinear_mismatches": 247,
+  "stripped_for_linear": true,
+  "note": "nine probes recover an affine composite exactly; the same probes leave a nonlinear psi unrecovered"
+}

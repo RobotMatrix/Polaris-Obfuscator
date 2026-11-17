@@ -50,9 +50,22 @@
 这正是 §6.2 所依赖的前提：仿射模块编码可被整体归一化。
 
 **做到哪一步**：可识别性（identification）已证明并可复现。
-**没做到哪一步**：真正解出 `A1`、`A2` 并还原 `ψ` 的归一化（normalization）未实现——
-那是仿射等价求解（Biryukov–Shamir / Beierle–Leander 一类算法），工作量与风险都远大于本轮。
-所以文档 §6.2 的结论现在是"必要条件已证、充分性未证"。
+**归一化（线性情形）已补上**：`tools/hsvm_affine_recover.cpp`。
+ψ 线性时 `A2∘ψ∘A1` 仍仿射，`F(0)` + 8 个基向量共 **9 次探测**即可精确重建：
+
+```
+additivity self-check violations : 0
+linear psi : 9 probes -> mismatches over 256 =   0
+table  psi : 9 probes -> mismatches over 256 = 247
+=> affine module encodings stripped for linear modules: yes
+```
+
+也就是说：**线性 module 的仿射编码可以被完整剥离**（0 误差），
+非线性 ψ 用同样 9 次探测做不到（247/256 错）——这正说明 §6.2 的负结果来自非线性，
+不是来自"模块化"本身。
+
+`additivity self-check` 是先用 `F(a⊕b)=F(a)⊕F(b)⊕F(0)` 把矩阵行/列约定钉死再跑重建；
+上一轮失败正是栽在约定上（ADR-017），这次先用自检挡住了。
 
 ## 复现
 
