@@ -47,6 +47,7 @@ usage:
 import argparse
 import math
 import os
+import subprocess
 import sys
 import time
 
@@ -65,6 +66,8 @@ def main(argv=None):
     ap.add_argument("--ncpu", type=int, default=wb.DEFAULT_ENV[1])
     ap.add_argument("--cls", type=int, default=wb.DEFAULT_ENV[2])
     ap.add_argument("--key", default=R.CHALLENGE_KEY, help="only used on the verify line")
+    ap.add_argument("--ct", default=None,
+                    help="expected ciphertext for pt 6bc1bee2...; default: ask the binary")
     ap.add_argument("--table", default=None,
                     help="raw table from a variant generator (needs --work for hy_in.h/hy_seal.h)")
     ap.add_argument("--work", default=None)
@@ -143,18 +146,33 @@ def main(argv=None):
     if key is None:
         print("   incomplete: %d/16 bytes" % len(res["per_byte"]))
         return 1
+    expect, expect_src = R.CHALLENGE_CT, "reslib constant (not this artifact)"
+    if a.ct:
+        expect, expect_src = a.ct.lower(), "--ct"
+    elif os.access(a.binary, os.X_OK):
+        # the artifact prints its own vector; prefer it over any baked-in constant
+        try:
+            out = subprocess.run([a.binary], capture_output=True, text=True, timeout=120).stdout
+            for line in out.splitlines():
+                if line.lower().startswith("ciphertext"):
+                    v = line.split(":", 1)[1].strip()
+                    if len(v) == 32:
+                        expect, expect_src = v.lower(), "the artifact's own output"
+                        break
+        except Exception:
+            pass
     ct = wb.aes_encrypt(bytes.fromhex(R.CHALLENGE_PT), key)
     print("   recovered key: %s" % key.hex())
     print("   AES-128(%s) = %s" % (R.CHALLENGE_PT, ct.hex()))
-    print("   shipped ct  = %s" % R.CHALLENGE_CT)
-    print("   reproduces the shipped ciphertext: %s"
-          % ("YES" if ct.hex() == R.CHALLENGE_CT else "NO"))
+    print("   expected ct = %s   (from %s)" % (expect, expect_src))
+    print("   reproduces that ciphertext: %s"
+          % ("YES" if ct.hex() == expect else "NO"))
     print("   equals the published key: %s" % ("YES" if key.hex() == a.key else "NO"))
     print("   work factor: %d affine-consistency tests (64 byte positions x 256 guesses),"
           " 32 group recoveries" % (len(nc) * 256))
     print("   no search over Z, no search over D0/D1, no traces; %.2fs total (%.2fs algebra)"
           % (time.time() - t_start, t_peel))
-    return 0 if ct.hex() == R.CHALLENGE_CT else 1
+    return 0 if ct.hex() == expect else 1
 
 
 if __name__ == "__main__":
