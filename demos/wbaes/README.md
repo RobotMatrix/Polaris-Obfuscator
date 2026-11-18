@@ -1028,7 +1028,7 @@ python3 demos/wbaes/attacks/dca_attack.py --binary …/wbaes_vm2_clean --traces 
 | A1 生成端自检 | `gen_hybrid` | rc 0：`spn-mds: PASS`、`table-check PASS`、`seal-check PASS` |
 | A1 的负向对照 | 注入一次结构故障（`E` 与其逆不配） | 加密侧 **rc 8**、解密侧 **rc 9** |
 | A2 VM 真被执行 | `-DWBAES_VM_SCHEDTEST` | 完好 `2c0b8f87…` → 翻调度块第 48 字节 `0d95f13482690349cb09f0e8e5fe9a6b` → 恢复 `2c0b8f87…` |
-| A2 DFA | `-DWBAES_DFA_SELFTEST` | 密文 `c703bf11d9b37bc3acea04fd6aea8b27`、回环 `ee7a7dd279868e38979d485750a1956f`，`vector-match: FAIL`（按设计是垃圾） |
+| A2 DFA | `-DWBAES_DFA_SELFTEST` | 垃圾输出（每次运行都不同，本次密文 `c703bf11d9b37bc3acea04fd6aea8b27`、回环 `ee7a7dd279868e38979d485750a1956f`），`vector-match: FAIL`、`roundtrip: FAIL`（按设计） |
 | A2 VM 偏移 | `tests/test_vm_offsets` | `vm-offsets: PASS`（含 F4 出货布局 + 288 项批量计划） |
 | 族维度 | `--fam 0` / `--fam 1` / `--fam 3` | 各 **rc 2**：`this build has one shape (--fam 4); 0..3 cannot express a 16-bit combine` |
 | 封印 | `hy_seal.h` / 运行期自检 | seal `0x502cea34`，全表 + 每 4096 字节抽样双检，`seal-check PASS` |
