@@ -24,6 +24,9 @@
 | `wbaes_vm_clean` | `-O2`，dl4 全部 + **HSV 字节码算每轮表偏移** | 有 | `07d9…`（未公开） | `29d00ce8…` |
 | `wbaes_vm_max` | `-O2` + 8 pass，同上 | 有 | `07d9…`（未公开） | `29d00ce8…` |
 
+| `wbaes_nl_clean` | `-O2`，dl5 跨 lane 非线性重编码 + VM | 有 | `46f6…`（未公开） | `80aadc09…` |
+| `wbaes_nl_max` | `-O2` + 8 pass，同上 | 有 | `46f6…`（未公开） | `80aadc09…` |
+
 **`*_vm` 是含 VM 的一代。** 与 dl4 同一套表（异构族 + lane 内部编码 + 掩码 + 封印 + DFA 双算），
 差别在热路径上多了一段真在跑的 HSV 字节码（ISA v2，`Tld`）：
 
@@ -64,6 +67,43 @@
     recovery failed: no candidate key           (29.0 s)
   ```
   失败原因与 dl4 相同（每格是 `E[MC·S(x)]`，随机 256 元素双射），不是 VM 的功劳。
+
+`*_nl` 是 **dl5**：把 `demos/wbaes/attacks/` 里那两条**已经成功**的攻击（BGE 类静态剥离、
+DCA 地址轨迹）挡住的一代。它不改函数（密文与旧钥逐字节对应），只改两处结构：
+
+- 64K 成对解码表的**输出**多一层随机双射：`Q[a][b] = Z(D0[a] ^ D1[b])`。表不再是秩 1 张量，
+  "一行 + 一列"拟合不出它，所以拿不到 lane 的逆；边界也从 256 项换成 **64K 两字节表**，
+  值 `P[Zl⁻¹(u) ^ Zr⁻¹(v) ^ rk]`，`Zl⁻¹/Zr⁻¹` 不作为独立表存在；
+- 一列的四个输出字节当作一个 32 位字，过三轮可逆**非线性重编码**
+  （每轮：异或常量 → 逐字节随机双射 → 固定 4×4 MDS `(1,4,3,7)`，逆 `(11,11,9,8)`），
+  下一轮边界用存的逆向 S 表还原。所以轮边界内存里没有单字节明文域状态。
+- F0 也丢掉原来两张 256 项逆表，和 F1/F2/F3 共用同一张两字节边界表。
+
+列槽因此从 768 KiB 涨到 780 KiB（表总长 **70,090,816 B**，+1.28%），每块耗时翻倍
+（10.02 → 22.29 µs 加密、10.66 → 22.21 µs 解密，同钥同 VM 配置实测）。
+
+**两条攻击在这个产物上的实测结果（本机实跑）**：
+
+```
+python3 demos/wbaes/attacks/bge_attack.py
+  32/32 pair tables fitted; 9646 of 131072 sampled entries reproduced by two
+  256-byte arrays, but 8672 of those lie on the a=0 row or the b=0 column that
+  the fit is built from. Off those, 974/122400 = 0.0080 reproduce, against
+  1/256 = 0.0039 for an unrelated table
+  incomplete (0/16 bytes): round 0 did not yield the key          (rc=1)
+
+python3 demos/wbaes/attacks/dca_attack.py --traces <harness>/dl4_traces.bin
+  tag F1 (kind 144) half 0: candidates per column [0, 0, 0, 0] -> 0/16 key bytes
+  tag F1 (kind 144) half 1: ... 0/16     tag F2 half 0/1: ... 0/16
+  tag F3 (kind 160) half 0: ... 0/16     tag F3 half 1: ... 0/16
+  iso: 8 distinct pair sums, 8 index values, conflicts 0, index == pair sum 0/8
+  incomplete: 0/16 bytes                                          (rc=1)
+```
+
+**别把"这两条脚本失败"读成"抗提取"**：恢复出的边界下标仍然是成对和的**函数**（实测 0 冲突），
+只是被一条未知随机双射遮住；`Q = Z∘(D0⊕D1)` 是隐藏位移问题；重编码的逆在解掩后可由
+12 张逆向 S 表 + 公开 MDS 求出。这三条都没有脚本，也都没测——`demos/wbaes/WB-DESIGN-V2.md`
+§十二 把它们列成"剩余攻击面"。
 
 `*_dl4` 在 dl3 的异构之上把内部编码补齐：每条 lane 一个随机 256 元素双射，
 每行两张 64K 表把两条 lane 的逆取回来，明文部分和 XOR 后再走 256 项随机边界置换
@@ -188,6 +228,14 @@ vector-match: PASS
 roundtrip   : PASS
 ```
 
+`*_nl` 两个的预期输出（dl5 换钥后）：
+```
+plaintext : 6bc1bee22e409f96e93d7e117393172a
+ciphertext: 80aadc09777696c9d492a7e53b3b15b0
+vector-match: PASS
+roundtrip   : PASS
+```
+
 ## 结构提示（不做隐瞒，这些是你该自己验证的）
 
 - `*_vm` 多一个 `__DATA,__hsvm` 节（344 字节字节码）和 `_hsvm_entry` 函数；
@@ -199,6 +247,9 @@ roundtrip   : PASS
   所以"数表槽形状推轮数"不再成立，但调度块本身在解掩后是明文可读的。
 - dl4 的列槽里多了 8 张 64K 表（512 KiB，槽是 768 KiB）：两条 lane 的随机双射就在这 8 张表里
   被取逆，另外 4 张 256 项表是轮边界；宽表/系数表只存 `E[MC[row][k]·S(x)]`。
+- `*_nl` 的列槽是 798,720 B：`[0,4096)` lane/系数表（F0 是两张 512 KiB 前置表，与其它族区段
+  重叠但互不读取）、`[4096,528384)` 八张 64K 成对解码表、`[528384,536576)` 3 轮重编码的
+  12 张正向 S 表 + 12 张逆向 S 表 + 12 个常量、`[536576,798720)` 四张 64K 两字节边界表。
 - `kHyTab` 是 `private_extern` 符号；strip 之后仍可从节表定位。
 - 没有 S 盒、没有轮密钥异或：所有轮函数都在表里。
 - 解密路径与加密路径共用同表区。
@@ -242,6 +293,13 @@ roundtrip   : PASS
    所以正确的说法是"朴素路径已关，成本未知"，不是"提取不了"。
    `demos/wbaes/DATA-LAYER.md` 第八节有实测记录。
 
+1c. **`*_nl`：仓库里那两条攻击脚本都失败，但残留路径未测。**
+   现状（实测）：`bge_attack.py` 0/16 字节、`dca_attack.py` 0/16 字节，原因见上一节的输出；
+   经典单字节 CPA 依旧零泄漏（16/16 槽位的 lane 表下标逐位等于公开的 `P0(pt)`）。
+   未做：`Q = Z(D0⊕D1)` 的隐藏位移求解、基于"未知双射一致性"的边界下标统计
+   （需要 ~2^12 条轨迹）、解掩后对重编码求逆再剥表。所以正确的说法是
+   "这两条脚本关了"，不是"提取不了"。
+
 2. **DFA（故障注入）已被检测。** 加密与解密都做两遍独立遍历并比对，
    不一致时输出随机垃圾（不给故障密文），所以经典 DFA 拿不到差分样本。
    想绕需要多故障/共模故障或直接 patch 校验。
@@ -262,6 +320,8 @@ roundtrip   : PASS
 - 复现构建需要仓库里的 `gen_hybrid.cpp` 与同一把密钥；本目录只放产物，不放源码与密钥。
 - 构建方式（供你核对平台差异，不是给你的提示）：
   ```
-  clang++ -O2 -std=c++17 -DWBAES_BAKED -DWBAES_NO_MIR -I. -I<repo>/demos/wbaes \
-          demo_wbaes.cpp hy_tab.S [-mllvm -passes=alias,gvenc,indcall,indbr,mba,sub,bcf,fla] -o <out>
+  # wbaes_vm_*/wbaes_nl_* 还需要 -DWBAES_HAVE_VM，且 wbaes_vm.cpp 单独走 hsvm pass：
+  clang++ -O2 -std=c++17 -DWBAES_BAKED -DWBAES_NO_MIR [-DWBAES_HAVE_VM] -I. -I<repo>/demos/wbaes \
+          demo_wbaes.cpp hy_tab.S [wbaes_vm.o] \
+          [-mllvm -passes=alias,gvenc,indcall,indbr,mba,sub,bcf,fla] -o <out>
   ```
