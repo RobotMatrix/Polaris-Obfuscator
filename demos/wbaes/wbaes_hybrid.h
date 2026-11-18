@@ -5,40 +5,52 @@
 // 轮密钥只出现在表项里。运行时按列取两对字节，再取一张联合表。
 // 下标经过 16 位 Feistel，和明文下标不是同一套排列。
 //
-// dl5 (cross-lane nonlinear recoding). Two structural changes to the round tail,
-// each with the attack it is meant to stop:
+// F4 (this generation's only shape): 16-bit column combining.
 //
-//   * every 64K pair-decode table now carries a random 8-bit bijection on its
-//     *output*: Q[a][b] = Z(D0[a] ^ D1[b]). The table is no longer a rank-1 XOR
-//     tensor, so one row plus one column no longer reproduces it
-//     (bge_attack.py step 1);
-//   * the boundary is a 64K two-byte table, Q2[u][v] = P[Zl^-1(u) ^ Zr^-1(v) ^ rk].
-//     Its index depends on two bytes and neither Z^-1 exists as a table of its
-//     own, so an address no longer inverts to a key-dependent byte
-//     (dca_attack.py experiment B).
+// MixColumns is GF(2)-linear, so a column's partial sums can be paired on the
+// lane axis *and* on the output-row axis: each (row pair, lane pair) is a
+// 2^16-index table of 16-bit values, and the two halves of a row pair meet in
+// one 16-bit XOR.
 //
-// The four output bytes of a column are a 32-bit word; they leave the round
-// through a 32-bit nonlinear recoding (3 rounds of per-byte random bijection,
-// fixed 4x4 MDS, per-round constant) that mixes all four bytes. See hy_spn_fwd.
+//     Y01 = T[rp0][b0|b1<<8] ^ T[rp0][b2|b3<<8]      rows 0,1
+//     Y23 = T[rp1][b0|b1<<8] ^ T[rp1][b2|b3<<8]      rows 2,3
+//
+// The value encoding E is a per-build invertible affine map on GF(2)^16, the
+// same on both halves of a row pair, so E(u) ^ E(v) = E(u ^ v) and E's constant
+// cancels. The four 2^16-index decode tables take the 16-bit XOR, apply E^-1, add
+// the column's round-key constant and the output bijection. No 8-bit combine
+// exists anywhere on the data path.
+//
+// The encoding has to be affine, and that is arithmetic rather than a choice: if
+// E0, E1 are bijections on 16 bits and some M satisfies M(E0(u) ^ E1(v)) = u ^ v
+// for all u, v, then M = E0^-1 = E1^-1 and E0(u ^ v) = E0(u) ^ E0(v). A nonlinear
+// 16-bit encoding cannot be undone by any 2^16-index table. The consequence is
+// measured, not hidden: the pair table is exactly XOR-separable
+// (T[a][b] == X[a] ^ Y[b] over all 2^16 entries), one axis of it is still one key
+// byte, and the key falls out at 4,096 affine-consistency tests (0.08 s of
+// algebra). This generation is shipped for speed, with that written down:
+// attacks/residual/W16-EXPERIMENT.md, README 5.29.
+//
+// The 32-bit recoding is unchanged from dl5: a column's four output bytes leave
+// the round through three rounds of (per-byte random bijection, fixed 4x4 MDS,
+// per-round constant). See hy_spn_fwd.
 static const int HY_MC_ROUNDS = 9;
 static const int HY_DEC_STEPS = 9;
 static const uint32_t HY_N = 65536u;
 static const uint32_t HY_U32 = HY_N * 4u;
-static const uint32_t HY_U8 = HY_N;
 static const uint32_t HY_U16 = HY_N * 2u;
 
 // One column slot per (direction, round, column). Byte layout:
-//   [0, 4096)          F1/F3: four 32-bit lane tables (256 x 4 B, 1024 B apart)
-//                      F2:    sixteen coefficient tables (16 x 256 x 1 B)
-//                      F0:    the two 16-bit-indexed pair tables (2 x 256 KiB)
-//   [4096, 528384)     F1/F2/F3 only: eight 64K pair-decode tables, 2 per output row
+//   [0, 524288)        4 x 2^16-entry pair tables of 16-bit values:
+//                      k=0 rows 0,1 lanes 0,1   k=1 rows 0,1 lanes 2,3
+//                      k=2 rows 2,3 lanes 0,1   k=3 rows 2,3 lanes 2,3
+//   [524288, 528384)   unused: the 4 KiB alignment gap of the shipped stride,
+//                      kept so HY_COL and the VM's 288 offsets do not move
 //   [528384, 536576)   the recoding: 12 forward + 12 inverse 256-entry tables and
 //                      the twelve per-round constants (HY_SPN_*)
-//   [536576, 798720)   four 64K two-byte boundary tables, one per output row
-// F0 never reads the pair-decode region and F1/F2/F3 never read the F0 front, so
-// the two front layouts overlap only where the other family does not look.
-static const uint32_t HY_LANE_OFF = 0u;
-static const uint32_t HY_Q_OFF = 4096u;
+//   [536576, 798720)   4 x 2^16-index decode tables, one per output row
+// The slot is the same 798,720 B as the eight-bit generations: a shorter one
+// would save 294,912 B (0.42 %) and invalidate every offset the VM computes.
 static const uint32_t HY_SPN_OFF = 528384u;
 static const uint32_t HY_SPN_ROUNDS = 3u;
 static const uint32_t HY_SPN_SI_OFF = 12u * 256u; // inverse S-boxes, after 12 forward ones
@@ -57,8 +69,10 @@ static const uint32_t HY_OFF_DEC = HY_ENC_BYTES;
 static const uint32_t HY_TABLES = HY_ENC_BYTES + HY_DEC_BYTES;
 
 // Round-family schedule. The generator writes one family byte per (direction,
-// round) here, inside the sealed table, so the reader never assumes that all
-// nine rounds share one shape. Masked on disk like every other table byte.
+// round) here, inside the sealed table. In this generation every byte is
+// HY_FAM_W16; it is still data because the VM reads it to pick its lane
+// addressing, and because a zero byte there must move the addresses rather than
+// be quietly ignored.
 // The tail of the block carries the layout words the HSV bytecode reads through
 // Tld: base and round stride per direction, column stride, and the two lane
 // strides. They sit at 4-byte-aligned offsets because Tld only reads aligned words.
@@ -67,41 +81,28 @@ static const uint32_t HY_SCHED_STRIDE = 16u;
 static const uint32_t HY_SCHED_BYTES = 64u;
 static const uint32_t HY_TOTAL = HY_TABLES + HY_SCHED_BYTES;
 
-// Families. Every one computes the same round function; they differ in how the
-// linear layer and the key constant are carried into the table path.
-static const int HY_FAM_PAIR = 0; // two 16-bit-indexed pair tables + 64K boundary
-static const int HY_FAM_T32 = 1;  // four 32-bit byte-indexed tables + pair decode
-static const int HY_FAM_T8 = 2;   // 16 coefficient byte tables + pair decode
-static const int HY_FAM_T32K = 3; // four 32-bit tables, column key folded in
+// The one shape. It has to be nonzero: the VM's `brz fam, pair-layout` branch is
+// what tells it this round gives every lane its own table at `k * lane_stride`,
+// and the lane-stride word is one 2^16-entry pair table (HY_W16_TAB). The four
+// earlier families each put their partial sums in 8-bit tables at this column
+// stride, so none of them can express a 16-bit combine; they are gone rather
+// than left as branches no build can reach.
+static const int HY_FAM_W16 = 4;
 
-// Table kinds inside one column slot. Distinct per family so the tag - and with
-// it the index scatter - never repeats between shapes.
-static const int HY_K_PAIR_L = 0;  // 0,1 pair halves (16-bit index, 32-bit word)
-static const int HY_K_T32_W = 16;  // 16..19 wide lane tables
-static const int HY_K_T8_C = 32;   // 32..47 coefficient tables
-static const int HY_K_T32K_W = 64; // 64..67 wide lane tables
-static const int HY_K_T32_Q = 80;  // 80..87 pair decode, two lookups per row
-static const int HY_K_T8_Q = 88;   // 88..95
-static const int HY_K_T32K_Q = 96; // 96..103
+// Table kinds inside one column slot. Distinct per table so the tag - and with
+// it the index scatter - never repeats between tables.
 static const int HY_K_SPN_S = 112; // 112..123 forward S-boxes (round i, byte j)
 static const int HY_K_SPN_SI = 124;// 124..135 inverse S-boxes
-static const int HY_K_BDY_PAIR = 136; // 136..139 F0 two-byte boundary
-static const int HY_K_BDY_T32 = 144;  // 144..147 F1
-static const int HY_K_BDY_T8 = 152;   // 152..155 F2
-static const int HY_K_BDY_T32K = 160;// 160..163 F3
+static const int HY_K_W16_L = 200; // 200..203 the four 16-bit-output pair tables
+static const int HY_K_W16_D = 208; // 208..211 the four 2^16-index decode tables
 
 // Sub-layout inside one column slot.
-static const uint32_t HY_W1024 = 1024u; // 256 byte-indexed uint32 entries
 static const uint32_t HY_W256 = 256u;
-static_assert(HY_Q_OFF + 8u * HY_N <= HY_SPN_OFF, "pair-decode tables do not fit the column slot");
+static const uint32_t HY_W16_TAB = HY_U16; // one pair table: 2^16 entries x 2 B
 static_assert(HY_SPN_OFF + HY_SPN_BYTES <= HY_BDY_OFF, "recoding tables do not fit");
-static_assert(HY_BDY_OFF + 4u * HY_N <= HY_COL, "boundary tables do not fit");
-// F0's 512 KiB front deliberately overlaps the lane and pair-decode regions of the
-// other three families: no family reads another family's region, and the round's
-// family byte comes from the sealed schedule block. What must not overlap is
-// anything inside one family, which is why the recoding and boundary regions sit
-// above the front.
-static_assert(2u * HY_U32 <= HY_SPN_OFF, "F0 front must end before the recoding region");
+static_assert(HY_BDY_OFF + 4u * HY_N <= HY_COL, "decode tables do not fit");
+static_assert(4u * HY_W16_TAB <= HY_SPN_OFF, "the pair tables must end before the recoding region");
+static_assert(HY_BDY_OFF + 4u * HY_N == HY_COL, "the decode tables are the last region of the slot");
 
 inline uint32_t hy_env_mix(int pagesize, int ncpu, int cls) {
     return (uint32_t)pagesize ^ ((uint32_t)ncpu << 16) ^ ((uint32_t)cls * 0x01000193u) ^ 0xA5C31E87u;
@@ -165,11 +166,6 @@ inline uint32_t hy_dec_tail() {
     return HY_OFF_DEC + HY_DEC_ENTRY + HY_DEC_STEPS * HY_DEC_STEP;
 }
 
-inline uint32_t hy_load32(const uint8_t *tab, uint32_t off, uint16_t logical, uint32_t env, uint32_t tag) {
-    uint16_t s = hy_scatter(logical, env, tag);
-    const uint8_t *p = tab + off + (uint32_t)s * 4u;
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
 inline uint8_t hy_load8(const uint8_t *tab, uint32_t off, uint16_t logical, uint32_t env, uint32_t tag) {
     uint16_t s = hy_scatter(logical, env, tag);
     return tab[off + s];
@@ -180,14 +176,6 @@ inline uint16_t hy_load16(const uint8_t *tab, uint32_t off, uint16_t logical, ui
     return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
 }
 
-inline void hy_store32(uint8_t *tab, uint32_t off, uint16_t logical, uint32_t env, uint32_t tag, uint32_t w) {
-    uint16_t s = hy_scatter(logical, env, tag);
-    uint8_t *p = tab + off + (uint32_t)s * 4u;
-    p[0] = (uint8_t)w;
-    p[1] = (uint8_t)(w >> 8);
-    p[2] = (uint8_t)(w >> 16);
-    p[3] = (uint8_t)(w >> 24);
-}
 inline void hy_store8(uint8_t *tab, uint32_t off, uint16_t logical, uint32_t env, uint32_t tag, uint8_t v) {
     uint16_t s = hy_scatter(logical, env, tag);
     tab[off + s] = v;
@@ -215,19 +203,8 @@ inline uint8_t hy_scatter8(uint8_t x, uint32_t env, uint32_t tag) {
     uint32_t b = (k >> 8) & 255u;
     return (uint8_t)(a * (uint32_t)x + b);
 }
-inline uint32_t hy_load32t(const uint8_t *tab, uint32_t off, uint8_t logical, uint32_t env, uint32_t tag) {
-    const uint8_t *p = tab + off + (uint32_t)hy_scatter8(logical, env, tag) * 4u;
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
 inline uint8_t hy_load8t(const uint8_t *tab, uint32_t off, uint8_t logical, uint32_t env, uint32_t tag) {
     return tab[off + hy_scatter8(logical, env, tag)];
-}
-inline void hy_store32t(uint8_t *tab, uint32_t off, uint8_t logical, uint32_t env, uint32_t tag, uint32_t w) {
-    uint8_t *p = tab + off + (uint32_t)hy_scatter8(logical, env, tag) * 4u;
-    p[0] = (uint8_t)w;
-    p[1] = (uint8_t)(w >> 8);
-    p[2] = (uint8_t)(w >> 16);
-    p[3] = (uint8_t)(w >> 24);
 }
 inline void hy_store8t(uint8_t *tab, uint32_t off, uint8_t logical, uint32_t env, uint32_t tag, uint8_t v) {
     tab[off + hy_scatter8(logical, env, tag)] = v;
@@ -338,87 +315,44 @@ inline void hy_rec_undo(const uint8_t *tab, uint32_t pbase, int dir, int round,
     }
 }
 
-// One column of one round, whatever shape the schedule picked for that round.
-// F1/F2/F3 read their lanes through a random bijection per (row,k) and decode two
-// lanes at a time in a 64K table that then passes through another random
-// bijection; the two halves meet in a 64K two-byte boundary table. F0 keeps its
-// two 16-bit-indexed pair tables, but its 256-entry inverse tables are gone: the
-// same two-byte boundary table performs that inversion.
+// One column of one round. The shape is fixed, so this is the whole round
+// function: four pair lookups, two 16-bit XORs, four decode lookups, then the
+// 32-bit recoding.
 //
 // lane16 (optional) is the 16-entry offset table the HSV bytecode produced for
-// this (dir, round): entry 4*col+k is the byte offset of column col's lane-k
-// table, and entry 4*col+0 is that column's slot base. The reader then takes
-// every lane-table address from the VM instead of computing it; the generator
-// passes nullptr and keeps deriving the same numbers itself.
+// this (dir, round): entry 4*col+k is the byte offset of column col's pair table
+// k, and entry 4*col+0 is that column's slot base. The reader then takes every
+// table address from the VM instead of computing it; the generator passes nullptr
+// and keeps deriving the same numbers itself.
 inline void hy_mc_round(const uint8_t *tab, uint32_t base, int round, int dir, int src_kind,
                         const uint8_t in[16], uint8_t out[16], uint32_t env,
                         const uint32_t *lane16 = nullptr) {
-    const int fam = (int)tab[HY_SCHED_OFF + (uint32_t)dir * HY_SCHED_STRIDE + (uint32_t)round];
     for (int col = 0; col < 4; col++) {
         const uint32_t cb = lane16 ? lane16[4 * col] : base + (uint32_t)col * HY_COL;
-        // Lane-table base per input row k. The stride is the family's: F0 reads
-        // lanes 0,1 from the left pair table and lanes 2,3 from the right one;
-        // the other families give every lane its own table HY_W1024 apart (F2's
-        // 256-byte coefficient tables sit at k*4*HY_W256, the same distance).
+        // One 2^16-entry pair table per (row pair, lane pair), HY_W16_TAB apart.
         uint32_t lk[4];
         for (int k = 0; k < 4; k++)
-            lk[k] = lane16 ? lane16[4 * col + k]
-                           : (fam == HY_FAM_PAIR ? ((k >= 2) ? cb + HY_U32 : cb)
-                                                 : cb + (uint32_t)k * HY_W1024);
+            lk[k] = lane16 ? lane16[4 * col + k] : cb + (uint32_t)k * HY_W16_TAB;
         uint8_t b[4];
         for (int k = 0; k < 4; k++) b[k] = in[hy_pick(src_kind, k + 4 * col)];
         const uint32_t bdy = cb + HY_BDY_OFF;
-        if (fam == HY_FAM_PAIR) {
-            const uint32_t left = hy_load32(tab, lk[0], (uint16_t)(b[0] | (b[1] << 8)), env,
-                                            hy_tag(dir, round, col, HY_K_PAIR_L));
-            const uint32_t right = hy_load32(tab, lk[2], (uint16_t)(b[2] | (b[3] << 8)), env,
-                                             hy_tag(dir, round, col, HY_K_PAIR_L + 1));
-            for (int row = 0; row < 4; row++) {
-                const uint8_t pl = (uint8_t)((left >> (8 * row)) & 255);
-                const uint8_t pr = (uint8_t)((right >> (8 * row)) & 255);
-                out[row + 4 * col] = hy_load8(tab, bdy + (uint32_t)row * HY_N,
-                                              (uint16_t)(pl | (pr << 8)), env,
-                                              hy_tag(dir, round, col, HY_K_BDY_PAIR + row));
-            }
-        } else if (fam == HY_FAM_T8) {
-            uint8_t v[4][4];
-            for (int k = 0; k < 4; k++)
-                for (int row = 0; row < 4; row++)
-                    v[k][row] = hy_load8t(tab, lk[k] + (uint32_t)row * HY_W256, b[k], env,
-                                          hy_tag(dir, round, col, HY_K_T8_C + k * 4 + row));
-            for (int row = 0; row < 4; row++) {
-                const uint8_t pl = hy_load8(tab, cb + HY_Q_OFF + (uint32_t)(2 * row) * HY_N,
-                                            (uint16_t)(v[0][row] | (v[1][row] << 8)), env,
-                                            hy_tag(dir, round, col, HY_K_T8_Q + 2 * row));
-                const uint8_t pr = hy_load8(tab, cb + HY_Q_OFF + (uint32_t)(2 * row + 1) * HY_N,
-                                            (uint16_t)(v[2][row] | (v[3][row] << 8)), env,
-                                            hy_tag(dir, round, col, HY_K_T8_Q + 2 * row + 1));
-                out[row + 4 * col] = hy_load8(tab, bdy + (uint32_t)row * HY_N,
-                                              (uint16_t)(pl | (pr << 8)), env,
-                                              hy_tag(dir, round, col, HY_K_BDY_T8 + row));
-            }
-        } else {
-            const int kw = (fam == HY_FAM_T32K) ? HY_K_T32K_W : HY_K_T32_W;
-            const int qb = (fam == HY_FAM_T32K) ? HY_K_T32K_Q : HY_K_T32_Q;
-            const int bk = (fam == HY_FAM_T32K) ? HY_K_BDY_T32K : HY_K_BDY_T32;
-            uint32_t w[4];
-            for (int k = 0; k < 4; k++)
-                w[k] = hy_load32t(tab, lk[k], b[k], env,
-                                  hy_tag(dir, round, col, kw + k));
-            for (int row = 0; row < 4; row++) {
-                const uint8_t a0 = (uint8_t)(w[0] >> (8 * row)), a1 = (uint8_t)(w[1] >> (8 * row));
-                const uint8_t a2 = (uint8_t)(w[2] >> (8 * row)), a3 = (uint8_t)(w[3] >> (8 * row));
-                const uint8_t pl = hy_load8(tab, cb + HY_Q_OFF + (uint32_t)(2 * row) * HY_N,
-                                            (uint16_t)(a0 | (a1 << 8)), env,
-                                            hy_tag(dir, round, col, qb + 2 * row));
-                const uint8_t pr = hy_load8(tab, cb + HY_Q_OFF + (uint32_t)(2 * row + 1) * HY_N,
-                                            (uint16_t)(a2 | (a3 << 8)), env,
-                                            hy_tag(dir, round, col, qb + 2 * row + 1));
-                out[row + 4 * col] = hy_load8(tab, bdy + (uint32_t)row * HY_N,
-                                              (uint16_t)(pl | (pr << 8)), env,
-                                              hy_tag(dir, round, col, bk + row));
-            }
-        }
+        const uint16_t l01 = (uint16_t)(b[0] | (b[1] << 8));
+        const uint16_t r01 = (uint16_t)(b[2] | (b[3] << 8));
+        const uint16_t wl01 = hy_load16(tab, lk[0], l01, env, hy_tag(dir, round, col, HY_K_W16_L));
+        const uint16_t wr01 = hy_load16(tab, lk[1], r01, env, hy_tag(dir, round, col, HY_K_W16_L + 1));
+        const uint16_t wl23 = hy_load16(tab, lk[2], l01, env, hy_tag(dir, round, col, HY_K_W16_L + 2));
+        const uint16_t wr23 = hy_load16(tab, lk[3], r01, env, hy_tag(dir, round, col, HY_K_W16_L + 3));
+        // The two halves of a row pair meet here: E(u) ^ E(v) = E(u ^ v), 16 bits.
+        const uint16_t x01 = (uint16_t)(wl01 ^ wr01);
+        const uint16_t x23 = (uint16_t)(wl23 ^ wr23);
+        out[0 + 4 * col] = hy_load8(tab, bdy, x01, env,
+                                    hy_tag(dir, round, col, HY_K_W16_D));
+        out[1 + 4 * col] = hy_load8(tab, bdy + 1u * HY_N, x01, env,
+                                    hy_tag(dir, round, col, HY_K_W16_D + 1));
+        out[2 + 4 * col] = hy_load8(tab, bdy + 2u * HY_N, x23, env,
+                                    hy_tag(dir, round, col, HY_K_W16_D + 2));
+        out[3 + 4 * col] = hy_load8(tab, bdy + 3u * HY_N, x23, env,
+                                    hy_tag(dir, round, col, HY_K_W16_D + 3));
         // Cross-lane nonlinear recoding: the four output bytes of the column are a
         // 32-bit word and they leave the round SPN-encoded.
         uint8_t y[4];

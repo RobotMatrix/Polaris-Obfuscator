@@ -188,21 +188,15 @@ static int table_has_key(const uint8_t *buf, size_t n, const uint8_t k[16]) {
     return 0;
 }
 
-// ---- per-round family schedule -------------------------------------------------
-// Which shape each round uses. Every family computes the identical function, so
-// the ciphertext cannot depend on this array - that is exactly what the checks
-// below verify. Within one column every family but F0 hides its table values the
-// same way: each lane of a lookup is a random 256-element bijection of
-// MC[row][k]*S(x), the four lanes of a row are decoded two at a time in a 64K
-// table (the inverse of those bijections), the two plain partial sums are XORed,
-// and a 256-entry table applies the random boundary permutation. So no table row
-// holds S(x^k) or MC(S(x^k)) verbatim, and no boundary is affine.
-static const int SCHED_ENC[9] = {HY_FAM_T32, HY_FAM_T8, HY_FAM_T32K, HY_FAM_PAIR, HY_FAM_T32,
-                                 HY_FAM_T8, HY_FAM_PAIR, HY_FAM_T32K, HY_FAM_T32};
-static const int SCHED_DEC[9] = {HY_FAM_PAIR, HY_FAM_T32, HY_FAM_T8, HY_FAM_PAIR, HY_FAM_T32K,
-                                 HY_FAM_T32, HY_FAM_T8, HY_FAM_PAIR, HY_FAM_T32K};
+// ---- the round shape -------------------------------------------------------------
+// One shape, all nine rounds, both directions: F4, 16-bit column combining. It is
+// still written into the table as data - the VM reads the family byte to choose
+// its lane addressing - but there is no second shape to choose from. The four
+// earlier families carried their partial sums in 8-bit tables at this same column
+// stride, so none of them can express a 16-bit combine; they were removed rather
+// than left as branches no build can reach (README 5.29).
 
-// What one round needs to know, independent of which family implements it.
+// What one round needs to know.
 struct RndSpec {
     const uint8_t (*inp)[256];  // input decoding per source byte; null = identity
     const uint8_t *rk_pre;      // XORed before SubBytes (round 0 only); null = none
@@ -218,146 +212,116 @@ static uint8_t round_byte(const RndSpec &s, int src, uint8_t enc) {
     return s.sbox_fwd ? sbox(v) : v;
 }
 
-// FAM_PAIR: two 16-bit pair tables feed a Q network, four byte tables invert Q,
-// add the round constant and apply the output encoding. Kept exactly as it was,
-// because this is the shape the earlier generations were verified on.
-static void fill_col_pair(uint8_t *tab, uint32_t cb, int dir, int round, int col,
-                          const RndSpec &sp, uint32_t env) {
-    const uint8_t (*M)[4] = sp.sbox_fwd ? MC : IMC;
-    uint8_t Q[4][2][256], Qi[4][2][256];
-    for (int row = 0; row < 4; row++)
-        for (int side = 0; side < 2; side++) rand_perm(Q[row][side], Qi[row][side]);
-    for (int side = 0; side < 2; side++) {
-        const int rows[2] = {side * 2, side * 2 + 1};
-        for (int b0 = 0; b0 < 256; b0++)
-            for (int b1 = 0; b1 < 256; b1++) {
-                uint8_t sb[2];
-                for (int t = 0; t < 2; t++)
-                    sb[t] = round_byte(sp, hy_pick(sp.src_kind, rows[t] + 4 * col),
-                                       (uint8_t)(t ? b1 : b0));
-                uint32_t word = 0;
-                for (int row = 0; row < 4; row++) {
-                    uint8_t partial = (uint8_t)(gmul(sb[0], M[row][rows[0]]) ^ gmul(sb[1], M[row][rows[1]]));
-                    word |= (uint32_t)Q[row][side][partial] << (8 * row);
-                }
-                hy_store32(tab, cb + (side ? HY_U32 : 0u), (uint16_t)(b0 | (b1 << 8)), env,
-                           hy_tag(dir, round, col, HY_K_PAIR_L + side), word);
-            }
-    }
-    // The two halves meet in a 64K two-byte table: it inverts Q for each half, adds
-    // the round constant and applies the output bijection. Qi never reaches the
-    // artifact - it exists in this process only, to compute the table values.
-    for (int row = 0; row < 4; row++) {
-        const int dst = row + 4 * col;
-        for (int a = 0; a < 256; a++)
-            for (int b = 0; b < 256; b++) {
-                uint8_t mixed = (uint8_t)(Qi[row][0][a] ^ Qi[row][1][b] ^ sp.rk_after[dst]);
-                hy_store8(tab, cb + HY_BDY_OFF + (uint32_t)row * HY_N, (uint16_t)(a | (b << 8)), env,
-                          hy_tag(dir, round, col, HY_K_BDY_PAIR + row), sp.outp[dst][mixed]);
-            }
-    }
-    burn(Q, sizeof(Q));
-    burn(Qi, sizeof(Qi));
-}
-
-// One random bijection per (row,k) lane and its inverse. The inverse is
-// materialised inside the 64K decode tables only: a lane value cannot be undone
-// by reading one row of one 256-entry table, which is what made dl3's rows
-// equal MC[row][k]*S(x) and handed over the key byte.
-struct LaneEnc {
-    uint8_t e[4][4][256];
-    uint8_t d[4][4][256];
+// ---- FAM_W16: 16-bit-wide column combining ----------------------------------
+//
+// MixColumns is GF(2)-linear, so the four lanes of a column split into two pairs
+// whose partial sums can be precomputed per pair. Pairing the *output rows* as
+// well gives a 16-bit partial sum per (row pair, lane pair):
+//
+//   Y01 = (MC[0][0]u0 ^ MC[0][1]u1 ^ MC[0][2]u2 ^ MC[0][3]u3,
+//          MC[1][0]u0 ^ MC[1][1]u1 ^ MC[1][2]u2 ^ MC[1][3]u3)
+//       = WL01 ^ WR01
+//
+// so the two halves meet in one XOR of two 16-bit words. Each half is a 2^16-index
+// table of 16-bit values, and the per-build encoding of that value is an affine
+// 16-bit map E (same E on both halves of a row pair), so E(u) ^ E(v) = E(u ^ v)
+// and the constant cancels. The four decode tables then take the 16-bit XOR,
+// apply E^-1, add the column constant and the output bijection.
+//
+// The encoding has to be affine here, and that is not a choice: if E0, E1 are
+// bijections on 16 bits and some M satisfies M(E0(u) ^ E1(v)) = u ^ v for all
+// u, v, then (absorbing constants) M = E0^-1 = E1^-1 and E0(u ^ v) = E0(u) ^ E0(v),
+// i.e. E0 is linear. Proven in the report; a nonlinear 16-bit encoding cannot be
+// undone by a 2^16-index table. The measured cost of that fact is in
+// attacks/residual/W16-EXPERIMENT.md: the pair table is exactly XOR-separable and
+// the key falls out at 4,096 tests.
+struct Mat16 {
+    uint16_t row[16];   // y bit i = parity(row[i] & x)
 };
 
-static void fill_lane_enc(LaneEnc &L) {
-    for (int row = 0; row < 4; row++)
-        for (int k = 0; k < 4; k++) rand_perm(L.e[row][k], L.d[row][k]);
+static uint16_t mat16_apply(const uint16_t row[16], uint16_t x) {
+    uint16_t y = 0;
+    for (int i = 0; i < 16; i++) {
+        uint16_t m = (uint16_t)(row[i] & x);
+        m ^= (uint16_t)(m >> 8);
+        m ^= (uint16_t)(m >> 4);
+        m ^= (uint16_t)(m >> 2);
+        m ^= (uint16_t)(m >> 1);
+        y |= (uint16_t)((m & 1u) << i);
+    }
+    return y;
 }
 
-// The tail F1/F2/F3 share: two 64K pair-decode tables per output row (lanes k=0,1
-// and lanes k=2,3), each one a random bijection Z applied to the XOR of the two
-// lane inverses, then one 64K two-byte boundary table that undoes both Z, adds the
-// column constant and applies the output bijection. Z's inverse exists only inside
-// that boundary table, so the pipeline is not XOR-separable and no standalone
-// inverse array is written. key_in_quad != 0 folds the column constant into the
-// first decode table, which is how F3 keeps "no key XOR anywhere in the code".
-static void fill_col_tail(uint8_t *tab, uint32_t cb, int dir, int round, int col,
-                          int qk, int bk, int key_in_quad, const RndSpec &sp,
-                          const LaneEnc &L, uint32_t env) {
-    for (int row = 0; row < 4; row++) {
-        const int dst = row + 4 * col;
-        uint8_t Z[2][256], Zi[2][256];
-        for (int p = 0; p < 2; p++) rand_perm(Z[p], Zi[p]);
-        for (int p = 0; p < 2; p++) {
-            const uint8_t *d0 = L.d[row][2 * p], *d1 = L.d[row][2 * p + 1];
-            for (int a = 0; a < 256; a++)
-                for (int b = 0; b < 256; b++) {
-                    uint8_t v = (uint8_t)(d0[a] ^ d1[b]);
-                    if (key_in_quad && p == 0) v ^= sp.rk_after[dst];
-                    hy_store8(tab, cb + HY_Q_OFF + (uint32_t)(2 * row + p) * HY_N,
-                              (uint16_t)(a | (b << 8)), env,
-                              hy_tag(dir, round, col, qk + 2 * row + p), Z[p][v]);
-                }
-        }
-        const uint8_t rk = key_in_quad ? 0 : sp.rk_after[dst];
-        for (int u = 0; u < 256; u++)
-            for (int v = 0; v < 256; v++) {
-                uint8_t mixed = (uint8_t)(Zi[0][u] ^ Zi[1][v] ^ rk);
-                hy_store8(tab, cb + HY_BDY_OFF + (uint32_t)row * HY_N, (uint16_t)(u | (v << 8)), env,
-                          hy_tag(dir, round, col, bk + row), sp.outp[dst][mixed]);
-            }
-        burn(Z, sizeof(Z));
-        burn(Zi, sizeof(Zi));
+// Gauss-Jordan on [A | I]; returns 0 (and leaves inv alone) if A is singular.
+static int mat16_inv(const uint16_t row[16], uint16_t inv[16]) {
+    uint32_t a[16];
+    for (int i = 0; i < 16; i++) a[i] = (uint32_t)row[i] | ((uint32_t)1u << (16 + i));
+    for (int c = 0; c < 16; c++) {
+        int piv = -1;
+        for (int r = c; r < 16; r++)
+            if ((a[r] >> c) & 1u) { piv = r; break; }
+        if (piv < 0) return 0;
+        uint32_t t = a[c]; a[c] = a[piv]; a[piv] = t;
+        for (int r = 0; r < 16; r++)
+            if (r != c && ((a[r] >> c) & 1u)) a[r] ^= a[c];
+    }
+    for (int i = 0; i < 16; i++) inv[i] = (uint16_t)(a[i] >> 16);
+    return 1;
+}
+
+static void mat16_rand(Mat16 &A, Mat16 &Ai) {
+    for (;;) {
+        for (int i = 0; i < 16; i++) A.row[i] = (uint16_t)rnd32();
+        if (mat16_inv(A.row, Ai.row)) return;
     }
 }
 
-// FAM_T32 / FAM_T32K: four 32-bit lookups per column. Each byte of the 32-bit
-// word is one MC contribution already pushed through a random bijection, so the
-// word is not XOR-combined directly; the decode tables below undo the bijections
-// on a pair of lanes at a time. The key sits in the boundary permutation's index
-// (T32) or in the first decode table (T32K).
-static void fill_col_t32(uint8_t *tab, uint32_t cb, int dir, int round, int col, int fam,
+static void fill_col_w16(uint8_t *tab, uint32_t cb, int dir, int round, int col,
                          const RndSpec &sp, uint32_t env) {
     const uint8_t (*M)[4] = sp.sbox_fwd ? MC : IMC;
-    LaneEnc L;
-    fill_lane_enc(L);
-    for (int k = 0; k < 4; k++) {
-        const int src = hy_pick(sp.src_kind, k + 4 * col);
-        for (int enc = 0; enc < 256; enc++) {
-            const uint8_t sb = round_byte(sp, src, (uint8_t)enc);
-            uint32_t word = 0;
-            for (int row = 0; row < 4; row++)
-                word |= (uint32_t)L.e[row][k][gmul(sb, M[row][k])] << (8 * row);
-            hy_store32t(tab, cb + (uint32_t)k * HY_W1024, (uint8_t)enc, env,
-                        hy_tag(dir, round, col,
-                               (fam == HY_FAM_T32K ? HY_K_T32K_W : HY_K_T32_W) + k),
-                        word);
+    Mat16 A[2], Ai[2];
+    uint16_t cst[2];
+    for (int p = 0; p < 2; p++) {
+        mat16_rand(A[p], Ai[p]);
+        const uint8_t c = (uint8_t)rnd32();
+        cst[p] = (uint16_t)(((uint16_t)c << 8) | c);
+    }
+    for (int rp = 0; rp < 2; rp++) {          // rp = row pair: rows 2rp, 2rp+1
+        const int r0 = 2 * rp, r1 = 2 * rp + 1;
+        for (int lp = 0; lp < 2; lp++) {      // lp = lane pair: lanes 2lp, 2lp+1
+            const int l0 = 2 * lp, l1 = l0 + 1;
+            const int s0 = hy_pick(sp.src_kind, l0 + 4 * col);
+            const int s1 = hy_pick(sp.src_kind, l1 + 4 * col);
+            const int k = 2 * rp + lp;
+            for (int a = 0; a < 256; a++) {
+                const uint8_t u0 = round_byte(sp, s0, (uint8_t)a);
+                const uint8_t p0r0 = gmul(u0, M[r0][l0]), p0r1 = gmul(u0, M[r1][l0]);
+                for (int b = 0; b < 256; b++) {
+                    const uint8_t u1 = round_byte(sp, s1, (uint8_t)b);
+                    const uint16_t w = (uint16_t)((p0r0 ^ gmul(u1, M[r0][l1])) |
+                                                  ((p0r1 ^ gmul(u1, M[r1][l1])) << 8));
+                    hy_store16(tab, cb + (uint32_t)k * HY_W16_TAB, (uint16_t)(a | (b << 8)), env,
+                               hy_tag(dir, round, col, HY_K_W16_L + k),
+                               (uint16_t)(mat16_apply(A[rp].row, w) ^ cst[rp]));
+                }
+            }
         }
     }
-    if (fam == HY_FAM_T32K)
-        fill_col_tail(tab, cb, dir, round, col, HY_K_T32K_Q, HY_K_BDY_T32K, 1, sp, L, env);
-    else
-        fill_col_tail(tab, cb, dir, round, col, HY_K_T32_Q, HY_K_BDY_T32, 0, sp, L, env);
-    burn(&L, sizeof(L));
-}
-
-// FAM_T8: 16 coefficient byte tables per column, one per (k,row), plus the same
-// decode/boundary tail. No 32-bit load anywhere in this shape.
-static void fill_col_t8(uint8_t *tab, uint32_t cb, int dir, int round, int col,
-                        const RndSpec &sp, uint32_t env) {
-    const uint8_t (*M)[4] = sp.sbox_fwd ? MC : IMC;
-    LaneEnc L;
-    fill_lane_enc(L);
-    for (int k = 0; k < 4; k++) {
-        const int src = hy_pick(sp.src_kind, k + 4 * col);
-        for (int row = 0; row < 4; row++)
-            for (int enc = 0; enc < 256; enc++)
-                hy_store8t(tab, cb + (uint32_t)(k * 4 + row) * HY_W256, (uint8_t)enc, env,
-                           hy_tag(dir, round, col, HY_K_T8_C + k * 4 + row),
-                           L.e[row][k][gmul(round_byte(sp, src, (uint8_t)enc), M[row][k])]);
+    // The four decode tables: 2^16 index, one output byte each. E^-1 lives here
+    // and nowhere else; the column constant and the output bijection follow it.
+    for (int row = 0; row < 4; row++) {
+        const int dst = row + 4 * col;
+        const Mat16 &ai = Ai[row >> 1];
+        const int sh = 8 * (row & 1);
+        for (int s = 0; s < 65536; s++) {
+            const uint8_t y = (uint8_t)((mat16_apply(ai.row, (uint16_t)s) >> sh) & 255);
+            hy_store8(tab, cb + HY_BDY_OFF + (uint32_t)row * HY_N, (uint16_t)s, env,
+                      hy_tag(dir, round, col, HY_K_W16_D + row),
+                      sp.outp[dst][(uint8_t)(y ^ sp.rk_after[dst])]);
+        }
     }
-    fill_col_tail(tab, cb, dir, round, col, HY_K_T8_Q, HY_K_BDY_T8, 0, sp, L, env);
-    burn(&L, sizeof(L));
+    burn(A, sizeof(A));
+    burn(Ai, sizeof(Ai));
 }
 
 // ---- the 32-bit nonlinear recoding (generator side) -------------------------
@@ -451,21 +415,20 @@ static int spn_mds_check() {
     return 1;
 }
 
-static void fill_round(uint8_t *tab, uint32_t base, int dir, int round, int fam,
+static void fill_round(uint8_t *tab, uint32_t base, int dir, int round,
                        const RndSpec &sp, uint32_t env) {
-    for (int col = 0; col < 4; col++) {
-        const uint32_t cb = base + (uint32_t)col * HY_COL;
-        if (fam == HY_FAM_PAIR) fill_col_pair(tab, cb, dir, round, col, sp, env);
-        else if (fam == HY_FAM_T8) fill_col_t8(tab, cb, dir, round, col, sp, env);
-        else fill_col_t32(tab, cb, dir, round, col, fam, sp, env);
-    }
+    for (int col = 0; col < 4; col++)
+        fill_col_w16(tab, base + (uint32_t)col * HY_COL, dir, round, col, sp, env);
 }
 
-// The schedule goes into the table so the reader is driven by data: a family
-// byte per (dir, round) plus a check byte, all sealed and masked with the rest.
+// The schedule goes into the table so the reader - and the VM - is driven by
+// data: one family byte per (dir, round) plus a check byte, all sealed and masked
+// with the rest. This generation writes HY_FAM_W16 everywhere; the byte is still
+// data because the VM reads it to decide its lane addressing.
 // The tail of the block carries the layout words the HSV bytecode reads through
 // Tld: base and round stride per direction, column stride, and the two lane
-// strides (one table per lane for F1/F2/F3, two pair tables for F0). They sit at
+// strides (one 2^16-entry pair table per lane, and the word no shape reads any
+// more but the block keeps so its 64-byte shape is unchanged). They sit at
 // 4-byte-aligned offsets because Tld only reads aligned words.
 static void put32(uint8_t *p, uint32_t v) {
     p[0] = (uint8_t)v;
@@ -474,14 +437,13 @@ static void put32(uint8_t *p, uint32_t v) {
     p[3] = (uint8_t)(v >> 24);
 }
 
-static void write_sched(uint8_t *tab, const int enc[9], const int dec[9]) {
+static void write_sched(uint8_t *tab) {
     for (int d = 0; d < 2; d++) {
-        const int *s = d == 0 ? enc : dec;
         uint8_t *g = tab + HY_SCHED_OFF + (uint32_t)d * HY_SCHED_STRIDE;
         uint8_t x = (uint8_t)d;
         for (int r = 0; r < 9; r++) {
-            g[r] = (uint8_t)s[r];
-            x ^= (uint8_t)s[r];
+            g[r] = (uint8_t)HY_FAM_W16;
+            x ^= (uint8_t)HY_FAM_W16;
         }
         g[9] = x;
     }
@@ -491,8 +453,8 @@ static void write_sched(uint8_t *tab, const int enc[9], const int dec[9]) {
     put32(w + 40, HY_ROUND);                      // encrypt round stride
     put32(w + 44, HY_DEC_STEP);                   // decrypt round stride
     put32(w + 48, HY_COL);                        // column stride
-    put32(w + 52, HY_W1024);                      // lane stride, F1/F2/F3
-    put32(w + 56, HY_U32);                        // pair stride, F0 lanes 2/3
+    put32(w + 52, HY_W16_TAB);                    // lane stride: one pair table
+    put32(w + 56, HY_U32);                        // pair stride: no shape reads it
 }
 
 static void fill_pairs(uint8_t *tab, uint32_t base, int dir, int round, int wiring,
@@ -509,16 +471,15 @@ static void fill_pairs(uint8_t *tab, uint32_t base, int dir, int round, int wiri
     }
 }
 
-// --fam N forces every round in both directions to family N (0..3). Every family
-// computes the same function, so the ciphertext must not change: that is what the
-// four forced builds verify. Without it the mixed schedule above is used.
-static int g_force_fam = -1;
-
+// --fam: there is one shape in this generation (HY_FAM_W16). The flag survives so
+// that --fam 0..3 is refused with rc 2 instead of silently building a table whose
+// ciphertext is wrong; the other four layouts cannot express a 16-bit combine at
+// this column stride.
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <out.bin> [--pagesize N] [--ncpu N] [--cls N] [--fam N]\n"
+        fprintf(stderr, "usage: %s <out.bin> [--pagesize N] [--ncpu N] [--cls N] [--fam 4]\n"
                         "  缺省读本机 sysctl; 交叉生成时显式给目标设备参数 (iOS: 16384/<ncpu>/<cls>)\n"
-                        "  --fam 0..3: 九轮全部使用同一实现族 (用于密文一致性对照)\n", argv[0]);
+                        "  --fam 4: 本代唯一形状 (16 位列合并); 0..3 已退役, 传入即 rc 2\n", argv[0]);
         return 2;
     }
     // hw.cachelinesize 是 8 字节 sysctl, int 缓冲会 ENOMEM → 读成 0 (与运行时一致地修)
@@ -537,8 +498,12 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--cls")) { cls = strtoull(argv[++i], nullptr, 0); ov_cl = true; }
         else if (!strcmp(argv[i], "--fam")) {
             const long v = strtol(argv[++i], nullptr, 0);
-            if (v < 0 || v > 3) { fprintf(stderr, "bad --fam (0..3)\n"); return 2; }
-            g_force_fam = (int)v;
+            if (v != HY_FAM_W16) {
+                fprintf(stderr, "--fam %ld: this build has one shape (--fam 4); "
+                                "0..3 cannot express a 16-bit combine\n", v);
+                return 2;
+            }
+            // only HY_FAM_W16 gets here; nothing to force, the schedule is fixed
         }
     }
     if ((ov_ps && pagesize == 0) || (ov_nc && ncpu == 0) || (ov_cl && cls == 0)) {
@@ -589,15 +554,10 @@ static int generate(const char *out_path, uint32_t env, uint8_t key[16]) {
     uint8_t P0[16][256], P0i[16][256];
     for (int i = 0; i < 16; i++) rand_perm(P0[i], P0i[i]);
 
-    // The schedule: mixed by default, one family everywhere under --fam.
-    int sched_enc[9], sched_dec[9];
-    for (int i = 0; i < 9; i++) {
-        sched_enc[i] = g_force_fam >= 0 ? g_force_fam : SCHED_ENC[i];
-        sched_dec[i] = g_force_fam >= 0 ? g_force_fam : SCHED_DEC[i];
-    }
-
+    // The schedule is data, and in this generation it says the same thing
+    // everywhere: nine rounds of the one shape, in both directions.
     std::vector<uint8_t> tab(HY_TOTAL, 0);
-    write_sched(tab.data(), sched_enc, sched_dec);
+    write_sched(tab.data());
 
     // Recoding parameters per (direction, round, column). Only the generator holds
     // them; the table gets the forward and inverse S-boxes and the constants, never
@@ -618,7 +578,7 @@ static int generate(const char *out_path, uint32_t env, uint8_t key[16]) {
         sp.src_kind = 1;
         sp.sbox_fwd = 1;
         for (int col = 0; col < 4; col++) spn_gen(spn_at(0, r, col));
-        fill_round(tab.data(), hy_enc_col(r, 0), 0, r, sched_enc[r], sp, env);
+        fill_round(tab.data(), hy_enc_col(r, 0), 0, r, sp, env);
         for (int col = 0; col < 4; col++)
             spn_fill(tab.data(), hy_enc_col(r, col), 0, r, col, spn_at(0, r, col), env);
         burn16(rk_next);                   // 本轮密钥随表写入完成即焚
@@ -699,7 +659,7 @@ static int generate(const char *out_path, uint32_t env, uint8_t key[16]) {
         sp.src_kind = 0;
         sp.sbox_fwd = 0;
         for (int col = 0; col < 4; col++) spn_gen(spn_at(1, step, col));
-        fill_round(tab.data(), hy_dec_mc(step), 1, step, sched_dec[step], sp, env);
+        fill_round(tab.data(), hy_dec_mc(step), 1, step, sp, env);
         for (int col = 0; col < 4; col++)
             spn_fill(tab.data(), hy_dec_mc(step) + (uint32_t)col * HY_COL, 1, step, col,
                      spn_at(1, step, col), env);
@@ -845,14 +805,8 @@ static int generate(const char *out_path, uint32_t env, uint8_t key[16]) {
         printf("round-0 input bijection: emitted hy_in.h\n");
     }
     printf("table-check PASS\nseal-check PASS\n");
-    {
-        static const char *nm[4] = {"F0", "F1", "F2", "F3"};
-        printf("round families enc:");
-        for (int r = 0; r < 9; r++) printf(" %s", nm[sched_enc[r]]);
-        printf("\n              dec:");
-        for (int r = 0; r < 9; r++) printf(" %s", nm[sched_dec[r]]);
-        printf("\n");
-    }
+    printf("round shape: F4 (16-bit column combining), 9 rounds, both directions, "
+           "20 lookups/column\n");
     printf("wrote %s (%u bytes)\n", out_path, HY_TOTAL);
     return 0;
 }

@@ -92,9 +92,11 @@ int main(void) {
     int fail = 0;
     uint8_t blk[64];
 
-    // The shipped layout numbers, with a mixed schedule.
-    static const uint8_t enc[9] = {1, 2, 3, 0, 1, 2, 0, 3, 1};
-    static const uint8_t dec[9] = {0, 1, 2, 0, 3, 1, 2, 0, 3};
+    // The shipped layout, and the shipped schedule: every (dir, round) is F4, so
+    // every lane takes its table from `k * lane_stride` with lane_stride =
+    // HY_W16_TAB (131072 B = one 2^16-entry pair table).
+    static const uint8_t enc[9] = {4, 4, 4, 4, 4, 4, 4, 4, 4};
+    static const uint8_t dec[9] = {4, 4, 4, 4, 4, 4, 4, 4, 4};
     memset(blk, 0, sizeof blk);
     memcpy(blk, enc, 9);
     memcpy(blk + 16, dec, 9);
@@ -103,13 +105,17 @@ int main(void) {
     wr32(blk + 40, 3145728u);
     wr32(blk + 44, 4194304u);
     wr32(blk + 48, 786432u);
-    wr32(blk + 52, 1024u);
+    wr32(blk + 52, 131072u);
     wr32(blk + 56, 262144u);
-    fail |= check_block("shipped-layout mixed", blk);
-    fail |= check_plan("plan: shipped mixed", blk);
+    fail |= check_block("shipped-layout F4", blk);
+    fail |= check_plan("plan: shipped F4", blk);
 
-    // Same layout, every family forced, one block per family.
-    for (int fam = 0; fam < 4; fam++) {
+    // The VM still has both lane addressing classes: family 0 (lanes 2,3 one pair
+    // table further) and every nonzero family (one table per lane). Only the
+    // nonzero class is reachable from a build now, but the branch is part of the
+    // bytecode and a damaged family byte would take it, so both are checked.
+    for (int fam = 0; fam < 5; fam++) {
+        if (fam == 4) continue; // == the shipped block above
         uint8_t b2[64];
         memcpy(b2, blk, sizeof b2);
         memset(b2, fam, 9);

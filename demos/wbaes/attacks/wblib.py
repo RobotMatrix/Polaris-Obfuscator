@@ -132,7 +132,8 @@ HY_TOTAL = HY_TABLES + SCHED_BYTES
 assert COL == 798720 and HY_TOTAL == 70090816, (COL, HY_TOTAL)
 
 FAM_PAIR, FAM_T32, FAM_T8, FAM_T32K = 0, 1, 2, 3
-FAM_NAMES = {0: "F0", 1: "F1", 2: "F2", 3: "F3"}
+FAM_W16 = 4                    # the shipped generation: 16-bit column combining
+FAM_NAMES = {0: "F0", 1: "F1", 2: "F2", 3: "F3", 4: "F4"}
 K_PAIR_L = 0
 K_T32_W = 16
 K_T8_C = 32
@@ -140,6 +141,8 @@ K_T32K_W = 64
 K_T32_Q, K_T8_Q, K_T32K_Q = 80, 88, 96
 K_SPN_S, K_SPN_SI = 112, 124
 K_BDY_PAIR, K_BDY_T32, K_BDY_T8, K_BDY_T32K = 136, 144, 152, 160
+K_W16_L, K_W16_D = 200, 208    # F4: four pair tables (16-bit values), four decodes
+W16_TAB = U16                  # one pair table: 2^16 entries * 2 B
 
 S4 = (0x6, 0xB, 0x5, 0xC, 0x1, 0xF, 0x0, 0xE, 0x9, 0x2, 0x7, 0xD, 0xA, 0x4, 0x3, 0x8)
 
@@ -397,7 +400,10 @@ def find_mask_seed(binary, tab_off, tab_size):
         ok = True
         for d in range(2):
             g = plain[d * SCHED_STRIDE: d * SCHED_STRIDE + HY_MC_ROUNDS + 1]
-            if any(b > 3 for b in g[:HY_MC_ROUNDS]):
+            # Family bytes: F0..F3 for the eight-bit generations, F4 for the
+            # shipped one. A byte outside the set this library names means the
+            # candidate seed is wrong (or the artifact is from a newer shape).
+            if any(b not in FAM_NAMES for b in g[:HY_MC_ROUNDS]):
                 ok = False
                 break
             x = d

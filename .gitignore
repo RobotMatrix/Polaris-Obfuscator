@@ -22,3 +22,8 @@ exported-binaries/wbaes-challenge/macos/wbaes_nl_clean
 exported-binaries/wbaes-challenge/macos/wbaes_nl_max
 exported-binaries/wbaes-challenge/macos/wbaes_vm2_clean
 exported-binaries/wbaes-challenge/macos/wbaes_vm2_max
+exported-binaries/wbaes-challenge/macos/wbaes_f4_clean
+exported-binaries/wbaes-challenge/macos/wbaes_f4_max
+demos/wbaes/hy_table.bin
+demos/wbaes/hy_in.h
+demos/wbaes/hy_seal.h

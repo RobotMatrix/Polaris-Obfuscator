@@ -22,30 +22,18 @@ sys.path.insert(0, os.path.dirname(HERE))
 import wblib as wb
 
 HOOKS = [
-    # hy_load32 (16-bit Feistel scatter, 32-bit entry)
-    ("""    const uint8_t *p = tab + off + (uint32_t)s * 4u;
-    return (uint32_t)p[0]""",
-     """    const uint8_t *p = tab + off + (uint32_t)s * 4u;
-    HY_TRACE(off + (uint32_t)s * 4u, logical, 4);
-    return (uint32_t)p[0]"""),
     # hy_load8 (16-bit Feistel scatter)
     ("""    uint16_t s = hy_scatter(logical, env, tag);
     return tab[off + s];""",
      """    uint16_t s = hy_scatter(logical, env, tag);
     HY_TRACE(off + s, logical, 1);
     return tab[off + s];"""),
-    # hy_load16 (pair-map tables)
+    # hy_load16 (pair tables)
     ("""    const uint8_t *p = tab + off + (uint32_t)s * 2u;
     return (uint16_t)(p[0]""",
      """    const uint8_t *p = tab + off + (uint32_t)s * 2u;
     HY_TRACE(off + (uint32_t)s * 2u, logical, 2);
     return (uint16_t)(p[0]"""),
-    # hy_load32t (byte-indexed, affine scatter)
-    ("""    const uint8_t *p = tab + off + (uint32_t)hy_scatter8(logical, env, tag) * 4u;
-    return (uint32_t)p[0]""",
-     """    const uint8_t *p = tab + off + (uint32_t)hy_scatter8(logical, env, tag) * 4u;
-    HY_TRACE(off + (uint32_t)hy_scatter8(logical, env, tag) * 4u, logical, 4);
-    return (uint32_t)p[0]"""),
     # hy_load8t (byte-indexed, affine scatter)
     ("""    return tab[off + hy_scatter8(logical, env, tag)];""",
      """    HY_TRACE(off + hy_scatter8(logical, env, tag), logical, 1);
@@ -103,7 +91,7 @@ def main(argv=None):
     text = open(hdr).read()
     with open(os.path.join(work, "hy_trace.h"), "w") as f:
         f.write(patch_header(text, env))
-    print("header  : %s -> %s/hy_trace.h (5 hooks)" % (hdr, work))
+    print("header  : %s -> %s/hy_trace.h (3 hooks)" % (hdr, work))
 
     # 3. compile + run
     exe = os.path.join(work, "harness")
