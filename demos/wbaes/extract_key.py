@@ -648,7 +648,15 @@ def main(argv=None):
         digest = hashlib.sha256(f.read()).hexdigest()
     cputype, seg, sect, off, size = find_section(args.binary)
     if size not in (HY_TOTAL, HY_TABLES):
-        raise SystemExit(f"{seg},{sect} is {size} bytes, expected HY_TOTAL={HY_TOTAL}")
+        # dl4/dl5 column slots are 798,720 B (pair-decode + recoding + 64K boundary
+        # tables), so the blob is 70,090,816 B. The static peel this tool implements
+        # only works on the earlier shapes; say so instead of failing as if the
+        # binary were malformed.
+        raise SystemExit(
+            f"{seg},{sect} is {size} bytes, this tool models {HY_TOTAL} "
+            f"(dl1-dl3 geometry). A 70,090,816-byte blob is dl4/dl5: round-0 cells are "
+            f"arbitrary bijections (E / Z encodings), so this tool's row-equality peel does "
+            f"not apply. Use demos/wbaes/attacks/ (wblib.py) and see README 1b/1c.")
     has_sched = size == HY_TOTAL  # dl/dl2 predate the schedule block
     with open(args.binary, "rb") as f:
         f.seek(off)
