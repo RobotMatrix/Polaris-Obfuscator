@@ -30,6 +30,11 @@ attacks/residual/
   cross_instance.py        (d) 用 gen_hybrid.cpp 生成同钥异码两份产物，分别打 + 合并
   zk_attack.py             (e) rk0 移进输出双射的 zk 变体：按表形状 0.00 s 取回 rk0/rk1
                                （构造、实测与结论见 ZK-EXPERIMENT.md）
+  res16.py                 (f) 16 位合并形状的读取器、Decomp16、16 位值的密钥判别
+  w16_probe.py             (f) 16 位合并：前置算术、XOR 可分解性、分解、取钥、代价
+  w16_traces.py            (f) 16 位合并：地址轨迹侧（pair 表下标 vs P0、解码表 16 位下标）
+  w16/F4.patch             (f) 该变体的生成器/头文件补丁（仓库里的两个文件未改）
+                               （构造、实测与结论见 W16-EXPERIMENT.md）
 ```
 
 与 `attacks/` 下已有脚本的关系：这四个脚本**不修改** `wblib.py`、`bge_attack.py`、
