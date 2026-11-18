@@ -274,12 +274,14 @@ def main(argv=None):
     ap.add_argument("--cls", type=int, default=wb.DEFAULT_ENV[2])
     ap.add_argument("--seed", type=lambda s: int(s, 0), help="mask seed (found if omitted)")
     ap.add_argument("--cache", default=None, help="cache the unmasked table here")
+    ap.add_argument("--p0", default=None,
+                    help="raw HY_P0 (4096 B) for a variant artifact without a Mach-O header")
     ap.add_argument("--skip-a", action="store_true")
     ap.add_argument("--skip-b", action="store_true")
     a = ap.parse_args(argv)
 
     env = wb.hy_env_mix(a.pagesize, a.ncpu, a.cls)
-    print("binary : %s" % a.binary)
+    print("binary : %s" % (a.p0 or a.binary))
     print("env    : pagesize=%d ncpu=%d cls=%d -> 0x%08x" % (a.pagesize, a.ncpu, a.cls, env))
 
     t0 = time.time()
@@ -289,8 +291,12 @@ def main(argv=None):
         seed, frag_off, tried = wb.find_mask_seed(a.binary, tab_off, tab_size)
         print("mask seed: 0x%08x (%d candidate 4-word XORs in __const, %.2fs)"
               % (seed, tried, time.time() - t0))
-    data = open(a.binary, "rb").read()
-    p0 = wb.find_input_bijection(data)[0][1]
+    if a.p0:
+        raw = open(a.p0, "rb").read()
+        p0 = [list(raw[256 * i:256 * (i + 1)]) for i in range(16)]
+    else:
+        data = open(a.binary, "rb").read()
+        p0 = wb.find_input_bijection(data)[0][1]
     tab = None
     if a.traces:
         print("table  : not read -- with a trace file the attack needs no table bytes")

@@ -28,6 +28,8 @@ attacks/residual/
   consistency_attack.py    (b) 未知边界双射的碰撞一致性 + 每半 2^16 的 MITM
   recoding_peel.py         (c) 从产物反演 32 位重编码，再跑 dl4 的 XOR 剥离
   cross_instance.py        (d) 用 gen_hybrid.cpp 生成同钥异码两份产物，分别打 + 合并
+  zk_attack.py             (e) rk0 移进输出双射的 zk 变体：按表形状 0.00 s 取回 rk0/rk1
+                               （构造、实测与结论见 ZK-EXPERIMENT.md）
 ```
 
 与 `attacks/` 下已有脚本的关系：这四个脚本**不修改** `wblib.py`、`bge_attack.py`、

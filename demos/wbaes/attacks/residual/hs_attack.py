@@ -65,11 +65,19 @@ def main(argv=None):
     ap.add_argument("--ncpu", type=int, default=wb.DEFAULT_ENV[1])
     ap.add_argument("--cls", type=int, default=wb.DEFAULT_ENV[2])
     ap.add_argument("--key", default=R.CHALLENGE_KEY, help="only used on the verify line")
+    ap.add_argument("--table", default=None,
+                    help="raw table from a variant generator (needs --work for hy_in.h/hy_seal.h)")
+    ap.add_argument("--work", default=None)
     a = ap.parse_args(argv)
 
     t_start = time.time()
-    art, t_load = R.load_shipped(a.binary, a.seed, a.cache, (a.pagesize, a.ncpu, a.cls))
-    print("binary : %s" % a.binary)
+    if a.table:
+        art, _seed = R.load_variant(a.table, a.work or os.path.dirname(a.table),
+                                   (a.pagesize, a.ncpu, a.cls))
+        t_load = time.time() - t_start
+    else:
+        art, t_load = R.load_shipped(a.binary, a.seed, a.cache, (a.pagesize, a.ncpu, a.cls))
+    print("binary : %s" % (a.table or a.binary))
     print("artifact: table %d B, mask seed 0x%08x, unmask %.2fs"
           % (len(art.tab), art.seed, t_load))
     print("schedule enc: %s" % [wb.FAM_NAMES[s] for s in art.schedule])

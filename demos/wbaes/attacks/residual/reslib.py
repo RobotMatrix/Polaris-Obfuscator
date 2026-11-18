@@ -96,6 +96,40 @@ PY_IN_H = re.compile(r"static const unsigned char HY_P0\[16\]\[256\] = \{(.*?)\n
 PY_SEAL = re.compile(r"HY_SEED_FRAG\[4\] = \{([^}]*)\}")
 
 
+def load_variant(table_path, workdir, env_args=wb.DEFAULT_ENV, total=None):
+    """Load a table written by a *modified* generator (a variant experiment) whose
+    HY_TOTAL differs from the shipped one.
+
+    Same inputs as load_generated -- the masked table plus the hy_in.h (round-0
+    input bijection) and hy_seal.h (four seed words) the generator wrote next to
+    it -- but the length check is taken from the file (or `total`) instead of
+    wblib.HY_TOTAL, because a variant may append table regions. Every shipped
+    offset is unchanged in the variants under attacks/residual/, so the readers in
+    this module keep working.
+    """
+    env = wb.hy_env_mix(*env_args)
+    masked = open(table_path, "rb").read()
+    if total is not None and len(masked) != total:
+        raise SystemExit("%s: %d bytes, expected %d" % (table_path, len(masked), total))
+    in_h = open(os.path.join(workdir, "hy_in.h")).read()
+    m = PY_IN_H.search(in_h)
+    if not m:
+        raise SystemExit("no HY_P0 block in %s/hy_in.h" % workdir)
+    vals = [int(x) for x in re.findall(r"\d+", m.group(1))]
+    if len(vals) != 16 * 256:
+        raise SystemExit("HY_P0 block has %d values" % len(vals))
+    p0 = [vals[256 * i:256 * (i + 1)] for i in range(16)]
+    seal = open(os.path.join(workdir, "hy_seal.h")).read()
+    words = [int(x, 16) for x in re.findall(r"0x([0-9a-fA-F]+)", PY_SEAL.search(seal).group(1))]
+    seed = words[0] ^ words[1] ^ words[2] ^ words[3]
+    tab = bytearray(masked)
+    st = seed
+    for i in range(len(tab)):
+        st = wb.mask_next(st)
+        tab[i] ^= (st >> 24) & 0xFF
+    return Artifact(bytes(tab), env, p0, table_path, seed), seed
+
+
 def load_generated(table_path, workdir, env_args=wb.DEFAULT_ENV):
     """Load an artifact written by gen_hybrid.cpp directly (not in a Mach-O).
 

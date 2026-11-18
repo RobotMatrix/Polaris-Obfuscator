@@ -102,20 +102,35 @@ def main(argv=None):
     ap.add_argument("--pagesize", type=int, default=wb.DEFAULT_ENV[0])
     ap.add_argument("--ncpu", type=int, default=wb.DEFAULT_ENV[1])
     ap.add_argument("--cls", type=int, default=wb.DEFAULT_ENV[2])
+    ap.add_argument("--table", default=None, help="raw masked table of a variant artifact")
+    ap.add_argument("--p0", default=None, help="raw HY_P0 (4096 B) of the same artifact")
     ap.add_argument("--sample", type=int, default=4096,
                     help="entries verified per pair table (0 = all 65536)")
     a = ap.parse_args(argv)
 
     env = wb.hy_env_mix(a.pagesize, a.ncpu, a.cls)
-    print("binary : %s" % a.binary)
+    print("binary : %s" % (a.table or a.binary))
     print("env    : 0x%08x" % env)
     t0 = time.time()
     seed = a.seed
-    if seed is None:
-        seed, frag_off, tried = wb.find_mask_seed(a.binary, *wb.find_section(a.binary, "__hytab"))
-    tab_b = wb.load_plain_table(a.binary, seed=seed, cache=a.cache)
-    data = open(a.binary, "rb").read()
-    p0 = wb.find_input_bijection(data)[0][1]
+    if a.table:
+        masked = open(a.table, "rb").read()
+        if seed is None:
+            raise SystemExit("--table needs --seed")
+        tab_b = bytearray(masked)
+        st = seed
+        for i in range(len(tab_b)):
+            st = wb.mask_next(st)
+            tab_b[i] ^= (st >> 24) & 0xFF
+        tab_b = bytes(tab_b)
+        raw = open(a.p0, "rb").read()
+        p0 = [list(raw[256 * i:256 * (i + 1)]) for i in range(16)]
+    else:
+        if seed is None:
+            seed, frag_off, tried = wb.find_mask_seed(a.binary, *wb.find_section(a.binary, "__hytab"))
+        tab_b = wb.load_plain_table(a.binary, seed=seed, cache=a.cache)
+        data = open(a.binary, "rb").read()
+        p0 = wb.find_input_bijection(data)[0][1]
     p0i = [[0] * 256 for _ in range(16)]
     for i in range(16):
         for v in range(256):
