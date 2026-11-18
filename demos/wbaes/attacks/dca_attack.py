@@ -45,9 +45,9 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import wblib as wb
 
-PUBLISHED_KEY = "46f6abe52990556a6713141f65fed9a5"  # used only on the verify line
+PUBLISHED_KEY = "4f065a03ee16cf8c31b15fd8f0344c66"  # used only on the verify line
 CHALLENGE_PT = "6bc1bee22e409f96e93d7e117393172a"
-CHALLENGE_CT = "80aadc09777696c9d492a7e53b3b15b0"
+CHALLENGE_CT = "7672415a6313c58518fc95c9cb6922b8"
 
 MUL = {1: [wb.gmul(i, 1) for i in range(256)],
        2: [wb.gmul(i, 2) for i in range(256)],

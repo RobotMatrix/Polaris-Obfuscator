@@ -698,5 +698,5 @@ def prng_pts(n, seed=0x12345678, skip=0):
 
 DEFAULT_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "..", "..", "..", "exported-binaries", "wbaes-challenge",
-                           "macos", "wbaes_nl_clean")
+                           "macos", "wbaes_vm2_clean")
 DEFAULT_ENV = (16384, 10, 128)   # hw.pagesize/hw.ncpu/hw.cachelinesize on the build host
