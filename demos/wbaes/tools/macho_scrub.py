@@ -60,9 +60,20 @@ LC_SYMTAB = 0x2
 LC_CODE_SIGNATURE = 0x1D
 LC_DYSYMTAB = 0xB
 LC_DYLD_INFO_ONLY = 0x80000022
+LC_DYLD_INFO = 0x22
 LC_DYLD_EXPORTS_TRIE = 0x80000033
+LC_DYLD_CHAINED_FIXUPS = 0x80000034
+LC_FUNCTION_STARTS = 0x26
+LC_DATA_IN_CODE = 0x29
+LC_LINKER_OPTIMIZATION_HINT = 0x2E
 
 MH_EXECUTE = 0x2
+
+# Mangled-name / purpose prefixes. Anchored with ^ on purpose: only the *start*
+# of a name may carry one. An unanchored re.I search also matches inside our own
+# base32 names ("_zns4zohl73" contains "zn"), which made the post-condition
+# reject ~2% of the builds it had just renamed (SPLIT-SYMBOLS-S3.md 7.3).
+TELL_START = re.compile(rb"^_?(?:WBAES|wbaes|hsvm|hy_vm|hytab|HSV)|^_Z")
 
 # An empty export trie is two zero bytes: root node, terminal_size=0,
 # child_count=0. dyld walks it, finds no exports, and moves on.
@@ -117,7 +128,7 @@ def uleb(buf, off):
             return result, off
 
 
-def parse_export_trie(buf):
+def parse_export_trie(buf, spans=None):
     """Walk a dyld export trie; return [{name, flags, address}].
 
     Layout (dyld source, `MachOFile::forEachExportTrieEntry`): each node is a
@@ -125,6 +136,11 @@ def parse_export_trie(buf):
     count, then per child a NUL-terminated label and a ULEB child node offset
     *relative to the start of the trie*.  A terminal's info is flags, then the
     address (ULEB) unless EXPORT_SYMBOL_FLAGS_REEXPORT / STUB_AND_RESOLVER.
+
+    If `spans` is a list, the byte range of every reachable node is appended to
+    it. Everything inside [0, len(buf)) that no span covers is dead: `strip`
+    rewrites the root node in place and leaves the old nodes (and therefore the
+    old *names*) behind as plain strings. `zero_trie_slack` uses this.
     """
     out = []
 
@@ -145,6 +161,8 @@ def parse_export_trie(buf):
             out.append({"name": prefix, "flags": flags, "address": address})
         p = info_end
         if p >= len(buf):
+            if spans is not None:
+                spans.append((node_off, min(p, len(buf))))
             return
         nchild, p = uleb(buf, p)
         for _ in range(nchild):
@@ -155,12 +173,161 @@ def parse_export_trie(buf):
             p = z + 1
             child, p = uleb(buf, p)
             walk(child, prefix + label, depth + 1)
+        if spans is not None:
+            spans.append((node_off, min(p, len(buf))))
 
     try:
         walk(0, "")
     except (IndexError, ValueError):
         pass
     return out
+
+
+def zero_trie_slack(m, verbose=True):
+    """Zero the dead bytes inside every export trie region.
+
+    `strip` rewrites the trie root in place (so the old names stop resolving)
+    but does not zero the nodes it no longer points at: `strings` still reads
+    `WBAESTables`, `dec_core`, ... out of the file (SPLIT-SYMBOLS-S3.md 4).
+    Reachability is computed by walking the trie exactly the way dyld does, so
+    nothing a parser can reach is touched; the load command's dataoffset /
+    datasize are left alone, which is also what keeps `strip` orderable
+    afterwards.
+    """
+    info = []
+    for _off, _cmd, doff, _dsz in m.export_ranges():
+        start, size = struct.unpack_from("<II", m.data, doff)
+        if not size or not start:
+            continue
+        spans = []
+        before = parse_export_trie(bytes(m.data[start:start + size]), spans)
+        live = bytearray(size)
+        for a, b in spans:
+            live[a:b] = b"\x01" * (b - a)
+        zeroed = 0
+        for i in range(size):
+            if not live[i] and m.data[start + i]:
+                m.data[start + i] = 0
+                zeroed += 1
+        after = parse_export_trie(bytes(m.data[start:start + size]))
+        if after != before:
+            raise SystemExit("zeroing trie slack changed what the trie parses to")
+        info.append({"dataoffset": start, "datasize": size,
+                     "bytes_zeroed": zeroed, "names_kept": len(after)})
+        if verbose and zeroed:
+            print("trie slack zeroed: %d B of %d at 0x%x (%d name(s) still reachable)"
+                  % (zeroed, size, start, len(after)))
+    return info
+
+
+def neutralise_unwind(m, verbose=True):
+    """Replace the compact `__unwind_info` table with a valid empty one.
+
+    The table is the last structural place that still enumerates the *real*
+    function starts (SPLIT-SYMBOLS-S3.md 3.1: 15 of 17 entries real, precision
+    0.88) because S1 emits no CFI for chunks. MC refuses a nested
+    `.cfi_startproc` inside a function's own frame, so the table cannot be made
+    proportional from the compiler; it can only be dropped. The result is a
+    header with zero index entries at the same offset and the same section
+    size (so no load command moves and `strip`'s file-order check still
+    passes). Cost: no frame of this image can be unwound -- see
+    SPLIT-SYMBOLS-AB.md for the measured crash-report effect.
+    """
+    done = []
+    for _seg, sect, so in m.sections():
+        if sect != "__unwind_info":
+            continue
+        addr, size, offset = struct.unpack_from("<QQI", m.data, so + 32)
+        if size < 28:
+            raise SystemExit("__unwind_info at 0x%x is only %d B" % (offset, size))
+        ver, _ceo, _cec, _pao, _pac, io, ic = struct.unpack_from("<7I", m.data, offset)
+        m.data[offset:offset + size] = bytes(size)
+        # version 1, no common encodings, no personalities, empty index
+        struct.pack_into("<7I", m.data, offset, 1, 0, 0, 0, 0, 28, 0)
+        done.append({"addr": addr, "size": size, "version_before": ver,
+                     "index_before": ic})
+        if verbose:
+            print("__unwind_info neutralised: %d B at 0x%x, %d index entr(y/ies) -> 0"
+                  % (size, offset, ic))
+    return done
+
+
+def linkedit_claimed_ranges(m):
+    """Byte ranges of the file that some load command says it owns."""
+    ranges = []
+
+    def add(off, size, what):
+        if size:
+            ranges.append((off, off + size, what))
+
+    for off, cmd, cmdsize in m.cmds:
+        if cmd in (LC_DYLD_INFO, LC_DYLD_INFO_ONLY) and cmdsize >= 48:
+            for i, what in enumerate(("rebase", "bind", "weak_bind", "lazy_bind",
+                                      "export")):
+                o, s = struct.unpack_from("<II", m.data, off + 8 + i * 8)
+                add(o, s, "dyld_info." + what)
+        elif cmd in (LC_DYLD_EXPORTS_TRIE, LC_DYLD_CHAINED_FIXUPS,
+                     LC_FUNCTION_STARTS, LC_DATA_IN_CODE, LC_CODE_SIGNATURE,
+                     LC_LINKER_OPTIMIZATION_HINT):
+            o, s = struct.unpack_from("<II", m.data, off + 8)
+            add(o, s, "cmd %#x" % cmd)
+        elif cmd == LC_SYMTAB:
+            symoff, nsyms, stroff, strsize = struct.unpack_from("<IIII", m.data, off + 8)
+            add(symoff, nsyms * 16, "symtab")
+            add(stroff, strsize, "strtab")
+        elif cmd == LC_DYSYMTAB:
+            f = struct.unpack_from("<18I", m.data, off + 8)
+            add(f[6], f[7] * 8, "toc")            # tocoff, ntoc
+            add(f[8], f[9] * 56, "modtab")        # modtaboff, nmodtab
+            add(f[10], f[11] * 4, "extrefsyms")   # extrefsymoff, nextrefsyms
+            add(f[12], f[13] * 4, "indirectsym")  # indirectsymoff, nindirectsyms
+            add(f[14], f[15] * 8, "extrel")       # extreloff, nextrel
+            add(f[16], f[17] * 8, "locrel")       # locreloff, nlocrel
+        elif cmd == LC_SEGMENT_64:
+            nsects = struct.unpack_from("<I", m.data, off + 64)[0]
+            for i in range(nsects):
+                so = off + 72 + i * 80
+                ssize, soff = struct.unpack_from("<QI", m.data, so + 40)
+                add(soff, ssize, "section")
+    return ranges
+
+
+def zero_linkedit_slack(m, verbose=True):
+    """Zero every byte of __LINKEDIT that no load command claims.
+
+    `strip` and ld-rewritten tables leave gaps: after a full strip the old
+    symbol table entries and the old string table stay in the file as dead
+    bytes (they are inside __LINKEDIT but described by nothing), which is how
+    `WBAES|_ZN` still matched 4 raw bytes in the fully stripped wbaes artifact.
+    Only bytes outside every claimed range are touched, so live metadata cannot
+    be hit; the effect is verified by re-reading the file with the same
+    machinery (nm / trie walk) and by running it.
+    """
+    seg = None
+    for off, cmd, _sz in m.cmds:
+        if cmd != LC_SEGMENT_64:
+            continue
+        name = m.data[off + 8:off + 24].split(b"\0")[0]
+        if name == b"__LINKEDIT":
+            fileoff, filesize = struct.unpack_from("<QQ", m.data, off + 40)
+            seg = (fileoff, filesize)
+    if not seg:
+        return {"zeroed": 0}
+    lo, size = seg
+    claimed = bytearray(size)
+    for a, b, _what in linkedit_claimed_ranges(m):
+        a, b = max(a, lo), min(b, lo + size)
+        if b > a:
+            claimed[a - lo:b - lo] = b"\x01" * (b - a)
+    zeroed = 0
+    for i in range(size):
+        if not claimed[i] and m.data[lo + i]:
+            m.data[lo + i] = 0
+            zeroed += 1
+    if verbose:
+        print("__LINKEDIT slack zeroed: %d B of %d (unclaimed by any load command)"
+              % (zeroed, size))
+    return {"zeroed": zeroed, "linkedit": [lo, size]}
 
 
 class MachO:
@@ -310,8 +477,12 @@ def scrub_exports(m, seed, mode="empty", verbose=True):
 
 
 def harden(inp, out, seed, check=False, strip_locals=True, keep_undef=True, verbose=True,
-           exports="empty"):
+           exports="empty", unwind="keep", zero_slack=True):
     m = MachO(inp)
+    # Names that exist before the rewrite; the post-condition below is about
+    # these and only these.
+    orig_names = {s["name"] for s in m.symbols() if (s["type"] & N_TYPE) != N_UNDF}
+    orig_names |= {e["name"] for e in m.exports()}
     renamed_sections = []
     for segname, sectname, so in m.sections():
         if sectname in STOCK or not sectname:
@@ -396,20 +567,47 @@ def harden(inp, out, seed, check=False, strip_locals=True, keep_undef=True, verb
             print("  %-48s -> %s" % (old, new))
         print("symbols dropped : %d" % dropped)
 
-    # Post-condition: no original name may survive in *either* name table. This
-    # is the check the first version of this tool did not have, which is why a
-    # renamed LC_SYMTAB and an untouched export trie both shipped.
+    # Stale bytes: nothing above rewrites what the load commands no longer
+    # describe, so dead trie nodes and dead strtab bytes stay readable by
+    # `strings` (that is the whole of SPLIT-SYMBOLS-S3.md 4's "names in the
+    # file, addresses gone"). Both passes only touch bytes that no parser and
+    # no load command can reach.
+    zero_trie_slack(m, verbose=verbose)
+    if zero_slack:
+        zero_linkedit_slack(m, verbose=verbose)
+    if unwind == "neutralise":
+        neutralise_unwind(m, verbose=verbose)
+    elif unwind != "keep":
+        raise SystemExit("unknown --unwind mode %r" % unwind)
+
+    # Post-condition, two independent checks:
+    #   1. exactness -- no name that was in the file before the rewrite may be
+    #      readable in the string table or the export trie;
+    #   2. shape -- no surviving name may *start* with a tell prefix.
+    # `TELL_START` is anchored and case-sensitive for `_Z` on purpose: our own
+    # base32 names are lowercase/digit only and can spell "zn" (`_zns4zohl73`),
+    # and the old unanchored re.I scan rejected ~2% of the 17-name builds it
+    # had just renamed (SPLIT-SYMBOLS-S3.md 7.3). Names this run generated are
+    # exempt by identity, so a self-collision can never fail the build.
     leftover = [e["name"] for e in m.exports()]
     if exports != "keep" and leftover:
         raise SystemExit("export trie still carries %d name(s): %s"
                          % (len(leftover), ", ".join(leftover[:8])))
-    tells = re.compile(rb"WBAES|hsvm|hy_vm|wbaes|hytab|_ZN|_ZNK", re.I)
+    generated = {new for _old, new in renamed_syms} | {new for _s, _o, new in renamed_sections}
     tab = m.symtab()
     if tab is not None:
         _o, _symoff, _n, stroff, strsize = tab
-        hit = tells.findall(bytes(m.data[stroff:stroff + strsize]))
-        if hit:
-            raise SystemExit("string table still carries %r" % hit[:8])
+        names = [x for x in bytes(m.data[stroff:stroff + strsize]).split(b"\0") if x]
+        survived = sorted({n.decode("utf-8", "replace") for n in names}
+                          & orig_names)
+        if survived:
+            raise SystemExit("original name(s) survived in the string table: %s"
+                             % ", ".join(survived[:8]))
+        bad = [n.decode("utf-8", "replace") for n in names
+               if TELL_START.search(n) and n.decode("utf-8", "replace") not in generated]
+        if bad:
+            raise SystemExit("string table still carries tell prefix(es): %s"
+                             % ", ".join(bad[:8]))
 
     if check:
         return m
@@ -433,11 +631,18 @@ def main():
     ap.add_argument("--exports", choices=("empty", "zero", "keep"), default="empty",
                     help="what to do with LC_DYLD_EXPORTS_TRIE: empty trie (default), "
                          "zero-size command, or keep (dylibs)")
+    ap.add_argument("--unwind", choices=("keep", "neutralise"), default="keep",
+                    help="keep __unwind_info, or rewrite it as a valid empty table "
+                         "(a stripped artifact no longer has a name table, but the "
+                         "unwind table still enumerates the real function starts)")
+    ap.add_argument("--no-zero-slack", action="store_true",
+                    help="do not zero the __LINKEDIT bytes no load command claims "
+                         "(dead trie nodes / dead string table; on by default)")
     a = ap.parse_args()
     if not a.check and not a.out:
         raise SystemExit("--out is required unless --check")
     harden(a.inp, a.out, a.seed, check=a.check, strip_locals=not a.keep_locals,
-           exports=a.exports)
+           exports=a.exports, unwind=a.unwind, zero_slack=not a.no_zero_slack)
 
 
 if __name__ == "__main__":

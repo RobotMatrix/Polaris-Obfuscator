@@ -122,6 +122,8 @@ public:
 
   // S1: one seeded local label per split chunk (see SplitSymbols above).
   void emitChunkSymbols(MachineFunction &MF);
+  // Seeded label at the function entry (linkage parity with real symbols).
+  std::string emitEntrySymbol(MachineFunction &MF);
 
 private:
   // Blocks produced by the split, in emission order; emitChunkSymbols labels
@@ -1015,6 +1017,74 @@ static std::string makeChunkSymbolName(StringRef Module, StringRef Fn,
   return std::string(Buf);
 }
 
+// Emit `NAME:` (plus `.globl`, optionally `.no_dead_strip`) at the first
+// instruction of MBB, in the same linkage class as a real function symbol.
+//
+// `.globl` is what closes the oracle: `ld -x` deletes non-external symbols
+// only, so a *local* chunk label survived while the real symbol did not, and
+// "this start has a name" became a zero-false-positive real-function detector
+// (SPLIT-SYMBOLS-S3.md 3: labelled_forged = 0).  `.private_extern` was measured
+// first and is unusable: MC accepts the directive (MCSA_PrivateExtern), but
+// ld64 rewrites N_PEXT definitions to non-external in the output ("non-external
+// (was a private external)"), which puts the chunks straight back in the local
+// class.  No MCSymbol surgery is involved either way: the directive goes
+// through the same AsmParser path as the `.byte` filler this pass already uses.
+static bool emitLinkageParityLabel(MachineBasicBlock *MBB,
+                                   const std::string &Sym, bool NoDeadStrip,
+                                   const AArch64InstrInfo *TII) {
+  if (!MBB || MBB->empty())
+    return false;
+  std::string Text = ".globl " + Sym + "\n";
+  if (NoDeadStrip)
+    Text += ".no_dead_strip " + Sym + "\n";
+  Text += Sym + ":\n";
+  char *Persist = new char[Text.size() + 1];
+  memcpy(Persist, Text.c_str(), Text.size() + 1);
+  BuildMI(*MBB, MBB->begin(), nullptr, TII->get(AArch64::INLINEASM))
+      .addExternalSymbol(Persist)
+      .addImm(InlineAsm::Extra_HasSideEffects);
+  return true;
+}
+
+static void appendSplitSidecar(const std::string &Records) {
+  if (SplitSymbolsSidecar.empty() || Records.empty())
+    return;
+  static bool HeaderWritten = false;
+  std::ofstream Ofs(SplitSymbolsSidecar, std::ios::app);
+  if (!Ofs.is_open()) {
+    errs() << "[split-symbols] cannot open " << SplitSymbolsSidecar << "\n";
+    return;
+  }
+  if (!HeaderWritten) {
+    HeaderWritten = true;
+    Ofs << "polaris-split-symbols\t1\nseed\t" << std::hex << splitNameSeed()
+        << std::dec << "\n";
+  }
+  Ofs << Records;
+}
+
+// A seeded label at the function's own entry, so a start stays named no matter
+// what happened to the function's real symbol.  Without it a *local-linkage*
+// function is the only kind of start that loses its name to `ld -x` (measured
+// on wbaes: 4 of 19 real starts), which is the mirror image of the oracle this
+// change removes -- "unnamed" would select exactly the static functions.
+std::string AArch64RubbishCodePass::emitEntrySymbol(MachineFunction &MF) {
+  if (!SplitSymbols)
+    return "";
+  if (!MF.getTarget().getTargetTriple().isOSBinFormatMachO())
+    return "";
+  MachineBasicBlock &EntryMBB = MF.front();
+  std::string Sym = makeChunkSymbolName(
+      MF.getFunction().getParent()->getModuleIdentifier(),
+      MF.getFunction().getName().str() + "$entry", 0);
+  // No .no_dead_strip here: the alias sits in the function's own atom, so
+  // -dead_strip keeps it exactly when it keeps the function.  Pinning it would
+  // pin every function in the binary.
+  if (!emitLinkageParityLabel(&EntryMBB, Sym, /*NoDeadStrip=*/false, TII))
+    return "";
+  return "entry\t" + MF.getFunction().getName().str() + "\t" + Sym + "\n";
+}
+
 // Give every split chunk its own label.  The label is emitted as inline asm at
 // the block's first instruction, so it reaches MC and becomes a real nlist
 // entry; ld64 derives LC_FUNCTION_STARTS from it as well.
@@ -1035,6 +1105,7 @@ void AArch64RubbishCodePass::emitChunkSymbols(MachineFunction &MF) {
   std::set<MachineBasicBlock *> Seen;
   std::string Records;
   unsigned Idx = 0;
+  Records += emitEntrySymbol(MF);
   for (MachineBasicBlock *MBB : ChunkBlocks) {
     if (!MBB || MBB->empty() || !Seen.insert(MBB).second)
       continue;
@@ -1043,12 +1114,8 @@ void AArch64RubbishCodePass::emitChunkSymbols(MachineFunction &MF) {
     // unreferenced chunk (measured: the linked binary segfaults).  Keeping
     // .no_dead_strip lets the label stay in the nlist without turning the
     // chunk into a dead-strippable atom.
-    std::string Text = ".no_dead_strip " + Sym + "\n" + Sym + ":\n";
-    char *Persist = new char[Text.size() + 1];
-    memcpy(Persist, Text.c_str(), Text.size() + 1);
-    BuildMI(*MBB, MBB->begin(), nullptr, TII->get(AArch64::INLINEASM))
-        .addExternalSymbol(Persist)
-        .addImm(InlineAsm::Extra_HasSideEffects);
+    if (!emitLinkageParityLabel(MBB, Sym, /*NoDeadStrip=*/true, TII))
+      continue;
     Records += "chunk\t" + FnName + "\t" + std::to_string(Idx) + "\t" + Sym +
                "\t" + std::to_string(MBB->getNumber()) + "\n";
     ++Idx;
@@ -1057,20 +1124,8 @@ void AArch64RubbishCodePass::emitChunkSymbols(MachineFunction &MF) {
     return;
   if (getenv("ARMRC_DEBUG"))
     errs() << "[split-symbols] " << FnName << " chunks=" << Idx << "\n";
-  if (SplitSymbolsSidecar.empty())
-    return;
-  static bool HeaderWritten = false;
-  std::ofstream Ofs(SplitSymbolsSidecar, std::ios::app);
-  if (!Ofs.is_open()) {
-    errs() << "[split-symbols] cannot open " << SplitSymbolsSidecar << "\n";
-    return;
-  }
-  if (!HeaderWritten) {
-    HeaderWritten = true;
-    Ofs << "polaris-split-symbols\t1\nseed\t" << std::hex << splitNameSeed()
-        << std::dec << "\n";
-  }
-  Ofs << "fn\t" << FnName << "\t" << Idx << "\n" << Records;
+  Records = "fn\t" + FnName + "\t" + std::to_string(Idx) + "\n" + Records;
+  appendSplitSidecar(Records);
 }
 
 void AArch64RubbishCodePass::process(MachineFunction &MF, ObfuscateOption &OO) {
@@ -1124,6 +1179,17 @@ bool AArch64RubbishCodePass::runOnMachineFunction(MachineFunction &MF) {
   if (checkShouldProcess(MF, OO)) {
     process(MF, OO);
     return true;
+  }
+  // Functions the obfuscator does not touch still get the entry alias when
+  // split-symbols is on: otherwise their start is named only by their real
+  // symbol, so `ld -x` un-names exactly the static functions (wbaes: 4 of 19
+  // real starts) and "unnamed" turns into a function detector of its own.
+  if (SplitSymbols && !MF.getFunction().isDeclaration()) {
+    std::string Rec = emitEntrySymbol(MF);
+    if (!Rec.empty()) {
+      appendSplitSidecar(Rec);
+      return true;
+    }
   }
   return false;
 }

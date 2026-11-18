@@ -36,11 +36,38 @@ table is padded to the old size, so no load command moves) and fixes the
 an arm64 macOS binary with a stale embedded signature is killed on exec.
 
 The symbol table is **not** the only place those names live. ld64 also writes the
-defined names into `LC_DYLD_EXPORTS_TRIE`, and the tool refused to write an
+defined names into `LC_DYLD_EXPORTS_TRIE`, and the tool refuses to write an
 artifact whose trie or string table still matched `WBAES|hsvm|hy_vm|wbaes|hytab|
 _ZN` after the rewrite. Rewriting one name table and leaving the other is worse
 than doing nothing: the artifact looks anonymous to `nm` while `dyld_info
 -exports` still prints every original name at its address.
+
+Two more places hold names, both handled now (`--no-zero-slack` opts out of the
+first, `--unwind neutralise` enables the second):
+
+* **dead bytes.** A table that is rewritten in place keeps the bytes it no
+  longer points at. After `strip`, the export trie's old nodes are unreachable
+  but still spell `decryptPK7AES_ctxPh`, `ECB_`, ... (measured: 1,608 printable
+  fragments in a 34,176 B trie region of the wbaes artifact, SPLIT-SYMBOLS-AB.md).
+  `zero_trie_slack` zeroes exactly the bytes the trie walk cannot reach, and
+  `zero_linkedit_slack` zeroes every `__LINKEDIT` byte no load command claims.
+* **`__unwind_info`.** It is a name-free table that still enumerates the real
+  function starts (15 of 17 entries on wbaes: precision 0.88), and neither
+  `strip` nor this tool used to touch it. `--unwind neutralise` rewrites it as
+  a valid header with zero index entries, at the same offset and size.
+
+Order matters: `strip` must run **before** this tool. Emptying the trie changes
+its `datasize`, after which ld64's `strip` refuses the file ("function starts
+data out of place"); `--exports keep` is the only mode `strip` still accepts
+afterwards. Strip-then-scrub is the supported order and what the B profile uses.
+
+The post-condition now tests two things, and both are about *original* names:
+no name that was in the file before the rewrite may still be in the string
+table, and no surviving name may **start** with a tell prefix. The old check
+searched the whole string table for `_ZN` case-insensitively, which also matches
+inside the tool's own base32 names (`_zns4zohl73`); with S1's chunk labels in
+the table that rejected 151 of 200 seeds (75.5%), not the 2% measured when the
+table held 17 names.
 
 For a device build the last step must sign with the real identity and
 entitlements instead; `codesign -s -` is enough only because this artifact is a
