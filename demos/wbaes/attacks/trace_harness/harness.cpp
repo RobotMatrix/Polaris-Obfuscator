@@ -21,7 +21,7 @@ static std::vector<Tr> g_tr;
 static inline void hy_trace_push(uint32_t a, uint32_t l, uint32_t w) { g_tr.push_back({a, l, w}); }
 #define HY_TRACE(a, l, w) hy_trace_push((uint32_t)(a), (uint32_t)(l), (uint32_t)(w))
 
-#define HY_TABLE_BYTES 69206080u // HY_TOTAL from wbaes_hybrid.h
+#define HY_TABLE_BYTES 70090816u // HY_TOTAL from wbaes_hybrid.h (dl5 layout)
 static uint8_t g_tab_buf[HY_TABLE_BYTES];
 static const uint8_t *hy_tab_ptr = g_tab_buf;
 #define HYKTAB hy_tab_ptr
@@ -40,9 +40,12 @@ static void enc_once(const uint8_t in[16], uint8_t out[16], uint32_t env) {
     uint8_t s[16], n[16];
     for (int i = 0; i < 16; i++) s[i] = HY_P0[i][in[i]];
     for (int r = 0; r < HY_MC_ROUNDS; r++) {
+        // mirror hy_encrypt_once: undo the previous round's 32-bit recoding first
+        if (r) hy_rec_undo(HYKTAB, hy_enc_col(r - 1, 0), 0, r - 1, s, env);
         hy_mc_round(HYKTAB, hy_enc_col(r, 0), r, 0, 1, s, n, env);
         for (int i = 0; i < 16; i++) s[i] = n[i];
     }
+    hy_rec_undo(HYKTAB, hy_enc_col(HY_MC_ROUNDS - 1, 0), 0, HY_MC_ROUNDS - 1, s, env);
     hy_pair_map(HYKTAB, hy_enc_final(), s, out, env, 0, 9, 1);
 }
 

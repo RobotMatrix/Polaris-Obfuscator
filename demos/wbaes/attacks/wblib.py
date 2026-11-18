@@ -96,12 +96,27 @@ def aes_encrypt(pt, key):
 
 
 # ---- table geometry (wbaes_hybrid.h) ---------------------------------------
+# dl5 layout. One column slot per (direction, round, column):
+#   [0, 4096)        F1/F3 lane tables / F2 coefficient tables / F0 pair front
+#   [4096, 528384)   F1/F2/F3 eight 64K pair-decode tables
+#   [528384, 536576) the 32-bit recoding: 12 forward + 12 inverse S-boxes, 12 constants
+#   [536576, 798720) four 64K two-byte boundary tables
 HY_MC_ROUNDS = 9
 N = 65536
 U32 = N * 4
 U8 = N
 U16 = N * 2
-COL = U32 + U32 + 4 * U8
+LANE_OFF = 0
+Q_OFF = 4096
+SPN_OFF = 528384
+SPN_ROUNDS = 3
+SPN_SI_OFF = 12 * 256
+SPN_C_OFF = 24 * 256
+SPN_BYTES = 8192
+BDY_OFF = SPN_OFF + SPN_BYTES
+COL = BDY_OFF + 4 * N                       # 798720
+W1024 = 256 * 4
+W256 = 256
 ROUND = 4 * COL
 MC_SIZE = HY_MC_ROUNDS * ROUND
 PAIRS = 8 * U16
@@ -109,24 +124,22 @@ ENC_BYTES = MC_SIZE + PAIRS
 DEC_ENTRY = PAIRS
 DEC_STEP = ROUND + PAIRS
 DEC_BYTES = DEC_ENTRY + HY_MC_ROUNDS * DEC_STEP + PAIRS
-HY_TABLES = ENC_BYTES + DEC_BYTES          # 69_206_016
+HY_TABLES = ENC_BYTES + DEC_BYTES
 SCHED_OFF = HY_TABLES
 SCHED_STRIDE = 16
 SCHED_BYTES = 64
-HY_TOTAL = HY_TABLES + SCHED_BYTES         # 69_206_080
+HY_TOTAL = HY_TABLES + SCHED_BYTES
+assert COL == 798720 and HY_TOTAL == 70090816, (COL, HY_TOTAL)
 
 FAM_PAIR, FAM_T32, FAM_T8, FAM_T32K = 0, 1, 2, 3
 FAM_NAMES = {0: "F0", 1: "F1", 2: "F2", 3: "F3"}
-K_PAIR_L, K_PAIR_Z = 0, 2
-K_T32_W, K_T32_R = 16, 20
-K_T8_C, K_T8_R = 32, 48
-K_T32K_W, K_T32K_Q, K_T32K_R = 64, 96, 104
-K_T32_Q, K_T8_Q = 80, 88
-W1024 = 256 * 4
-W256 = 256
-Q_OFF = 8 * 1024
-T32_R_OFF = 4 * W1024
-T8_R_OFF = 16 * W256
+K_PAIR_L = 0
+K_T32_W = 16
+K_T8_C = 32
+K_T32K_W = 64
+K_T32_Q, K_T8_Q, K_T32K_Q = 80, 88, 96
+K_SPN_S, K_SPN_SI = 112, 124
+K_BDY_PAIR, K_BDY_T32, K_BDY_T8, K_BDY_T32K = 136, 144, 152, 160
 
 S4 = (0x6, 0xB, 0x5, 0xC, 0x1, 0xF, 0x0, 0xE, 0x9, 0x2, 0x7, 0xD, 0xA, 0x4, 0x3, 0x8)
 
@@ -156,6 +169,17 @@ def hy_scatter(x, env, tag):
     for i in range(4):
         left, right = right, left ^ hy_f8(right, k, i)
     return ((left << 8) | right) & 0xFFFF
+
+
+def hy_scatter_inv(y, env, tag):
+    """Inverse of hy_scatter: the four Feistel rounds are undone in reverse, so the
+    logical 16-bit index of a 64K table is recoverable from an address exactly."""
+    k = _tag_key(env, tag)
+    L = (y >> 8) & 0xFF          # hy_scatter packs the *internal* left half high
+    R = y & 0xFF
+    for i in range(3, -1, -1):
+        L, R = R ^ hy_f8(L, k, i), L
+    return (L | (R << 8)) & 0xFFFF
 
 
 def hy_scatter8(x, env, tag):
@@ -442,6 +466,55 @@ class Tab(object):
         return struct.unpack_from("<I", self.buf, off + hy_scatter(logical, self.env, tag) * 4)[0]
 
 
+# ---- the 32-bit nonlinear recoding (mirror of wbaes_hybrid.h) --------------
+# Three rounds of (XOR constant, per-byte bijection, 4x4 MDS mix). The mixing is
+# the circulant (1,4,3,7) and its inverse the circulant (11,11,9,8).
+MDS_W = (1, 4, 3, 7)
+MDS_V = (11, 11, 9, 8)
+
+
+def mds(y, w=MDS_W):
+    t = [0] * 4
+    for r in range(4):
+        a = 0
+        for k in range(4):
+            a ^= gmul(y[k], w[(k - r + 4) & 3])
+        t[r] = a
+    y[:] = t
+
+
+def spn_fwd(tab, cb, direction, rnd, col, y, env, log=None):
+    for i in range(SPN_ROUNDS):
+        for j in range(4):
+            c = tab.buf[cb + SPN_OFF + SPN_C_OFF + i * 4 + j]
+            off = cb + SPN_OFF + (i * 4 + j) * W256
+            tag = hy_tag(direction, rnd, col, K_SPN_S + i * 4 + j)
+            li = (y[j] ^ c) & 0xFF
+            if log is not None:
+                log(off + hy_scatter8(li, env, tag), li, 1)
+            y[j] = tab.r8t(off, li, tag)
+        mds(y)
+
+
+def spn_inv(tab, cb, direction, rnd, col, y, env, log=None):
+    for i in range(SPN_ROUNDS - 1, -1, -1):
+        mds(y, MDS_V)
+        for j in range(4):
+            c = tab.buf[cb + SPN_OFF + SPN_C_OFF + i * 4 + j]
+            off = cb + SPN_OFF + SPN_SI_OFF + (i * 4 + j) * W256
+            tag = hy_tag(direction, rnd, col, K_SPN_SI + i * 4 + j)
+            if log is not None:
+                log(off + hy_scatter8(y[j], env, tag), y[j], 1)
+            y[j] = tab.r8t(off, y[j], tag) ^ c
+
+
+def rec_undo(tab, pbase, direction, rnd, state, env, log=None):
+    for col in range(4):
+        y = state[4 * col:4 * col + 4]
+        spn_inv(tab, pbase + col * COL, direction, rnd, col, y, env, log)
+        state[4 * col:4 * col + 4] = y
+
+
 # ---- the table network, with optional access logging ----------------------
 def mc_round(tab, base, rnd, direction, src_kind, state, env, log=None):
     """Mirror of hy_mc_round from wbaes_hybrid.h; log receives (offset, logical, width)."""
@@ -450,10 +523,11 @@ def mc_round(tab, base, rnd, direction, src_kind, state, env, log=None):
     for col in range(4):
         cb = base + col * COL
         b = [state[sr_src(k + 4 * col)] if src_kind == 1 else state[k + 4 * col] for k in range(4)]
+        bdy = cb + BDY_OFF
         if fam in (FAM_T32, FAM_T32K):
             kw = K_T32K_W if fam == FAM_T32K else K_T32_W
             qb = K_T32K_Q if fam == FAM_T32K else K_T32_Q
-            rb = K_T32K_R if fam == FAM_T32K else K_T32_R
+            bk = K_BDY_T32K if fam == FAM_T32K else K_BDY_T32
             w = [0] * 4
             for k in range(4):
                 off = cb + k * W1024
@@ -475,12 +549,12 @@ def mc_round(tab, base, rnd, direction, src_kind, state, env, log=None):
                 if log is not None:
                     log(off + hy_scatter(li, env, tag), li, 1)
                 pr = tab.r8(off, li, tag)
-                off = cb + T32_R_OFF + row * W256
-                tag = hy_tag(direction, rnd, col, rb + row)
-                li = pl ^ pr
+                off = bdy + row * N
+                tag = hy_tag(direction, rnd, col, bk + row)
+                li = pl | (pr << 8)
                 if log is not None:
-                    log(off + hy_scatter8(li, env, tag), li, 1)
-                out[row + 4 * col] = tab.r8t(off, li, tag)
+                    log(off + hy_scatter(li, env, tag), li, 1)
+                out[row + 4 * col] = tab.r8(off, li, tag)
         elif fam == FAM_T8:
             v = [[0] * 4 for _ in range(4)]
             for k in range(4):
@@ -503,12 +577,12 @@ def mc_round(tab, base, rnd, direction, src_kind, state, env, log=None):
                 if log is not None:
                     log(off + hy_scatter(li, env, tag), li, 1)
                 pr = tab.r8(off, li, tag)
-                off = cb + T8_R_OFF + row * W256
-                tag = hy_tag(direction, rnd, col, K_T8_R + row)
-                li = pl ^ pr
+                off = bdy + row * N
+                tag = hy_tag(direction, rnd, col, K_BDY_T8 + row)
+                li = pl | (pr << 8)
                 if log is not None:
-                    log(off + hy_scatter8(li, env, tag), li, 1)
-                out[row + 4 * col] = tab.r8t(off, li, tag)
+                    log(off + hy_scatter(li, env, tag), li, 1)
+                out[row + 4 * col] = tab.r8(off, li, tag)
         else:
             off = cb
             tag = hy_tag(direction, rnd, col, K_PAIR_L)
@@ -525,12 +599,15 @@ def mc_round(tab, base, rnd, direction, src_kind, state, env, log=None):
             for row in range(4):
                 pl = (left >> (8 * row)) & 255
                 pr = (right >> (8 * row)) & 255
-                off = cb + 2 * U32 + row * U8
-                tag = hy_tag(direction, rnd, col, K_PAIR_Z + row)
+                off = bdy + row * N
+                tag = hy_tag(direction, rnd, col, K_BDY_PAIR + row)
                 li = pl | (pr << 8)
                 if log is not None:
                     log(off + hy_scatter(li, env, tag), li, 1)
                 out[row + 4 * col] = tab.r8(off, li, tag)
+        y = out[4 * col:4 * col + 4]
+        spn_fwd(tab, cb, direction, rnd, col, y, env, log)
+        out[4 * col:4 * col + 4] = y
     return out
 
 
@@ -557,7 +634,10 @@ def pair_map(tab, base, state, env, direction, rnd, wiring, log=None):
 def encrypt(tab, p0, pt, env, log=None):
     s = [p0[i][pt[i]] for i in range(16)]
     for r in range(HY_MC_ROUNDS):
+        if r:
+            rec_undo(tab, enc_col(r - 1, 0), 0, r - 1, s, env, log)
         s = mc_round(tab, enc_col(r, 0), r, 0, 1, s, env, log)
+    rec_undo(tab, enc_col(HY_MC_ROUNDS - 1, 0), 0, HY_MC_ROUNDS - 1, s, env, log)
     return bytes(pair_map(tab, enc_final(), s, env, 0, 9, 1, log))
 
 
@@ -618,5 +698,5 @@ def prng_pts(n, seed=0x12345678, skip=0):
 
 DEFAULT_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "..", "..", "..", "exported-binaries", "wbaes-challenge",
-                           "macos", "wbaes_dl4_clean")
+                           "macos", "wbaes_nl_clean")
 DEFAULT_ENV = (16384, 10, 128)   # hw.pagesize/hw.ncpu/hw.cachelinesize on the build host

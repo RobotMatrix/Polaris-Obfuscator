@@ -105,12 +105,16 @@ static void hy_encrypt_once(const uint8_t in[16], uint8_t out[16], uint32_t env,
     uint8_t s[16], n[16];
     for (int i = 0; i < 16; i++) s[i] = HY_P0[i][in[i]]; // round-0 input bijection
     for (int r = 0; r < HY_MC_ROUNDS; r++) {
+        // The previous round left its bytes SPN-encoded; the round tables are built
+        // on the plain (output-bijection) domain, so undo it first.
+        if (r) hy_rec_undo(HYKTAB, hy_enc_col(r - 1, 0), 0, r - 1, s, env);
         // hy_mc_round reads this round's family out of the table: the nine rounds
         // do not have to share a table shape, and the loop does not know which.
         // off[r] is the VM's offset plan for that round (nullptr: derive it here).
         hy_mc_round(HYKTAB, hy_enc_col(r, 0), r, 0, 1, s, n, env, off ? off[r] : nullptr);
         for (int i = 0; i < 16; i++) s[i] = n[i];
     }
+    hy_rec_undo(HYKTAB, hy_enc_col(HY_MC_ROUNDS - 1, 0), 0, HY_MC_ROUNDS - 1, s, env);
     if (arm_fault) {
 #ifdef WBAES_DFA_SELFTEST
         if (g_dfa_once) {
@@ -164,9 +168,12 @@ static void hy_decrypt_once(const uint8_t in[16], uint8_t out[16], uint32_t env,
     for (int step = 0; step < HY_DEC_STEPS; step++) {
         hy_mc_round(HYKTAB, hy_dec_mc(step), step, 1, 0, s, t, env,
                     off ? off[step] : nullptr);
+        hy_rec_undo(HYKTAB, hy_dec_mc(step), 1, step, t, env);
         hy_pair_map(HYKTAB, hy_dec_sb(step), t, n, env, 1, 20 + step, 2);
         for (int i = 0; i < 16; i++) s[i] = n[i];
     }
+    // No undo here: the last pair map already returned the D[0] domain, which is
+    // what hy_dec_tail() expects.
     hy_pair_map(HYKTAB, hy_dec_tail(), s, out, env, 1, 40, 0);
 }
 

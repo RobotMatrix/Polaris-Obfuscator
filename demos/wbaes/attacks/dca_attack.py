@@ -20,11 +20,15 @@ Two experiments, in the order a DCA attacker would try them:
      that decides the outcome is printed too: the index is P0(pt), a public bijection
      of the plaintext byte, so the address has zero key dependence.
 
-  B. exact-index recovery + 4-byte meet-in-the-middle: dl4's 256-entry boundary
-     permutation tables are indexed by the round output *before* AddRoundKey,
-     MC(row,:) . S(pt ^ rk0). Their address inverts (affine) to that byte exactly, so
-     one trace is one 8-bit equation in four key bytes; meet-in-the-middle over
-     (k0,k1) x (k2,k3) with a signature over a few traces solves each column.
+  B. exact-index recovery + 4-byte meet-in-the-middle: the address of the round-0
+     boundary table inverts (4-round Feistel, code) to its logical index exactly.
+     On dl4 that index was the single byte MC(row,:) . S(pt ^ rk0), so one trace was
+     one 8-bit equation in four key bytes and a meet-in-the-middle over
+     (k0,k1) x (k2,k3) solved each column. On dl5 the boundary table is 64K and its
+     index is *two* bytes, each one a random 8-bit bijection image of one half of
+     that row sum; the bijections live only inside the table, so the recovered index
+     cannot be predicted from a key guess. The experiment still runs the same MITM
+     on both halves and reports what it gets, plus the measured fact that decides it.
 
 usage:
   python3 dca_attack.py                     # traces from the Python model (no build)
@@ -41,9 +45,9 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import wblib as wb
 
-PUBLISHED_KEY = "755e563b1dffd249ef552c1bb778de29"  # used only on the verify line
+PUBLISHED_KEY = "46f6abe52990556a6713141f65fed9a5"  # used only on the verify line
 CHALLENGE_PT = "6bc1bee22e409f96e93d7e117393172a"
-CHALLENGE_CT = "abe296eea2625f251ba57ed0b408272c"
+CHALLENGE_CT = "80aadc09777696c9d492a7e53b3b15b0"
 
 MUL = {1: [wb.gmul(i, 1) for i in range(256)],
        2: [wb.gmul(i, 2) for i in range(256)],
@@ -153,22 +157,63 @@ def experiment_a(addrs, pts, env, key, p0):
 
 
 # ---------------------------------------------------------------------------
-def boundary_index(addrs, col, row, env, rb):
-    """Round-0 boundary table: 256 entries, index = plain MixColumns row output."""
-    base = wb.enc_col(0, col) + wb.T32_R_OFF + row * wb.W256   # same slot for F1/F2/F3
-    tag = wb.hy_tag(0, 0, col, rb + row)
-    out = []
+def boundary_index(addrs, col, row, env, bk):
+    """Round-0 boundary table: 64K entries, two-byte index. The 16-bit Feistel scatter
+    is inline code, so the attacker inverts it exactly - and gets back the two
+    pair-decode outputs (u, v), not the round output."""
+    base = wb.enc_col(0, col) + wb.BDY_OFF + row * wb.N
+    tag = wb.hy_tag(0, 0, col, bk + row)
+    lo, hi = [], []
     for tr in addrs:
-        hit = [a for a in tr if base <= a < base + wb.W256]
+        hit = [a for a in tr if base <= a < base + wb.N]
         if not hit:
             raise SystemExit("boundary slot (col %d row %d) not in trace" % (col, row))
-        out.append(wb.hy_scatter8_inv(hit[0] - base, env, tag))
-    return out
+        li = wb.hy_scatter_inv(hit[0] - base, env, tag)
+        lo.append(li & 255)
+        hi.append(li >> 8)
+    return lo, hi
 
 
-def recover_column(addrs, pts, col, row, env, sig_traces, rb):
+def pair_sums(pts, key, col, row):
+    """MC(row,:) . S(pt ^ rk0) for the four lanes of this column, with the true key:
+    the value dl4's boundary index equalled, and the value this build hides."""
+    srcs = [wb.sr_src(k + 4 * col) for k in range(4)]
+    m = [wb.MC[row][k] for k in range(4)]
+    left = [0] * len(pts)
+    right = [0] * len(pts)
+    for t, pt in enumerate(pts):
+        a = [MUL[m[k]][wb.SBOX[pt[srcs[k]] ^ key[srcs[k]]]] for k in range(4)]
+        left[t] = a[0] ^ a[1]
+        right[t] = a[2] ^ a[3]
+    return left, right
+
+
+def index_leak_report(addrs, pts, env, key, bk, row=0, half=0):
+    """Measured facts about what the recovered index byte is. For the true key the
+    byte is one bijection away from the pair sum (so the *dependency* is there), but
+    the bijection is inside the table and the byte is not the pair sum itself."""
+    print("   is the recovered index byte a function of the pair sum (true key)?")
+    for col in range(4):
+        lo, hi = boundary_index(addrs, col, row, env, bk)
+        left, right = pair_sums(pts, key, col, row)
+        obs = lo if half == 0 else hi
+        src = left if half == 0 else right
+        seen = {}
+        conflicts = 0
+        for x, y in zip(src, obs):
+            if x in seen and seen[x] != y:
+                conflicts += 1
+            seen[x] = y
+        exact = sum(1 for x, y in zip(src, obs) if x == y)
+        print("     col %d: %d distinct pair sums, %d index values, conflicts %d,"
+              " index == pair sum on %d/%d traces"
+              % (col, len(set(src)), len(set(obs)), conflicts, exact, len(obs)))
+
+
+def recover_column(addrs, pts, col, row, env, sig_traces, bk, half):
     """MITM over (k_a,k_b) x (k_c,k_d): u = XOR_k MC[row][k] . S(pt_k ^ key_k)."""
-    u = boundary_index(addrs, col, row, env, rb)
+    lo, hi = boundary_index(addrs, col, row, env, bk)
+    u = lo if half == 0 else hi
     srcs = [wb.sr_src(k + 4 * col) for k in range(4)]
     m = [wb.MC[row][k] for k in range(4)]
     v = [[[MUL[m[k]][wb.SBOX[pt[srcs[k]] ^ g]] for pt in pts] for g in range(256)]
@@ -194,13 +239,13 @@ def recover_column(addrs, pts, col, row, env, sig_traces, rb):
     return srcs, cands
 
 
-def experiment_b(addrs, pts, env, key, rb, row=0, sig_traces=3, quiet=False):
-    """One run with a fixed guess for round 0's family tag. Returns (key bytes, counts)."""
+def experiment_b(addrs, pts, env, key, bk, row=0, sig_traces=3, half=0, quiet=False):
+    """One run with a fixed guess for round 0's family tag and one index half."""
     t0 = time.time()
     rec = {}
     counts = []
     for col in range(4):
-        srcs, cands = recover_column(addrs, pts, col, row, env, sig_traces, rb)
+        srcs, cands = recover_column(addrs, pts, col, row, env, sig_traces, bk, half)
         counts.append(len(cands))
         if not quiet:
             print("   col %d: %2d candidate 4-byte key(s) for key bytes %s  [%.2fs]"
@@ -274,24 +319,29 @@ def main(argv=None):
         return 0
     n_b = min(a.b_traces, len(addrs))
     print("== B. round-0 boundary-table address -> 4-byte meet-in-the-middle ==")
-    print("   the 256-entry boundary table is indexed by MC(%d,:) . S(pt ^ rk0), the round"
-          % a.row)
-    print("   output before AddRoundKey, recovered exactly from the affine scatter. The")
-    print("   schedule block is sealed, so the attacker tries each family's table tag:")
+    print("   the boundary table is 64K with a two-byte index, recovered exactly from the")
+    print("   Feistel scatter. Its halves are the two pair-decode outputs of row %d:" % a.row)
+    print("   u = Zl(MC(row,0).S(pt^k0) ^ MC(row,1).S(pt^k1)),")
+    print("   v = Zr(MC(row,2).S(pt^k2) ^ MC(row,3).S(pt^k3)).")
+    print("   The schedule block is sealed, so the attacker tries each family's tag and")
+    print("   each half as if it were the pair sum the dl4 boundary table exposed:")
     rec, counts, tb, win = None, None, 0.0, None
-    for fam, rb in ((wb.FAM_T32, wb.K_T32_R), (wb.FAM_T8, wb.K_T8_R),
-                    (wb.FAM_T32K, wb.K_T32K_R)):
-        r, c, t = experiment_b(addrs[:n_b], pts[:n_b], env, key, rb, a.row,
-                               a.sig_traces, quiet=True)
-        print("     tag %-3s (kind %3d): candidates per column %s -> %s  [%.2fs]"
-              % (wb.FAM_NAMES[fam], rb, c,
-                 "16/16 key bytes" if len(r) == 16 else "%d/16 key bytes" % len(r), t))
-        if rec is None or len(r) > len(rec):
-            rec, counts, tb, win = r, c, t, rb
-        if len(r) == 16:
-            break
+    for fam, bk in ((wb.FAM_T32, wb.K_BDY_T32), (wb.FAM_T8, wb.K_BDY_T8),
+                    (wb.FAM_T32K, wb.K_BDY_T32K)):
+        for half in (0, 1):
+            r, c, t = experiment_b(addrs[:n_b], pts[:n_b], env, key, bk, a.row,
+                                   a.sig_traces, half, quiet=True)
+            print("     tag %-3s (kind %3d) half %d: candidates per column %s -> %s  [%.2fs]"
+                  % (wb.FAM_NAMES[fam], bk, half, c,
+                     "16/16 key bytes" if len(r) == 16 else "%d/16 key bytes" % len(r), t))
+            if rec is None or len(r) > len(rec):
+                rec, counts, tb, win = r, c, t, bk
+            if len(r) == 16:
+                break
+    print("   what the recovered index actually is (round-0 family F1, kind %d):" % wb.K_BDY_T32)
+    index_leak_report(addrs[:n_b], pts[:n_b], env, key, wb.K_BDY_T32, a.row, 0)
     if win is not None:
-        print("   per-column detail for the winning tag (kind %d):" % win)
+        print("   per-column detail for the best tag (kind %d):" % win)
         experiment_b(addrs[:n_b], pts[:n_b], env, key, win, a.row, a.sig_traces)
     print("== recovered key ==")
     if len(rec) != 16:

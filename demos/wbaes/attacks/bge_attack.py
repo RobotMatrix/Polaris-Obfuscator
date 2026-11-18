@@ -7,8 +7,12 @@ from the generator's own parameters, which is what the design says an attacker w
 have to reason about:
 
     lane(row,k)[x] = E[row][k][ MC[row][k] . S(x ^ rk) ]        E: random bijection
-    pair(row,p)[a,b] = D[row][2p][a] ^ D[row][2p+1][b]          D = E^-1
-    out(row,dst)[u]  = P[r][dst][ u ^ rk_next ]                 P: random bijection
+    pair(row,p)[a,b] = Z[D[row][2p][a] ^ D[row][2p+1][b]]       D = E^-1, Z random
+    out(row,dst)[a,b] = P[r][dst][ Zl^-1(u) ^ Zr^-1(v) ^ rk ]   P: random bijection
+
+The pair-decode tables carry a random bijection on their *output* and the boundary
+is a 64K two-byte table, so the XOR fit below is the test that decides whether the
+decode tables still hand over the lane inverses.
 
 The design's claim (demos/wbaes/AFFINE-ROUNDS.md sec. 8) is that E is not recoverable
 because its inverse D "cannot fit into one 256-entry table"; the 64K pair table is the
@@ -39,9 +43,9 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import wblib as wb
 
-PUBLISHED_KEY = "755e563b1dffd249ef552c1bb778de29"  # used only on the verify line
+PUBLISHED_KEY = "46f6abe52990556a6713141f65fed9a5"  # used only on the verify line
 CHALLENGE_PT = "6bc1bee22e409f96e93d7e117393172a"
-CHALLENGE_CT = "abe296eea2625f251ba57ed0b408272c"
+CHALLENGE_CT = "80aadc09777696c9d492a7e53b3b15b0"
 
 MUL = {1: [wb.gmul(i, 1) for i in range(256)],
        2: [wb.gmul(i, 2) for i in range(256)],
@@ -69,6 +73,8 @@ def decode_pair(tab, col, row, pair, env, sample=0):
     for b in range(256):
         d1[b] = tab.r8(off, b << 8, tag) ^ d00
     bad = 0
+    ax_n = ax_bad = 0   # entries off the row a=0 and the column b=0, which the fit
+                        # reproduces by construction and which therefore prove nothing
     if sample:
         # deterministic spread over the 65536 entries
         step = 65536 // sample
@@ -80,8 +86,12 @@ def decode_pair(tab, col, row, pair, env, sample=0):
         pred = d0[li & 255] ^ d1[li >> 8] ^ d00
         if v != pred:
             bad += 1
+        if (li & 255) and (li >> 8):
+            ax_n += 1
+            if v != pred:
+                ax_bad += 1
     n = sample if sample else 65536
-    return d0, d1, n, bad, len(set(d0)) == 256, len(set(d1)) == 256
+    return d0, d1, n, bad, ax_n, ax_bad, len(set(d0)) == 256, len(set(d1)) == 256
 
 
 def main(argv=None):
@@ -117,31 +127,45 @@ def main(argv=None):
              [wb.FAM_NAMES[s] for s in sched]))
 
     print("== 0. model ==")
-    print("   round-0 column slot: 4 lane tables (256 x 4 B) feeding 8 pair tables")
-    print("   (64K each) and 4 boundary permutation tables (256 B); key sits in the")
-    print("   lane value (S(x ^ rk0)), boundary table carries rk1.")
+    print("   round-0 column slot: 4 lane tables (256 x 4 B) feeding 8 pair-decode")
+    print("   tables (64K each) and 4 two-byte boundary tables (64K each); the key sits")
+    print("   in the lane value (S(x ^ rk0)), the boundary carries rk1.")
 
     # ---- step 1: XOR separability of the pair tables ----------------------
     print("== 1. peel step 1: is the 64K pair table opaque? ==")
     print("   pair(row,p)[a,b] = D[row][2p][a] ^ D[row][2p+1][b]  (by construction)")
     t1 = time.time()
     d = {}
-    tot = bad = perm = 0
+    tot = bad = perm = ax_n = ax_bad = 0
     for col in range(4):
         for row in range(4):
             for p in range(2):
-                d0, d1, n, b, ok0, ok1 = decode_pair(tab, col, row, p, env, a.sample)
+                d0, d1, n, b, an, ab, ok0, ok1 = decode_pair(tab, col, row, p, env, a.sample)
                 d[(col, row, p)] = (d0, d1)
                 tot += n
                 bad += b
+                ax_n += an
+                ax_bad += ab
                 perm += (ok0 and ok1)
-    print("   %d/%d pair tables decomposed; %d of %d entries reproduced exactly by two"
+    print("   %d/%d pair tables fitted; %d of %d sampled entries reproduced by two"
           % (32, 32, tot - bad, tot))
-    print("   256-byte arrays (%.2fs); recovered D is a permutation in %d/32 tables"
-          % (time.time() - t1, perm))
-    print("   -> the inverse bijections E^-1 are in the table in plain form, one XOR")
-    print("      constant away: a rank-1 tensor has only 2*256 degrees of freedom, so")
-    print("      'it only fits in a 64K table' buys nothing.")
+    print("   256-byte arrays (%.2fs), but %d of those lie on the a=0 row or the b=0"
+          % (time.time() - t1, tot - ax_n))
+    print("   column that the fit is built from. Off those, %d/%d = %.4f reproduce,"
+          % (ax_n - ax_bad, ax_n, (ax_n - ax_bad) / float(ax_n) if ax_n else 0.0))
+    print("   against 1/256 = %.4f for an unrelated table; recovered D is a permutation"
+          % (1.0 / 256.0))
+    print("   in %d/32 tables (a random 256-byte array is a permutation too, so that"
+          " means nothing)" % perm)
+    fit = (ax_n - ax_bad) / float(ax_n) if ax_n else 0.0
+    print("   -> %.4f of the off-axis entries fit, against 1/256 = %.4f expected from a"
+          " random" % (fit, 1.0 / 256.0))
+    if fit > 0.999:
+        print("      output bijection: a rank-1 tensor has 2*256 degrees of freedom, so")
+        print("      the lane inverses are handed over and the key follows from step 3.")
+    else:
+        print("      output bijection: Q is not D0[a]^D1[b], so one row plus one column")
+        print("      does not reproduce it and step 3 has no lane inverse to work with.")
 
     # ---- step 2 + 3: recover E, then the key byte ------------------------
     print("== 2/3. peel step 2/3: lane encodings back, then round-0 key bytes ==")
@@ -203,16 +227,13 @@ def main(argv=None):
         print("   incomplete (%d/16 bytes): round 0 did not yield the key" % len(rec))
         return 1
     print("== what this means for the design claim ==")
-    print("   AFFINE-ROUNDS.md sec. 8 argued that a 256-entry table cannot hold the")
-    print("   inverse of a lane bijection, so reading one row of one table returns")
-    print("   nothing. That is true and measured (each lane row is a 256-element")
-    print("   bijection image: any of the 256 key bytes fits it). What the argument")
-    print("   missed is that the 64K table *does* contain the inverse, in XOR-separated")
-    print("   form: Q[a][b] = D0[a] ^ D1[b] is recoverable from one row and one column")
-    print("   of Q. Because the mix step is XOR, an elementwise bijection on a lane is")
-    print("   not a mixing: to hide D, the inverse has to depend on a value that is not")
-    print("   itself a table entry (Chow-style cross-lane nonlinear recoding), not just")
-    print("   sit in a bigger table.")
+    print("   On dl4 these two steps were enough: Q[a][b] = D0[a]^D1[b] is a rank-1")
+    print("   tensor, one row plus one column reproduced all 2^21 entries, and round 0")
+    print("   alone gave the master key. What blocked them here is the pair table's")
+    print("   output bijection Z: the fit above reproduced 1/256 of the entries, which")
+    print("   is what an unrelated table gives, and no candidate key byte survives")
+    print("   step 3. Recovering Z together with D0,D1 from Q[a][b] = Z(D0[a]^D1[b]) is")
+    print("   the hidden-shift problem this script does not attempt.")
     return 0
 
 

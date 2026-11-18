@@ -244,13 +244,16 @@ static void fill_col_pair(uint8_t *tab, uint32_t cb, int dir, int round, int col
                            hy_tag(dir, round, col, HY_K_PAIR_L + side), word);
             }
     }
+    // The two halves meet in a 64K two-byte table: it inverts Q for each half, adds
+    // the round constant and applies the output bijection. Qi never reaches the
+    // artifact - it exists in this process only, to compute the table values.
     for (int row = 0; row < 4; row++) {
         const int dst = row + 4 * col;
         for (int a = 0; a < 256; a++)
             for (int b = 0; b < 256; b++) {
                 uint8_t mixed = (uint8_t)(Qi[row][0][a] ^ Qi[row][1][b] ^ sp.rk_after[dst]);
-                hy_store8(tab, cb + 2u * HY_U32 + (uint32_t)row * HY_U8, (uint16_t)(a | (b << 8)), env,
-                          hy_tag(dir, round, col, HY_K_PAIR_Z + row), sp.outp[dst][mixed]);
+                hy_store8(tab, cb + HY_BDY_OFF + (uint32_t)row * HY_N, (uint16_t)(a | (b << 8)), env,
+                          hy_tag(dir, round, col, HY_K_BDY_PAIR + row), sp.outp[dst][mixed]);
             }
     }
     burn(Q, sizeof(Q));
@@ -271,15 +274,20 @@ static void fill_lane_enc(LaneEnc &L) {
         for (int k = 0; k < 4; k++) rand_perm(L.e[row][k], L.d[row][k]);
 }
 
-// The tail F1/F2/F3 share: two 64K decode tables per output row (lanes k=0,1
-// and k=2,3), XOR of the two plain partial sums, then the boundary permutation.
-// key_in_quad != 0 folds the column constant into the first decode table, which
-// is how F3 keeps "no key XOR anywhere in the code".
-static void fill_col_dec(uint8_t *tab, uint32_t cb, int dir, int round, int col,
-                         int qb, int rb, uint32_t roff, const RndSpec &sp,
-                         const LaneEnc &L, int key_in_quad, uint32_t env) {
+// The tail F1/F2/F3 share: two 64K pair-decode tables per output row (lanes k=0,1
+// and lanes k=2,3), each one a random bijection Z applied to the XOR of the two
+// lane inverses, then one 64K two-byte boundary table that undoes both Z, adds the
+// column constant and applies the output bijection. Z's inverse exists only inside
+// that boundary table, so the pipeline is not XOR-separable and no standalone
+// inverse array is written. key_in_quad != 0 folds the column constant into the
+// first decode table, which is how F3 keeps "no key XOR anywhere in the code".
+static void fill_col_tail(uint8_t *tab, uint32_t cb, int dir, int round, int col,
+                          int qk, int bk, int key_in_quad, const RndSpec &sp,
+                          const LaneEnc &L, uint32_t env) {
     for (int row = 0; row < 4; row++) {
         const int dst = row + 4 * col;
+        uint8_t Z[2][256], Zi[2][256];
+        for (int p = 0; p < 2; p++) rand_perm(Z[p], Zi[p]);
         for (int p = 0; p < 2; p++) {
             const uint8_t *d0 = L.d[row][2 * p], *d1 = L.d[row][2 * p + 1];
             for (int a = 0; a < 256; a++)
@@ -288,13 +296,18 @@ static void fill_col_dec(uint8_t *tab, uint32_t cb, int dir, int round, int col,
                     if (key_in_quad && p == 0) v ^= sp.rk_after[dst];
                     hy_store8(tab, cb + HY_Q_OFF + (uint32_t)(2 * row + p) * HY_N,
                               (uint16_t)(a | (b << 8)), env,
-                              hy_tag(dir, round, col, qb + 2 * row + p), v);
+                              hy_tag(dir, round, col, qk + 2 * row + p), Z[p][v]);
                 }
         }
         const uint8_t rk = key_in_quad ? 0 : sp.rk_after[dst];
-        for (int x = 0; x < 256; x++)
-            hy_store8t(tab, cb + roff + (uint32_t)row * HY_W256, (uint8_t)x, env,
-                       hy_tag(dir, round, col, rb + row), sp.outp[dst][(uint8_t)(x ^ rk)]);
+        for (int u = 0; u < 256; u++)
+            for (int v = 0; v < 256; v++) {
+                uint8_t mixed = (uint8_t)(Zi[0][u] ^ Zi[1][v] ^ rk);
+                hy_store8(tab, cb + HY_BDY_OFF + (uint32_t)row * HY_N, (uint16_t)(u | (v << 8)), env,
+                          hy_tag(dir, round, col, bk + row), sp.outp[dst][mixed]);
+            }
+        burn(Z, sizeof(Z));
+        burn(Zi, sizeof(Zi));
     }
 }
 
@@ -322,11 +335,9 @@ static void fill_col_t32(uint8_t *tab, uint32_t cb, int dir, int round, int col,
         }
     }
     if (fam == HY_FAM_T32K)
-        fill_col_dec(tab, cb, dir, round, col, HY_K_T32K_Q, HY_K_T32K_R, HY_T32_R_OFF, sp,
-                     L, 1, env);
+        fill_col_tail(tab, cb, dir, round, col, HY_K_T32K_Q, HY_K_BDY_T32K, 1, sp, L, env);
     else
-        fill_col_dec(tab, cb, dir, round, col, HY_K_T32_Q, HY_K_T32_R, HY_T32_R_OFF, sp,
-                     L, 0, env);
+        fill_col_tail(tab, cb, dir, round, col, HY_K_T32_Q, HY_K_BDY_T32, 0, sp, L, env);
     burn(&L, sizeof(L));
 }
 
@@ -345,8 +356,99 @@ static void fill_col_t8(uint8_t *tab, uint32_t cb, int dir, int round, int col,
                            hy_tag(dir, round, col, HY_K_T8_C + k * 4 + row),
                            L.e[row][k][gmul(round_byte(sp, src, (uint8_t)enc), M[row][k])]);
     }
-    fill_col_dec(tab, cb, dir, round, col, HY_K_T8_Q, HY_K_T8_R, HY_T8_R_OFF, sp, L, 0, env);
+    fill_col_tail(tab, cb, dir, round, col, HY_K_T8_Q, HY_K_BDY_T8, 0, sp, L, env);
     burn(&L, sizeof(L));
+}
+
+// ---- the 32-bit nonlinear recoding (generator side) -------------------------
+// The generator draws the three rounds (per-byte bijection, per-byte inverse,
+// per-round constant), writes both directions' tables and burns the pair. The
+// forward direction is composed into nothing - the tables are used as they are -
+// and the inverse direction is what the round boundary applies, so no inverse of
+// the whole map is ever materialised.
+struct Spn {
+    uint8_t s[HY_SPN_ROUNDS][4][256];
+    uint8_t si[HY_SPN_ROUNDS][4][256];
+    uint8_t c[HY_SPN_ROUNDS][4];
+};
+
+static void spn_gen(Spn &S) {
+    for (uint32_t i = 0; i < HY_SPN_ROUNDS; i++)
+        for (int j = 0; j < 4; j++) {
+            rand_perm(S.s[i][j], S.si[i][j]);
+            S.c[i][j] = (uint8_t)rnd32();
+        }
+}
+
+static void spn_fill(uint8_t *tab, uint32_t cb, int dir, int round, int col,
+                     const Spn &S, uint32_t env) {
+    for (uint32_t i = 0; i < HY_SPN_ROUNDS; i++)
+        for (int j = 0; j < 4; j++) {
+            const int ks = HY_K_SPN_S + (int)(i * 4u) + j;
+            const int ki = HY_K_SPN_SI + (int)(i * 4u) + j;
+            for (int v = 0; v < 256; v++) {
+                hy_store8t(tab, cb + HY_SPN_OFF + (i * 4u + (uint32_t)j) * HY_W256, (uint8_t)v, env,
+                           hy_tag(dir, round, col, ks), S.s[i][j][v]);
+                hy_store8t(tab, cb + HY_SPN_OFF + HY_SPN_SI_OFF + (i * 4u + (uint32_t)j) * HY_W256,
+                           (uint8_t)v, env, hy_tag(dir, round, col, ki), S.si[i][j][v]);
+            }
+            // Constants are read directly (not through an index), so they sit in a
+            // fixed 12-byte block of the same slot: still inside the masked blob.
+            tab[cb + HY_SPN_OFF + HY_SPN_C_OFF + i * 4u + (uint32_t)j] = S.c[i][j];
+        }
+}
+
+// MDS self-check: the matrix and its inverse, applied in turn, must be the
+// identity, and every square submatrix of the forward matrix must be nonsingular
+// (that is what "MDS" buys: a single changed input byte changes every output
+// byte). Both properties are printed by generate().
+static uint8_t gdet(const uint8_t m[4][4], int n) {
+    if (n == 1) return m[0][0];
+    uint8_t s = 0;
+    for (int j = 0; j < n; j++) {
+        if (!m[0][j]) continue;
+        uint8_t sub[4][4] = {{0}};
+        for (int i = 1; i < n; i++) {
+            int c = 0;
+            for (int k = 0; k < n; k++)
+                if (k != j) sub[i - 1][c++] = m[i][k];
+        }
+        s ^= gmul(m[0][j], gdet(sub, n - 1));
+    }
+    return s;
+}
+
+static int spn_mds_check() {
+    static const uint8_t W[4] = {1, 4, 3, 7};
+    static const uint8_t V[4] = {11, 11, 9, 8};
+    uint8_t M[4][4], Mi[4][4];
+    for (int r = 0; r < 4; r++)
+        for (int k = 0; k < 4; k++) {
+            M[r][k] = W[(k - r + 4) & 3];
+            Mi[r][k] = V[(k - r + 4) & 3];
+        }
+    for (int r = 0; r < 4; r++)
+        for (int k = 0; k < 4; k++) {
+            uint8_t a = 0;
+            for (int t = 0; t < 4; t++) a ^= gmul(M[r][t], Mi[t][k]);
+            if (a != (uint8_t)(r == k)) return 0;
+        }
+    for (int n = 1; n <= 4; n++)
+        for (int rows = 0; rows < 16; rows++)
+            for (int cols = 0; cols < 16; cols++) {
+                int nr = 0, nc = 0;
+                uint8_t sub[4][4] = {{0}};
+                for (int i = 0; i < 4; i++) {
+                    if (!(rows & (1 << i))) continue;
+                    nc = 0;
+                    for (int j = 0; j < 4; j++)
+                        if (cols & (1 << j)) sub[nr][nc++] = M[i][j];
+                    nr++;
+                }
+                if (nr != n || nc != n) continue;
+                if (gdet(sub, n) == 0) return 0;
+            }
+    return 1;
 }
 
 static void fill_round(uint8_t *tab, uint32_t base, int dir, int round, int fam,
@@ -461,6 +563,11 @@ static int generate(const char *out_path, uint32_t env, uint8_t key[16]) {
     ref_decrypt(ct, back, key);
     if (memcmp(back, wbaes_key::test_pt, 16) != 0) return 5;
 
+    // The recoding's mixing matrix must be invertible and MDS; both are structural
+    // facts, so a failure here means the constants in wbaes_hybrid.h were edited.
+    if (!spn_mds_check()) return 13;
+    printf("spn-mds: PASS (circulant (1,4,3,7) / inverse (11,11,9,8), all square minors nonzero)\n");
+
     g_ur = fopen("/dev/urandom", "rb");
     if (!g_ur) return 3;
     int seen[65536];
@@ -492,6 +599,14 @@ static int generate(const char *out_path, uint32_t env, uint8_t key[16]) {
     std::vector<uint8_t> tab(HY_TOTAL, 0);
     write_sched(tab.data(), sched_enc, sched_dec);
 
+    // Recoding parameters per (direction, round, column). Only the generator holds
+    // them; the table gets the forward and inverse S-boxes and the constants, never
+    // the inverse of the composed 32-bit map.
+    std::vector<Spn> spn((size_t)(2 * HY_MC_ROUNDS * 4));
+    auto spn_at = [&](int dir, int round, int col) -> Spn & {
+        return spn[(size_t)((dir * HY_MC_ROUNDS + round) * 4 + col)];
+    };
+
     for (int r = 0; r < 9; r++) {
         uint8_t rk_next[16];
         derive_rk(r + 1, key, rk_next);
@@ -502,7 +617,10 @@ static int generate(const char *out_path, uint32_t env, uint8_t key[16]) {
         sp.outp = (const uint8_t (*)[256])P[r];
         sp.src_kind = 1;
         sp.sbox_fwd = 1;
+        for (int col = 0; col < 4; col++) spn_gen(spn_at(0, r, col));
         fill_round(tab.data(), hy_enc_col(r, 0), 0, r, sched_enc[r], sp, env);
+        for (int col = 0; col < 4; col++)
+            spn_fill(tab.data(), hy_enc_col(r, col), 0, r, col, spn_at(0, r, col), env);
         burn16(rk_next);                   // 本轮密钥随表写入完成即焚
     }
     {
@@ -528,9 +646,14 @@ static int generate(const char *out_path, uint32_t env, uint8_t key[16]) {
         uint8_t s[16], n[16];
         for (int i = 0; i < 16; i++) s[i] = P0[i][in[i]]; // round-0 input bijection
         for (int r = 0; r < HY_MC_ROUNDS; r++) {
+            // Undo the previous round's 32-bit recoding first: the round tables are
+            // built on the plain (output-bijection) domain, exactly as hy_encrypt_once
+            // does it.
+            if (r) hy_rec_undo(tab.data(), hy_enc_col(r - 1, 0), 0, r - 1, s, env);
             hy_mc_round(tab.data(), hy_enc_col(r, 0), r, 0, 1, s, n, env);
             memcpy(s, n, 16);
         }
+        hy_rec_undo(tab.data(), hy_enc_col(HY_MC_ROUNDS - 1, 0), 0, HY_MC_ROUNDS - 1, s, env);
         hy_pair_map(tab.data(), hy_enc_final(), s, out, env, 0, 9, 1);
     };
     table_enc(wbaes_key::test_pt, ct);
@@ -575,7 +698,11 @@ static int generate(const char *out_path, uint32_t env, uint8_t key[16]) {
         sp.outp = (const uint8_t (*)[256])Mperm[step];
         sp.src_kind = 0;
         sp.sbox_fwd = 0;
+        for (int col = 0; col < 4; col++) spn_gen(spn_at(1, step, col));
         fill_round(tab.data(), hy_dec_mc(step), 1, step, sched_dec[step], sp, env);
+        for (int col = 0; col < 4; col++)
+            spn_fill(tab.data(), hy_dec_mc(step) + (uint32_t)col * HY_COL, 1, step, col,
+                     spn_at(1, step, col), env);
         burn16(folded);                    // 折叠常量随本轮表写入完成即焚
 
         uint8_t outv[16][256];
@@ -608,9 +735,12 @@ static int generate(const char *out_path, uint32_t env, uint8_t key[16]) {
         hy_pair_map(tab.data(), hy_dec_entry(), in, s, env, 1, 0, 2);
         for (int step = 0; step < HY_DEC_STEPS; step++) {
             hy_mc_round(tab.data(), hy_dec_mc(step), step, 1, 0, s, t, env);
+            hy_rec_undo(tab.data(), hy_dec_mc(step), 1, step, t, env);
             hy_pair_map(tab.data(), hy_dec_sb(step), t, n, env, 1, 20 + step, 2);
             memcpy(s, n, 16);
         }
+        // No undo here: the last pair map already returned the D[0] domain, and
+        // hy_dec_tail() expects exactly that.
         hy_pair_map(tab.data(), hy_dec_tail(), s, out, env, 1, 40, 0);
     };
 
@@ -630,6 +760,7 @@ static int generate(const char *out_path, uint32_t env, uint8_t key[16]) {
     }
     fclose(g_ur);
     g_ur = nullptr;
+    burn(spn.data(), spn.size() * sizeof(Spn)); // 编码参数用完即焚
 
     // 逐轮核验表内无轮密钥残留; 每轮扫描完立即焚毁该轮密钥
     for (int r = 0; r <= 10; r++) {

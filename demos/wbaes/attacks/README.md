@@ -1,5 +1,9 @@
 # dl4 攻击闸门：DCA 与 BGE 类剥离（实测）
 
+> **状态（2026-11-18）**：dl4 上两条攻击都**成功**（下面各节即为那次实测）。
+> 当前这一代 `wbaes_nl_*` 已改成跨 lane 非线性重编码，两条攻击在新产物上都**失败**，
+> 见文末 [dl5 一节](#dl52026-11-18同一批脚本在新一代产物上都失败)。
+
 这两个脚本是对 `WB-DESIGN-V2.md` §六 攻击表里 `E4b`（BGE 类跨轮还原）和 `E4c`（DCA）
 的落地判据。结论先说，数字都在下面各节里，全部来自本机实跑（2026-11-17，macOS arm64）。
 
@@ -191,3 +195,58 @@ cross-round algebra rounds needed: 0 -- round 0 alone is the whole key
    插桩攻击者。第 0 轮边界置换表就是这种表；把它换成 64K 表（下标是 16 位、需要两条 lane
    的值）会让逐字节反解失效，但同一批地址仍然泄漏两条 lane 的组合——只是把 8 位方程
    换成 16 位方程。真正的关法是让入口轮不存在"明文域下标"的表。
+
+## dl5（2026-11-18）：同一批脚本在新一代产物上都失败
+
+对手换成 `exported-binaries/wbaes-challenge/macos/wbaes_nl_clean`（key `46f6abe5…`，
+密文 `80aadc09…`）；`wblib.DEFAULT_BIN` 已指向它。表体积 70,090,816 B（dl5 布局）。
+
+| 攻击 | 命令 | dl5 结果 |
+|---|---|---|
+| BGE 类静态剥离 | `python3 bge_attack.py` | `incomplete (0/16 bytes)`，rc=1 |
+| DCA 地址轨迹 | `python3 dca_attack.py --traces <tr>/dl4_traces.bin` | `incomplete: 0/16 bytes`，rc=1 |
+| 经典单字节 CPA | 同上实验 A | 仍然零泄漏（16/16 槽位下标 == `P0(pt)`） |
+
+关键输出（本机实跑）：
+
+```
+== 1. peel step 1: is the 64K pair table opaque? ==
+   32/32 pair tables fitted; 9646 of 131072 sampled entries reproduced by two
+   256-byte arrays (0.19s), but 8672 of those lie on the a=0 row or the b=0
+   column that the fit is built from. Off those, 974/122400 = 0.0080 reproduce,
+   against 1/256 = 0.0039 for an unrelated table
+   -> 0.0080 of the off-axis entries fit, ... Q is not D0[a]^D1[b], so one row plus
+      one column does not reproduce it and step 3 has no lane inverse to work with.
+== result ==
+   incomplete (0/16 bytes): round 0 did not yield the key
+```
+
+```
+     tag F1  (kind 144) half 0: candidates per column [0, 0, 0, 0] -> 0/16 key bytes
+     tag F1  (kind 144) half 1: candidates per column [0, 0, 0, 0] -> 0/16 key bytes
+     tag F2  (kind 152) half 0: ... 0/16        tag F2 half 1: ... 0/16
+     tag F3  (kind 160) half 0: ... 0/16        tag F3 half 1: ... 0/16
+   what the recovered index actually is (round-0 family F1, kind 144):
+     col 0: 8 distinct pair sums, 8 index values, conflicts 0, index == pair sum on 0/8 traces
+== recovered key ==
+   incomplete: 0/16 bytes
+```
+
+“函数、0 冲突、0/8 相等”这一行是本代最关键的一条：恢复出的下标仍然是成对和的**函数**
+（所以泄漏面没消失），但它被一条**未知**随机双射 `Z` 遮住，密钥假设预测不出它的值。
+能打它的只剩“未知双射一致性”统计（约 2^12 条轨迹），本仓库未实现。
+
+### 脚本改了什么（以及为什么不算削弱）
+
+- `wblib.py`：表几何常量改成 dl5 布局（列槽 798720 B、成对解码 `Q_OFF=4096`、
+  重编码 `SPN_OFF=528384`、两字节边界 `BDY_OFF=536576`）；`mc_round()`/`encrypt()` 按
+  `hy_mc_round` 的新尾巴重写（成对解码读 2 字节下标、边界读 64K 表、每列多记 12 次重编码读
+  与 `hy_rec_undo()` 的还原读）；新增 `hy_scatter_inv()`：16 位 Feistel 逐轮反解，
+  使攻击者**仍然**能从地址精确还原 64K 表的逻辑下标（不还原就等于送对手一个借口）。
+- `dca_attack.py`：实验 B 从“1 字节下标 + MITM”改成“还原 2 字节下标 → 每个半字节各跑一遍
+  原来的 4 字节 MITM”，并把测得的结构事实打成一行；实验 A 未改。
+- `bge_attack.py`：拟合逻辑一个字没改；只把“a=0 行 / b=0 列是拟合自身构造出来的、
+  不能算复现”讲清楚，并把结论改成按实测比例分支（>0.999 才说可分解）。
+
+判定条件两边都没动：要么 16/16 字节密钥 + 复现产物密文，要么失败。难度没有降低——
+脚本现在读的是 dl5 的真实形状，仍然拿不到密钥。

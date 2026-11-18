@@ -263,3 +263,28 @@ vector-match: PASS / roundtrip: PASS
 （69,206,016 B 的 dl3 形状），与当前 `hy_seal.h` 不匹配 —— 用它重编必然
 `vector-match: FAIL`。本轮没有把它从索引里移除（未获授权），换钥请按 §3 在
 临时目录重新生成。
+
+## dl5 换钥（2026-11-18）
+
+dl5（跨 lane 非线性重编码）落地后换了一把新钥，流程与 §3 一致，只是表体积变了：
+
+```
+$ python3 rotate_key.py
+key      : 46f6abe52990556a6713141f65fed9a5
+test_pt  : 6bc1bee22e409f96e93d7e117393172a
+test_ct  : 80aadc09777696c9d492a7e53b3b15b0
+offsets  : K=[24, 24, 36, 45] C=[60, 43, 17, 33] CH=[28, 7, 13, 58]
+
+$ ./gen_hybrid hy_table.bin
+spn-mds: PASS (circulant (1,4,3,7) / inverse (11,11,9,8), all square minors nonzero)
+seal: 0x9545cc81
+table-check PASS / seal-check PASS
+wrote hy_table.bin (70090816 bytes)
+
+$ ./wbaes_nl_clean && ./wbaes_nl_max
+ciphertext: 80aadc09777696c9d492a7e53b3b15b0
+vector-match: PASS / roundtrip: PASS
+```
+
+`openssl enc -aes-128-ecb -K 46f6abe52990556a6713141f65fed9a5 -nopad` 独立复核同一密文。
+产物：`wbaes_nl_{clean,max}`，`strip -S` 后各 70,707,000 B，校验和进 `sha256.txt`。
