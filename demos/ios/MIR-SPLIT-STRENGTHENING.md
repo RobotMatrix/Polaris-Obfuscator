@@ -36,6 +36,13 @@
 > `reports/SPLIT-COMPUTED-BRANCHES.md`：跨块直接边在 demo6 上 7 → 0、可解算的
 > `adrp+add+br` 30 → 0，但**每调用耗时 +62.8%，G4 的 ≤5% 门槛没达到**，
 > 而且目标表 + key 都在产物里，能被离线解回（42/42）。建议只按 profile 转冷边。
+>
+> **S2b 已跟进**（`-mllvm -computed-branches-encoded` / `-computed-branches-cold-only`，
+> 都默认关）：目标表改成逐条掩码、key 折在 `__DATA_CONST` 的 ring 里，S2 的
+> 20 行脚本在 demo6 上从 46/46 掉到 **0/46**（找到 ring 但猜不到掩码也是 0/46），
+> 代价只多 2.8%（相对 S2）。但 **≤5% 仍然没达到**：瓶颈是"直接分支换成 load→br"
+> 本身（+62.2%），冷边档位实测零收益。判决与推荐见
+> `reports/COMPUTED-BRANCHES-ENCODED.md`。
 
 ### S3 去符号 + 单一大区间：让工具必须自己找边界
 - 做法：`-Wl,-x,-S` 去掉本地符号（导出表必须另清，见 `EXPORT-HARDENING`），

@@ -1,6 +1,7 @@
 #include "AArch64.h"
 #include "AArch64InstrInfo.h"
 #include "AArch64Subtarget.h"
+#include "MCTargetDesc/AArch64AddressingModes.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/CodeGen/LivePhysRegs.h"
 #include "llvm/CodeGen/MachineFunction.h"
@@ -18,6 +19,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <fstream>
@@ -78,6 +80,44 @@ static cl::opt<bool> ComputedBranches(
 static cl::opt<std::string> ComputedBranchesSidecar(
     "computed-branches-sidecar", cl::Hidden, cl::init(""),
     cl::desc("Append the computed-branch edge map to this file"));
+
+// ---- S2b: encoded target table -------------------------------------------
+// S2 stores `delta + key` at 4 bytes per entry and carries the key as the
+// `sub #imm` of the consuming sequence, so one linear pass gets every successor
+// back (reports/SPLIT-COMPUTED-BRANCHES.md 6: 42/42).  With this flag:
+//
+//   * the key stops being an immediate.  A per-function *ring* of two 32-bit
+//     words lives in __DATA,__const -- a different segment, tens of KB from the
+//     table -- and the mask base is folded out of it at run time
+//     (`ldr x, [ring]` then `eor x, x, x, lsr #32`, i.e. K = W0 ^ W1).  Neither
+//     stored word is K, and no instruction in the sequence carries K;
+//   * every entry gets its own mask M_i = K ^ c_i, folded into the stored word
+//     at assembly time.  The table is therefore not a delta array, two entries
+//     that point at the same block do not look alike, and the mask sequence is
+//     a seeded hash over the index (not an arithmetic progression), so it
+//     cannot be interpolated from a few decoded entries;
+//   * the sequence rebuilds M_i with `eor #c_i`.  c_i is visible in the code,
+//     which is harmless on its own: without K it says nothing about the entry.
+//
+// Table entries stay table-relative (`sym - table + M_i`), so the no-rebase /
+// slide-safe property of S2 is unchanged; the ring is plain data with no
+// fixups.  Off by default: with only -computed-branches, codegen is byte
+// identical to S2.
+static cl::opt<bool> ComputedBranchesEncoded(
+    "computed-branches-encoded", cl::Hidden, cl::init(false),
+    cl::desc("S2b: mask every table entry from a key ring in __DATA,__const"));
+
+// Cost lever for G4.  A converted edge costs a load-to-branch chain (measured
+// at 2.1 ns/edge, reports/SPLIT-COMPUTED-BRANCHES.md 7.2) and that is only
+// visible where the edge is walked per iteration; the S2 report's own reading
+// was "cost follows which edges, not how many".  "Cold" here means: neither end
+// of the edge belongs to a cycle of the CFG (a DFS back edge plus every block
+// on the path it closes).  No profile is needed, and the approximation errs
+// towards converting fewer edges, never more.
+static cl::opt<bool> ComputedBranchesColdOnly(
+    "computed-branches-cold-only", cl::Hidden, cl::init(false),
+    cl::desc("S2b: convert only edges whose two ends are outside every loop"));
+
 
 #define DEBUG_TYPE "aarch64-obfuscation"
 
@@ -161,15 +201,28 @@ public:
   // Seeded label at the function entry (linkage parity with real symbols).
   std::string emitEntrySymbol(MachineFunction &MF);
 
+  // ISel, so they cost no bytes; what they buy is the ground truth "which
+  // source function does this chunk belong to", which the binary no longer
+  // carries once several functions share one interval.
+  int scopeOf(MachineBasicBlock *MBB) const {
+  }
+
   // S2: table-driven edges (see ComputedBranches above).
   unsigned addCbEntry(MachineBasicBlock *To);
+  // S2b: table entry with an explicit `eor #c` operand (the two arms of a
+  // conditional need c_T and c_T^d, where both c_T and d are encodable).
+  unsigned addCbEntryWithC(MachineBasicBlock *To, uint32_t C);
   bool pickDeadRegs(MachineBasicBlock &MBB, MachineInstr *Before, unsigned N,
                     std::vector<MCPhysReg> &Out);
   void emitCbSeq(MachineBasicBlock &MBB, MachineBasicBlock::iterator At,
-                 MCPhysReg Base, MCPhysReg Tmp, unsigned Idx,
+                 MCPhysReg Base, MCPhysReg Tmp, MCPhysReg Mask, unsigned Idx,
                  std::vector<MachineInstr *> *FixPoint);
   bool isChunkHead(MachineBasicBlock *MBB) const;
   bool crossChunk(MachineBasicBlock *From, MachineBasicBlock *To) const;
+  // S2b: true when the edge is outside every cycle (see ColdOnly above).
+  bool cbColdEdge(MachineBasicBlock *A, MachineBasicBlock *B);
+  // S2b: does the cost/selection policy convert this edge at all?
+  bool cbWantsEdge(MachineBasicBlock *From, MachineBasicBlock *To);
   void convertComputedBranches(MachineFunction &MF);
   void emitComputedBranchTable(MachineFunction &MF);
 
@@ -179,14 +232,27 @@ private:
   std::vector<MachineBasicBlock *> ChunkBlocks;
   // S2: one target table per function, in table-index order.
   std::vector<MCSymbol *> CbTargets;
+  // S2b: per entry, the constant folded into the stored word (M_i, or 0 when
+  // the table is not encoded) and the `eor #imm` operand that rebuilds it (c_i).
+  std::vector<uint32_t> CbEntryMask;
+  std::vector<uint32_t> CbEntryC;
+  // S2b: per-function key ring (__DATA,__const) and the mask base derived from
+  // it at run time.  CbMaskKey never reaches the object.
+  uint32_t CbKeyW0 = 0, CbKeyW1 = 0, CbMaskKey = 0;
+  std::string CbRingLabel;
+
   // Layout run each block belongs to: -1 = the un-split head region, otherwise
   // the index of the chunk head that starts the run.  A "cross-chunk edge" is
   // one whose two ends have different ids -- this is the same partition the S1
   // chunk symbols describe, and it is what the split actually breaks.
   std::map<MachineBasicBlock *, int> ChunkId;
+  // Fragments inherit it through splitAt, so a chunk keeps the scope of the
+  // source function whose body it was cut from.  -1 = unattributed.
   std::string CbTableLabel;
   std::string CbRecords;
   unsigned CbConverted = 0, CbSkipped = 0, CbRefused = 0;
+  // Diagnostic: how many rewritten edges the CFG actually records.
+  unsigned CbCfgEdges = 0, CbCfgTotal = 0;
   MachineRegisterInfo *MRI = nullptr;
   const AArch64InstrInfo *TII = nullptr;
   const TargetRegisterInfo *TRI = nullptr;
@@ -457,6 +523,82 @@ bool AArch64RubbishCodePass::containsCall(MachineBasicBlock *MBB) {
   return false;
 }
 
+// ARMRC_CB_LIMIT=<n> converts at most n edges per function (0 = no limit).
+// Measurement only, like ARMRC_CB_ALL: it exists so the report can show what
+// per-call cost buys, since the cost is linear in the number of converted edges
+// that actually execute and that number cannot be known statically here.
+static unsigned cbEntryLimit() {
+  static unsigned N = [] {
+    const char *E = getenv("ARMRC_CB_LIMIT");
+    return E ? (unsigned)atoi(E) : 0u;
+  }();
+  return N;
+}
+
+// S2b: blocks that belong to a cycle of the CFG.  A DFS back edge (target still
+// on the stack) closes a cycle and every block from the target up to the source
+// is a member.  That over-approximates a natural loop -- there is no dominator
+// tree at pre-emit -- which is the safe direction for "cold only": fewer edges
+// are converted, never more.
+static void collectLoopBlocks(MachineFunction &MF,
+                              std::set<MachineBasicBlock *> &LoopBlocks) {
+  std::map<MachineBasicBlock *, unsigned> State; // 0 new, 1 on stack, 2 done
+  struct Frame {
+    MachineBasicBlock *B;
+    unsigned Next;
+  };
+  std::vector<Frame> Stack;
+  auto Push = [&](MachineBasicBlock *B) {
+    State[B] = 1;
+    Stack.push_back({B, 0});
+  };
+  Push(&MF.front());
+  while (!Stack.empty()) {
+    MachineBasicBlock *B = Stack.back().B;
+    unsigned Next = Stack.back().Next;
+    if (Next < B->succ_size()) {
+      Stack.back().Next = Next + 1;
+      MachineBasicBlock *S = *std::next(B->succ_begin(), Next);
+      auto St = State.find(S);
+      unsigned V = St == State.end() ? 0 : St->second;
+      if (V == 0) {
+        Push(S);
+      } else if (V == 1) {
+        for (auto It = Stack.rbegin(); It != Stack.rend(); ++It) {
+          LoopBlocks.insert(It->B);
+          if (It->B == S)
+            break;
+        }
+      }
+    } else {
+      State[B] = 2;
+      Stack.pop_back();
+    }
+  }
+}
+
+// Is this edge outside every cycle?  Recomputed per query because the split
+// keeps changing the CFG while it emits these edges; the cost is O(V+E) on a
+// pass that only runs with -computed-branches-cold-only.
+bool AArch64RubbishCodePass::cbColdEdge(MachineBasicBlock *A,
+                                       MachineBasicBlock *B) {
+  if (!ComputedBranchesColdOnly)
+    return true;
+  std::set<MachineBasicBlock *> LoopBlocks;
+  collectLoopBlocks(*A->getParent(), LoopBlocks);
+  return !LoopBlocks.count(A) && !LoopBlocks.count(B);
+}
+
+bool AArch64RubbishCodePass::cbWantsEdge(MachineBasicBlock *From,
+                                        MachineBasicBlock *To) {
+  if (!ComputedBranches)
+    return false;
+  unsigned Limit = cbEntryLimit();
+  if (Limit && CbTargets.size() >= Limit)
+    return false;
+  return cbColdEdge(From, To);
+}
+
 // Spill X16 with a 16-byte pre-indexed store, materialize the block address
 // in X16, and BR X16. The target block must start with emitX16Reload.
 void AArch64RubbishCodePass::emitIndirectBranch(
@@ -476,7 +618,22 @@ void AArch64RubbishCodePass::emitIndirectBranch(
             .getInstr();
     Anchors.insert(Spill);
     FixPoint.push_back(Spill);
-    emitCbSeq(From, At, AArch64::X16, AArch64::X17, addCbEntry(To), &FixPoint);
+    // S2b cost modes: a hot edge (or one past the measurement budget) keeps its
+    // displacement.  The spill stays so the target's reload still balances SP,
+    // and the branch is a plain `b` -- which is what the cost budget buys back
+    // and what the opacity budget pays for.
+    if (!cbWantsEdge(&From, To)) {
+      MachineInstr *B = BuildMI(From, At, DL, TII->get(AArch64::B))
+                            .addMBB(To)
+                            .getInstr();
+      Anchors.insert(B);
+      FixPoint.push_back(B);
+      To->setMachineBlockAddressTaken();
+      To->setLabelMustBeEmitted();
+      return;
+    }
+    emitCbSeq(From, At, AArch64::X16, AArch64::X17, AArch64::NoRegister,
+              addCbEntry(To), &FixPoint);
     To->setMachineBlockAddressTaken();
     To->setLabelMustBeEmitted();
     return;
@@ -551,6 +708,7 @@ static unsigned cbTableKey() {
   return K;
 }
 
+
 // Temp label (leading 'L' keeps it out of the nlist) for this function's table.
 static std::string makeCbTableLabel(StringRef Module, StringRef Fn) {
   static unsigned Salt = 0;
@@ -564,11 +722,77 @@ static std::string makeCbTableLabel(StringRef Module, StringRef Fn) {
   return std::string(Buf);
 }
 
+// ---- S2b: key ring and per-entry masks ------------------------------------
+
+// AArch64 logical immediates are a run of ones inside a power-of-two element,
+// replicated across the register and rotated; only such values fit in
+// `eor #imm`.  The mask itself is a full 32-bit word, so constraining this
+// operand is what keeps the stored entries random-looking.  Generated as
+// ror32(run of k ones, s) and verified, because an unencodable value is not
+// rejected by the MC layer -- it encodes to an invalid instruction.
+static uint32_t cbEncodableImm(uint64_t S) {
+  for (unsigned Tries = 0; Tries < 8; Tries++) {
+    S = mixNameHash(S, 0x4d41534bULL + Tries); // "MASK"
+    unsigned Len = 1 + (unsigned)((S >> 7) % 23);
+    unsigned Rot = (unsigned)((S >> 19) & 31);
+    uint32_t Run = Len >= 32 ? 0xffffffffu : ((1u << Len) - 1u);
+    uint32_t V = Rot ? ((Run >> Rot) | (Run << (32 - Rot))) : Run;
+    // Reject masks whose set bits are all low: c_i near 0 leaves K^c_i near K,
+    // and `entry - K` would then land next to the real target, i.e. inside
+    // __text by accident (measured: 4 of 46 entries before this guard).
+    if ((V >> 16) != 0 && AArch64_AM::isLogicalImmediate(V, 32))
+      return V;
+  }
+  return 0x01010101u;
+}
+
+// The `eor` operand for table index Idx.  Seeded from the function's ring, so
+// no two functions share a mask sequence, and the sequence cannot be continued
+// from the handful of entries somebody decoded by hand.
+static uint32_t cbEntryC(uint32_t Key, unsigned Idx) {
+  return cbEncodableImm(
+      mixNameHash(((uint64_t)Key << 32) ^ 0xc0ffeeULL, (uint64_t)Idx * 2 + 1));
+}
+
+// Per-function ring: the mask base is W0 ^ W1, and that fold happens in the
+// sequence (`eor x, x, x, lsr #32`), so neither stored word is the key and no
+// instruction carries it.  Drawn from the build seed rather than
+// nextObfRandom(), so the junk-code layout does not depend on this flag.
+static void cbPickKey(const std::string &Fn, uint32_t &W0, uint32_t &W1) {
+  uint64_t S = mixNameHash(splitNameSeed(), (uint64_t)hash_value(Fn));
+  S = mixNameHash(S, 0x53324b45594e47ULL); // "S2KEYNG"
+  W0 = (uint32_t)(S >> 13) | 1;
+  S = mixNameHash(S, 0x5232ULL);
+  W1 = (uint32_t)(S >> 29) | 1;
+  if ((W0 ^ W1) == 0)
+    W1 ^= 0x10001u;
+}
+
+// Temp label for this function's ring (leading 'L' keeps it out of the nlist).
+static std::string makeCbRingLabel(StringRef Module, StringRef Fn) {
+  static unsigned Salt = 0;
+  uint64_t H =
+      mixNameHash(splitNameSeed(), (uint64_t)(size_t)hash_value(Module));
+  H = mixNameHash(H, (uint64_t)(size_t)hash_value(Fn));
+  H = mixNameHash(H, 0x52494e47ULL + ++Salt);
+  char Buf[40];
+  snprintf(Buf, sizeof(Buf), "L__pck%012llx",
+           (unsigned long long)((H >> 16) & 0xffffffffffffULL));
+  return std::string(Buf);
+}
+
 unsigned AArch64RubbishCodePass::addCbEntry(MachineBasicBlock *To) {
+  return addCbEntryWithC(To, cbEntryC(CbMaskKey, (unsigned)CbTargets.size()));
+}
+
+unsigned AArch64RubbishCodePass::addCbEntryWithC(MachineBasicBlock *To,
+                                                 uint32_t C) {
   MCSymbol *Sym = To->getSymbol();
   To->setMachineBlockAddressTaken();
   To->setLabelMustBeEmitted();
   CbTargets.push_back(Sym);
+  CbEntryC.push_back(ComputedBranchesEncoded ? C : 0);
+  CbEntryMask.push_back(ComputedBranchesEncoded ? (CbMaskKey ^ C) : 0);
   return CbTargets.size() - 1;
 }
 
@@ -614,48 +838,150 @@ bool AArch64RubbishCodePass::pickDeadRegs(MachineBasicBlock &MBB,
 }
 
 // adrp/add <table>; ldrsw; sub #key; add base; br.  Clobbers Base and Tmp.
+//
+// S2b shape (ComputedBranchesEncoded): the entry is masked and the key is
+// folded out of the ring at run time.
+//
+//   adrp  xK, <ring>@PAGE ; ldr xK,[xK] ; eor xK,xK,xK,lsr#32   ; K = W0^W1
+//   adrp  xB, <table>@PAGE ; add xB,xB,<table>@PAGEOFF
+//   ldrsw xT, [xB, #idx]
+//   eor   wK, wK, #c_i          ; M_i = K ^ c_i
+//   sub   wT, wT, wK            ; delta
+//   add   xB, xB, wT, sxtw ; br xB
+//
+// With a third scratch register (Mask) the base survives and that is ten
+// instructions.  The split's own edges only have X16/X17 -- both are spilled as
+// a pair before the sequence -- so with Mask == NoRegister the entry is loaded
+// first and the base is re-derived at the end: twelve instructions, same two
+// registers, no extra memory traffic.
 void AArch64RubbishCodePass::emitCbSeq(MachineBasicBlock &MBB,
                                        MachineBasicBlock::iterator At,
                                        MCPhysReg Base, MCPhysReg Tmp,
-                                       unsigned Idx,
+                                       MCPhysReg Mask, unsigned Idx,
                                        std::vector<MachineInstr *> *FixPoint) {
   DebugLoc DL;
-  MCSymbol *Tbl =
-      MBB.getParent()->getMMI().getContext().getOrCreateSymbol(CbTableLabel);
+  MCContext &Ctx = MBB.getParent()->getMMI().getContext();
+  MCSymbol *Tbl = Ctx.getOrCreateSymbol(CbTableLabel);
   auto Add = [&](MachineInstr *MI) {
     Anchors.insert(MI);
     if (FixPoint)
       FixPoint->push_back(MI);
   };
-  Add(BuildMI(MBB, At, DL, TII->get(AArch64::ADRP))
-          .addReg(Base, RegState::Define)
-          .addSym(Tbl, AArch64II::MO_PAGE)
-          .getInstr());
-  Add(BuildMI(MBB, At, DL, TII->get(AArch64::ADDXri))
-          .addReg(Base, RegState::Define)
-          .addReg(Base)
-          .addSym(Tbl, static_cast<unsigned char>(AArch64II::MO_PAGEOFF |
-                                                 AArch64II::MO_NC))
-          .addImm(0)
-          .getInstr());
+  auto TableBase = [&](MCPhysReg R) {
+    Add(BuildMI(MBB, At, DL, TII->get(AArch64::ADRP))
+            .addReg(R, RegState::Define)
+            .addSym(Tbl, AArch64II::MO_PAGE)
+            .getInstr());
+    Add(BuildMI(MBB, At, DL, TII->get(AArch64::ADDXri))
+            .addReg(R, RegState::Define)
+            .addReg(R)
+            .addSym(Tbl, static_cast<unsigned char>(AArch64II::MO_PAGEOFF |
+                                                    AArch64II::MO_NC))
+            .addImm(0)
+            .getInstr());
+  };
   // The uimm12s4 operand holds the byte offset divided by 4.
-  Add(BuildMI(MBB, At, DL, TII->get(AArch64::LDRSWui))
-          .addReg(Tmp, RegState::Define)
-          .addReg(Base)
-          .addImm((int64_t)Idx)
-          .getInstr());
-  Add(BuildMI(MBB, At, DL, TII->get(AArch64::SUBXri))
+  auto LoadEntry = [&](MCPhysReg R, MCPhysReg From, unsigned I) {
+    Add(BuildMI(MBB, At, DL, TII->get(AArch64::LDRSWui))
+            .addReg(R, RegState::Define)
+            .addReg(From)
+            .addImm((int64_t)I)
+            .getInstr());
+  };
+  auto KeyFold = [&](MCPhysReg R) {
+    // K = W0 ^ W1 out of one 8-byte ring word; neither word is the key.
+    MCSymbol *Ring = Ctx.getOrCreateSymbol(CbRingLabel);
+    Add(BuildMI(MBB, At, DL, TII->get(AArch64::ADRP))
+            .addReg(R, RegState::Define)
+            .addSym(Ring, AArch64II::MO_PAGE)
+            .getInstr());
+    Add(BuildMI(MBB, At, DL, TII->get(AArch64::ADDXri))
+            .addReg(R, RegState::Define)
+            .addReg(R)
+            .addSym(Ring, static_cast<unsigned char>(AArch64II::MO_PAGEOFF |
+                                                     AArch64II::MO_NC))
+            .addImm(0)
+            .getInstr());
+    Add(BuildMI(MBB, At, DL, TII->get(AArch64::LDRXui))
+            .addReg(R, RegState::Define)
+            .addReg(R)
+            .addImm(0)
+            .getInstr());
+    Add(BuildMI(MBB, At, DL, TII->get(AArch64::EORXrs))
+            .addReg(R, RegState::Define)
+            .addReg(R)
+            .addReg(R)
+            .addImm(AArch64_AM::getShifterImm(AArch64_AM::LSR, 32))
+            .getInstr());
+  };
+  auto MaskEntry = [&](MCPhysReg R, uint32_t C) {
+    // A logical-immediate operand is carried as the 13-bit N:immr:imms
+    // encoding, not as the value; the printer decodes it back for display.
+    Add(BuildMI(MBB, At, DL, TII->get(AArch64::EORWri))
+            .addReg(R, RegState::Define)
+            .addReg(R)
+            .addImm((int64_t)AArch64_AM::encodeLogicalImmediate(C, 32))
+            .getInstr());
+  };
+
+  if (!ComputedBranchesEncoded) {
+    TableBase(Base);
+    LoadEntry(Tmp, Base, Idx);
+    Add(BuildMI(MBB, At, DL, TII->get(AArch64::SUBXri))
+            .addReg(Tmp, RegState::Define)
+            .addReg(Tmp)
+            .addImm((int64_t)cbTableKey())
+            .addImm(0)
+            .getInstr());
+    // Only the shifted-register form has an encoding; shift 0 is the plain add.
+    Add(BuildMI(MBB, At, DL, TII->get(AArch64::ADDXrs))
+            .addReg(Base, RegState::Define)
+            .addReg(Tmp)
+            .addReg(Base)
+            .addImm(0)
+            .getInstr());
+    Add(BuildMI(MBB, At, DL, TII->get(AArch64::BR)).addReg(Base).getInstr());
+    return;
+  }
+
+  uint32_t C = CbEntryC[Idx];
+  if (Mask != AArch64::NoRegister) {
+    KeyFold(Mask);
+    TableBase(Base);
+    LoadEntry(Tmp, Base, Idx);
+    MaskEntry(Mask, C);
+    Add(BuildMI(MBB, At, DL, TII->get(AArch64::SUBWrs))
+            .addReg(Tmp, RegState::Define)
+            .addReg(Tmp)
+            .addReg(Mask)
+            .addImm(0)
+            .getInstr());
+    Add(BuildMI(MBB, At, DL, TII->get(AArch64::ADDXrx))
+            .addReg(Base, RegState::Define)
+            .addReg(Base)
+            .addReg(Tmp)
+            .addImm(AArch64_AM::getArithExtendImm(AArch64_AM::SXTW, 0))
+            .getInstr());
+    Add(BuildMI(MBB, At, DL, TII->get(AArch64::BR)).addReg(Base).getInstr());
+    return;
+  }
+  // Two scratch registers: entry first, then the key, then the base again.
+  TableBase(Base);
+  LoadEntry(Tmp, Base, Idx);
+  KeyFold(Base);
+  MaskEntry(Base, C);
+  Add(BuildMI(MBB, At, DL, TII->get(AArch64::SUBWrs))
           .addReg(Tmp, RegState::Define)
           .addReg(Tmp)
-          .addImm((int64_t)cbTableKey())
+          .addReg(Base)
           .addImm(0)
           .getInstr());
-  // Only the shifted-register form has an encoding; shift 0 is the plain add.
-  Add(BuildMI(MBB, At, DL, TII->get(AArch64::ADDXrs))
+  TableBase(Base);
+  Add(BuildMI(MBB, At, DL, TII->get(AArch64::ADDXrx))
           .addReg(Base, RegState::Define)
-          .addReg(Tmp)
           .addReg(Base)
-          .addImm(0)
+          .addReg(Tmp)
+          .addImm(AArch64_AM::getArithExtendImm(AArch64_AM::SXTW, 0))
           .getInstr());
   Add(BuildMI(MBB, At, DL, TII->get(AArch64::BR)).addReg(Base).getInstr());
 }
@@ -666,6 +992,7 @@ static bool cbAllEdges() {
   static bool All = getenv("ARMRC_CB_ALL") != nullptr;
   return All;
 }
+
 
 // Rewrite the selected edges of one function.  Selection: an edge whose target
 // is a split chunk head (i.e. an edge that crosses the split), never into the
@@ -698,7 +1025,32 @@ void AArch64RubbishCodePass::convertComputedBranches(MachineFunction &MF) {
     return Opc == AArch64::LDRXpost || Opc == AArch64::LDPXpost;
   };
 
+  // S2b cost lever: loop membership, so that -computed-branches-cold-only can
+  // leave the edges a hot path walks alone (collectLoopBlocks above).
+  std::set<MachineBasicBlock *> LoopBlocks;
+  if (ComputedBranchesColdOnly)
+    collectLoopBlocks(MF, LoopBlocks);
+  // Diagnostic for the report: how many of the edges this pass rewrites are
+  // actually recorded in the CFG?  The split moves blocks and edits successor
+  // lists by hand, so a cycle cannot be found through an edge that is not
+  // there -- which is why the static "cold" test is weak (see the S2b report).
+  auto NoteCfg = [&](MachineBasicBlock &A, MachineBasicBlock *B) {
+    ++CbCfgTotal;
+    if (A.isSuccessor(B))
+      ++CbCfgEdges;
+  };
+  auto IsCold = [&](MachineBasicBlock *A, MachineBasicBlock *B) {
+    if (!ComputedBranchesColdOnly)
+      return true;
+    return !LoopBlocks.count(A) && !LoopBlocks.count(B);
+  };
+
   for (MachineBasicBlock &MBB : MF) {
+    if (cbEntryLimit() && CbTargets.size() >= cbEntryLimit()) {
+      CbRecords += "limit\t" + FnName + "\t" +
+                   std::to_string(CbTargets.size()) + "\n";
+      break;
+    }
     MachineBasicBlock::iterator TermIt = MBB.getFirstTerminator();
     if (TermIt == MBB.end())
       continue;
@@ -748,17 +1100,26 @@ void AArch64RubbishCodePass::convertComputedBranches(MachineFunction &MF) {
         Refuse(MBB, To, "sp-reload-target");
         continue;
       }
+      if (!IsCold(&MBB, To)) {
+        Refuse(MBB, To, "hot");
+        continue;
+      }
       std::vector<MCPhysReg> R;
-      if (!pickDeadRegs(MBB, Term, 2, R)) {
+      // S2b needs a third scratch register: base, key/mask and entry are alive
+      // at the same time.
+      if (!pickDeadRegs(MBB, Term, ComputedBranchesEncoded ? 3 : 2, R)) {
         ++CbSkipped;
         CbRecords += "skip\t" + FnName + "\tregs\t" +
                      std::to_string(MBB.getNumber()) + "\t" +
                      std::to_string(To->getNumber()) + "\n";
         continue;
       }
+      NoteCfg(MBB, To);
       unsigned Idx = addCbEntry(To);
       Term->eraseFromParent();
-      emitCbSeq(MBB, MBB.end(), R[0], R[1], Idx, nullptr);
+      emitCbSeq(MBB, MBB.end(), R[0], R[1],
+                ComputedBranchesEncoded ? R[2] : AArch64::NoRegister, Idx,
+                nullptr);
       ++CbConverted;
       CbRecords += "cb\t" + FnName + "\tb\t" + std::to_string(MBB.getNumber()) +
                    "\t" + std::to_string(To->getNumber()) + "\t" +
@@ -848,6 +1209,10 @@ void AArch64RubbishCodePass::convertComputedBranches(MachineFunction &MF) {
       Refuse(MBB, Taken, "sp-reload-target");
       continue;
     }
+    if (!IsCold(&MBB, Taken) || !IsCold(&MBB, Fall)) {
+      Refuse(MBB, Taken, "hot");
+      continue;
+    }
     std::vector<MCPhysReg> R;
     if (!pickDeadRegs(MBB, Term, 3, R)) {
       ++CbSkipped;
@@ -856,8 +1221,25 @@ void AArch64RubbishCodePass::convertComputedBranches(MachineFunction &MF) {
                    std::to_string(Taken->getNumber()) + "\n";
       continue;
     }
-    unsigned IdxT = addCbEntry(Taken);
-    unsigned IdxF = addCbEntry(Fall);
+    // S2b: the fall arm's mask is reached by xoring one more encodable
+    // constant onto the taken arm's mask, so the pair needs no fourth register.
+    uint32_t CT = 0, CD = 0;
+    unsigned IdxT, IdxF;
+    if (ComputedBranchesEncoded) {
+      CT = cbEntryC(CbMaskKey, (unsigned)CbTargets.size());
+      CD = cbEncodableImm(
+          mixNameHash(((uint64_t)CbMaskKey << 32) ^ 0xf00dULL,
+                      (uint64_t)CbTargets.size() * 4 + 3));
+      if (CD == 0)
+        CD = 0x01010101u;
+      IdxT = addCbEntryWithC(Taken, CT);
+      IdxF = addCbEntryWithC(Fall, CT ^ CD);
+    } else {
+      IdxT = addCbEntry(Taken);
+      IdxF = addCbEntry(Fall);
+    }
+    NoteCfg(MBB, Taken);
+    NoteCfg(MBB, Fall);
     DebugLoc DL = Term->getDebugLoc();
     if (CCOp) {
       if (IsTest)
@@ -872,6 +1254,110 @@ void AArch64RubbishCodePass::convertComputedBranches(MachineFunction &MF) {
             .addReg(TestReg)
             .addImm(0)
             .addImm(0);
+    }
+    // S2b: both arms masked, one key fold, one extra `eor` for the fall arm.
+    // Sixteen instructions on the same three registers (the base is re-derived
+    // because the ring load needs the register that held it).
+    if (ComputedBranchesEncoded) {
+      MCSymbol *Tbl = MF.getMMI().getContext().getOrCreateSymbol(CbTableLabel);
+      MCSymbol *Ring = MF.getMMI().getContext().getOrCreateSymbol(CbRingLabel);
+      MCPhysReg Base = R[0], Tmp = R[1], Aux = R[2];
+      auto Add = [&](MachineInstr *MI) { Anchors.insert(MI); };
+      auto TableBase = [&]() {
+        Add(BuildMI(MBB, TermIt, DL, TII->get(AArch64::ADRP))
+                .addReg(Base, RegState::Define)
+                .addSym(Tbl, AArch64II::MO_PAGE)
+                .getInstr());
+        Add(BuildMI(MBB, TermIt, DL, TII->get(AArch64::ADDXri))
+                .addReg(Base, RegState::Define)
+                .addReg(Base)
+                .addSym(Tbl, static_cast<unsigned char>(AArch64II::MO_PAGEOFF |
+                                                        AArch64II::MO_NC))
+                .addImm(0)
+                .getInstr());
+      };
+      TableBase();
+      Add(BuildMI(MBB, TermIt, DL, TII->get(AArch64::LDRSWui))
+              .addReg(Tmp, RegState::Define)
+              .addReg(Base)
+              .addImm((int64_t)IdxT)
+              .getInstr());
+      Add(BuildMI(MBB, TermIt, DL, TII->get(AArch64::LDRSWui))
+              .addReg(Aux, RegState::Define)
+              .addReg(Base)
+              .addImm((int64_t)IdxF)
+              .getInstr());
+      Add(BuildMI(MBB, TermIt, DL, TII->get(AArch64::ADRP))
+              .addReg(Base, RegState::Define)
+              .addSym(Ring, AArch64II::MO_PAGE)
+              .getInstr());
+      Add(BuildMI(MBB, TermIt, DL, TII->get(AArch64::ADDXri))
+              .addReg(Base, RegState::Define)
+              .addReg(Base)
+              .addSym(Ring, static_cast<unsigned char>(AArch64II::MO_PAGEOFF |
+                                                       AArch64II::MO_NC))
+              .addImm(0)
+              .getInstr());
+      Add(BuildMI(MBB, TermIt, DL, TII->get(AArch64::LDRXui))
+              .addReg(Base, RegState::Define)
+              .addReg(Base)
+              .addImm(0)
+              .getInstr());
+      Add(BuildMI(MBB, TermIt, DL, TII->get(AArch64::EORXrs))
+              .addReg(Base, RegState::Define)
+              .addReg(Base)
+              .addReg(Base)
+              .addImm(AArch64_AM::getShifterImm(AArch64_AM::LSR, 32))
+              .getInstr());
+      Add(BuildMI(MBB, TermIt, DL, TII->get(AArch64::EORWri))
+              .addReg(Base, RegState::Define)
+              .addReg(Base)
+              .addImm((int64_t)AArch64_AM::encodeLogicalImmediate(CT, 32))
+              .getInstr());
+      Add(BuildMI(MBB, TermIt, DL, TII->get(AArch64::SUBWrs))
+              .addReg(Tmp, RegState::Define)
+              .addReg(Tmp)
+              .addReg(Base)
+              .addImm(0)
+              .getInstr());
+      Add(BuildMI(MBB, TermIt, DL, TII->get(AArch64::EORWri))
+              .addReg(Base, RegState::Define)
+              .addReg(Base)
+              .addImm((int64_t)AArch64_AM::encodeLogicalImmediate(CD, 32))
+              .getInstr());
+      Add(BuildMI(MBB, TermIt, DL, TII->get(AArch64::SUBWrs))
+              .addReg(Aux, RegState::Define)
+              .addReg(Aux)
+              .addReg(Base)
+              .addImm(0)
+              .getInstr());
+      Add(BuildMI(MBB, TermIt, DL, TII->get(AArch64::CSELWr))
+              .addReg(Tmp, RegState::Define)
+              .addReg(Tmp)
+              .addReg(Aux)
+              .addImm((int64_t)Cond)
+              .getInstr());
+      TableBase();
+      Add(BuildMI(MBB, TermIt, DL, TII->get(AArch64::ADDXrx))
+              .addReg(Base, RegState::Define)
+              .addReg(Base)
+              .addReg(Tmp)
+              .addImm(AArch64_AM::getArithExtendImm(AArch64_AM::SXTW, 0))
+              .getInstr());
+      Add(BuildMI(MBB, TermIt, DL, TII->get(AArch64::BR))
+              .addReg(Base)
+              .getInstr());
+      Term->eraseFromParent();
+      ++CbConverted;
+      CbRecords += "cb\t" + FnName + "\tcond\t" +
+                   std::to_string(MBB.getNumber()) + "\t" +
+                   std::to_string(Taken->getNumber()) + "\t" +
+                   std::to_string(IdxT) + "\n";
+      CbRecords += "cb\t" + FnName + "\tcond-fall\t" +
+                   std::to_string(MBB.getNumber()) + "\t" +
+                   std::to_string(Fall->getNumber()) + "\t" +
+                   std::to_string(IdxF) + "\n";
+      continue;
     }
     // Both arms become data: two loads, one csel, one br.
     MCSymbol *Tbl = MF.getMMI().getContext().getOrCreateSymbol(CbTableLabel);
@@ -954,11 +1440,24 @@ void AArch64RubbishCodePass::emitComputedBranchTable(MachineFunction &MF) {
     return;
   }
   unsigned Key = cbTableKey();
-  std::string S = ".section __TEXT,__const\n.p2align 2\n";
+  std::string S;
+  if (ComputedBranchesEncoded) {
+    // The ring goes in a different segment, so nothing about the key is
+    // adjacent to the table: two words, and the mask base is their xor, which
+    // only the consuming sequence computes.
+    S += ".section __DATA,__const\n.p2align 3\n";
+    S += CbRingLabel + ":\n";
+    S += ".long " + std::to_string((unsigned long)CbKeyW0) + "\n";
+    S += ".long " + std::to_string((unsigned long)CbKeyW1) + "\n";
+  }
+  S += ".section __TEXT,__const\n.p2align 2\n";
   S += CbTableLabel + ":\n";
-  for (MCSymbol *T : CbTargets) {
-    S += ".long " + T->getName().str() + " - " + CbTableLabel + " + " +
-         std::to_string(Key) + "\n";
+  for (unsigned i = 0; i < CbTargets.size(); i++) {
+    // S2b: `+ M_i` with a per-entry mask instead of `+ key`; the entry is not a
+    // delta even after the ring is found.
+    uint32_t Addend = ComputedBranchesEncoded ? CbEntryMask[i] : Key;
+    S += ".long " + CbTargets[i]->getName().str() + " - " + CbTableLabel +
+         " + " + std::to_string((unsigned long)Addend) + "\n";
   }
   S += ".section __TEXT,__text,regular,pure_instructions\n";
   char *Persist = new char[S.size() + 1];
@@ -1586,10 +2085,14 @@ static void appendSplitSidecar(const std::string &Records) {
 }
 
 // Per-function record for the measurement, appended like the S1 sidecar.
+// `Ring` is "<label> <W0> <W1>" in encoded mode (empty otherwise): the mask base
+// is W0^W1, which the sidecar spells out only because a sidecar is build-time
+// debug data and never ships.
 static void appendComputedBranchSidecar(const std::string &Fn, unsigned Conv,
                                         unsigned Skip, unsigned Refused,
                                         unsigned Entries,
                                         const std::string &Table,
+                                        const std::string &Ring,
                                         const std::string &Records) {
   if (ComputedBranchesSidecar.empty())
     return;
@@ -1607,7 +2110,10 @@ static void appendComputedBranchSidecar(const std::string &Fn, unsigned Conv,
   }
   Ofs << "fn\t" << Fn << "\tconv\t" << Conv << "\tskipped\t" << Skip
       << "\trefused\t" << Refused << "\tentries\t" << Entries << "\ttable\t"
-      << Table << "\n";
+      << Table;
+  if (!Ring.empty())
+    Ofs << "\tring\t" << Ring;
+  Ofs << "\n";
   Ofs << Records;
 }
 
@@ -1665,7 +2171,8 @@ void AArch64RubbishCodePass::emitChunkSymbols(MachineFunction &MF) {
     if (!emitLinkageParityLabel(MBB, Sym, /*NoDeadStrip=*/true, TII))
       continue;
     Records += "chunk\t" + FnName + "\t" + std::to_string(Idx) + "\t" + Sym +
-               "\t" + std::to_string(MBB->getNumber()) + "\n";
+               "\t" + std::to_string(MBB->getNumber()) + "\t" +
+               std::to_string(scopeOf(MBB)) + "\n";
     ++Idx;
   }
   if (Idx == 0)
@@ -1679,10 +2186,20 @@ void AArch64RubbishCodePass::emitChunkSymbols(MachineFunction &MF) {
 void AArch64RubbishCodePass::process(MachineFunction &MF, ObfuscateOption &OO) {
   // S2: the table label has to exist before the split emits its own edges
   // (emitIndirectBranch adds entries while obfuscateControlFlow runs).
-  if (ComputedBranches)
+  if (ComputedBranches) {
     CbTableLabel = makeCbTableLabel(
         MF.getFunction().getParent()->getModuleIdentifier(),
         MF.getFunction().getName().str());
+    // S2b: the ring and the mask base have to exist before the first entry is
+    // added, because the entry's stored mask is derived from them.
+    if (ComputedBranchesEncoded) {
+      CbRingLabel = makeCbRingLabel(
+          MF.getFunction().getParent()->getModuleIdentifier(),
+          MF.getFunction().getName().str());
+      cbPickKey(MF.getFunction().getName().str(), CbKeyW0, CbKeyW1);
+      CbMaskKey = CbKeyW0 ^ CbKeyW1;
+    }
+  }
   obfuscateControlFlow(MF);
   if (ComputedBranches)
     convertComputedBranches(MF);
@@ -1697,13 +2214,19 @@ void AArch64RubbishCodePass::process(MachineFunction &MF, ObfuscateOption &OO) {
     MBB.setLabelMustBeEmitted();
   }
   if (ComputedBranches) {
+    std::string Ring;
+    if (ComputedBranchesEncoded && !CbRingLabel.empty())
+      Ring = CbRingLabel + " " + std::to_string((unsigned long)CbKeyW0) + " " +
+             std::to_string((unsigned long)CbKeyW1);
     appendComputedBranchSidecar(MF.getFunction().getName().str(), CbConverted,
                                 CbSkipped, CbRefused, CbTargets.size(),
-                                CbTableLabel, CbRecords);
+                                CbTableLabel, Ring, CbRecords);
     if (getenv("ARMRC_DEBUG"))
       errs() << "[computed-branches] " << MF.getFunction().getName()
              << " conv=" << CbConverted << " skipped=" << CbSkipped
-             << " refused=" << CbRefused << "\n";
+             << " refused=" << CbRefused << " entries=" << CbTargets.size()
+             << " cfg-edge-recorded=" << CbCfgEdges << "/" << CbCfgTotal
+             << "\n";
   }
 }
 
@@ -1738,13 +2261,19 @@ bool AArch64RubbishCodePass::runOnMachineFunction(MachineFunction &MF) {
   MergedMBBs.clear();
   ChunkBlocks.clear();
   CbTargets.clear();
+  CbEntryMask.clear();
+  CbEntryC.clear();
+  CbRingLabel.clear();
+  CbKeyW0 = CbKeyW1 = CbMaskKey = 0;
   ChunkId.clear();
   CbTableLabel.clear();
   CbRecords.clear();
   CbConverted = CbSkipped = CbRefused = 0;
+  CbCfgEdges = CbCfgTotal = 0;
   MRI = &MF.getRegInfo();
   TII = MF.getSubtarget<AArch64Subtarget>().getInstrInfo();
   TRI = MF.getSubtarget().getRegisterInfo();
+
 
   ObfuscateOption OO;
   Anchors.clear();

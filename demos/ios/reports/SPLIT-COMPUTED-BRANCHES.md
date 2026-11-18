@@ -1,5 +1,12 @@
 # S2 落地：跨块边沿改成表驱动的计算分支（computed-branches）
 
+> **后续：S2b 已把这张表加密**（`-mllvm -computed-branches-encoded`，默认关）。
+> 本文 §6 记录的"表 + key 都在产物里、20 行脚本 42/42"这一条已经不再成立：
+> 表项改成逐条掩码（`delta + K ^ c_i`），key 折在另一个段的 ring 里，本文的解码器
+> 在 demo6 上解回 **0/46**，wbaes 3,016 → 0。代价是相对本文 +2.8% 的每调用耗时、
+> wbaes 上 +8.9% 的边没转（寄存器不够）；**≤5% 的门槛仍然没达到**，判决见
+> `reports/COMPUTED-BRANCHES-ENCODED.md`。下文保留 S2 当时的原始数字，作为对照。
+
 > 状态：**已实现并入树**。机制在 `AArch64RubbishCode`（MIR, pre-emit 最后一站），
 > 开关 `-mllvm -computed-branches`，**默认关**；不做任何链接后修补。
 > 所有数字来自本机实跑（macOS 27.3 / arm64，本仓 clang 16.0.6），复现命令见 §12。
