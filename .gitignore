@@ -27,3 +27,16 @@ exported-binaries/wbaes-challenge/macos/wbaes_f4_max
 demos/wbaes/hy_table.bin
 demos/wbaes/hy_in.h
 demos/wbaes/hy_seal.h
+
+# build trees and exported artifacts (never commit these)
+src/build/
+demos/ios/out/
+exported-binaries/example1/
+exported-binaries/example2/
+exported-binaries/example3/
+exported-binaries/mac-native/
+exported-binaries/x86_64-linux/
+exported-binaries/ida-compare-pair/*
+!exported-binaries/ida-compare-pair/README.md
+!exported-binaries/ida-compare-pair/UnityWBAES.cs
+!exported-binaries/ida-compare-pair/f5_allpass.c
