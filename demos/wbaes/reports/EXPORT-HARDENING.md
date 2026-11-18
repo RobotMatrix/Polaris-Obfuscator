@@ -13,7 +13,8 @@ Everything below is measured on this host (arm64, 10 CPUs, `pagesize=16384`,
 > table back byte-for-byte and reports `tables_reenencoded: 0`. Steps 2 and 3
 > (known-answer replacement, Mach-O rename) are unaffected. The numbers below are
 > the dl5/vm2 run and stay valid for that artifact; they say nothing about F4,
-> whose key falls at 4,096 affine-consistency tests (README §5.29).
+> whose key falls at 4,096 affine-consistency tests (README §5.29). **§9 is the
+> F4 run, measured separately on 2026-11-18.**
 
 ---
 
@@ -265,3 +266,106 @@ obfuscating the MDS in code (needs `wbaes_hybrid.h`, owned elsewhere, and code
 obfuscation is the CFF/BCF reports' subject), and any attempt to make the tables
 stop being AES (that would change the ciphertext, which is the one thing this
 task must not do).
+
+---
+
+## 9. The F4 generation (measured 2026-11-18, the shape that actually ships)
+
+Everything in §1–§8 above was measured on the dl5/vm2 artifact and stays labelled
+as such. This section is the same pass re-run on the F4 sources, and it replaces
+no earlier number.
+
+Target: `demos/wbaes` current tree (key `3acb79e72c06bebbbdcda86dc62f009b`, KAT
+`6bc1bee2…172a` → `2c0b8f87b6aa8d4a8c7b12d8d2227c8d`, table 70,090,816 B,
+sha256 `d5c57b33…91e269`).
+
+```bash
+cd demos/wbaes
+python3 tools/harden_export.py --src . --out /tmp/wbaes-f4-hard \
+        --seed polaris-f4-export-2026-11-18 --probe --vmtest --m1
+# 4.89 s wall, exit 0
+```
+
+### 9.1 What each step did to this generation
+
+| step | result on F4 | why |
+|---|---|---|
+| table scrub (`hy_scrub`) | **nothing**: `tables_reenencoded: 0`, `bytes_changed: 0` | the F4 column front is four 2^16×16-bit pair tables; there is no 256-entry S-box-shaped lane table to pre-compose. `hy_table.bin` out is byte-identical to `hy_table.bin` in (both `d5c57b33…`), so the seal constants did not move either |
+| self-check vector (`hy_kat.h`) | NIST plaintext/ciphertext and the five printf strings gone; seed `0x4428bb0b`, plaintext derived at run time, `FNV-1a-64(ct) = 0xaec4da0d308d2fdd` | the hash was computed from real AES-128 at export time |
+| Mach-O scrub | 2 sections renamed (`__hytab` → `__rpw3sxyhfp`, `__hsvm` → `__r77nbreolp`), 16 symbols renamed from the seed, locals dropped, ad-hoc re-sign | post-link, so `@hsvm_*` was already resolved to addresses |
+
+`nm -a` on the result: 16 defined symbols, none matching
+`aes|wbaes|hsvm|hytab|sbox|mixcol|rcon|test_pt|test_ct`. The VM is still there and
+still wired: `_hsvm_entry` (0x100003284) → `_mrtisyvda7`, `_hsvm_table` →
+`_r2wqkkzdie`, `_hsvm_bytecode` → `_nqs7izwuif`, and the lowered entry is 206
+instructions with **0** indirect branches.
+
+### 9.2 M1: 100 → 0
+
+| artifact | S1 | S2 | S3 | S4 | S5 | S6 | S7 | total |
+|---|---|---|---|---|---|---|---|---|
+| `wbaes_f4_clean` (debug build, in `exported-binaries/…/macos/`) | 60 | 30 | 15 | 0 | 40 | 0 | 10 | **155** |
+| `wbaes_f4_max` (shipped, in `redteam-2026-11/`) | 60 | 30 | 0 | 0 | 0 | 0 | 10 | **100** |
+| `wbaes_f4_hard` (this run) | 0 | 0 | 0 | 0 | 0 | 0 | 0 | **0** |
+
+`wbaes_f4_max` already had no debug strings and no stored vector, which is why its
+baseline is 100 and not 155; the whole of what is left for this pass to remove is
+the 15 symbol tells, the 2 section names and the `hy_seal` metadata string. S6 is
+0 in all three (1,744 permutation windows in the table, none 4-uniform) — the F4
+pair tables are not S-box rows, so §3's point holds a fortiori.
+
+### 9.3 The function is unchanged, checked five ways
+
+| check | value |
+|---|---|
+| NIST ciphertext, hardened probe (`=6bc1bee2…172a`) | `2c0b8f87b6aa8d4a8c7b12d8d2227c8d` |
+| the same plaintext, `openssl enc -aes-128-ecb -K 3acb…` | `2c0b8f87b6aa8d4a8c7b12d8d2227c8d` |
+| the same plaintext, unhardened `wbaes_f4_max` | `2c0b8f87b6aa8d4a8c7b12d8d2227c8d` |
+| build-seed vector `3a1d7226…8e9c`, hardened probe | `836855128d9a7afb5ea8dfd0ef09282b` |
+| the same vector computed by AES-128 outside the artifact (openssl) | `836855128d9a7afb5ea8dfd0ef09282b` |
+| roundtrip | `check: ok` (the KAT compares `decrypt(ct)` with `pt`) |
+| VM negative test | intact `83685512…` → damaged `5aabe85a…` → restored `83685512…`, **PASS** |
+| `tools/hy_selftest` (orig vs hardened table) | 18/18 rounds identical, `all rounds identical` |
+
+### 9.4 Cost: the attacker's, not the runtime's
+
+File size 70,707,184 → **70,296,208 B** (−410,976 B, −0.58 %), all of it metadata
+(`LC_SYMTAB` + the smaller code directory). No code or data byte moved — the
+table section is still 70,090,816 B and byte-identical.
+
+`attacks/residual/w16_extract.py`, same host, same table, cold = no unmasked-table
+cache, warm = `--cache` hit:
+
+| | `wbaes_f4_max` | `wbaes_f4_hard` |
+|---|---|---|
+| extractor as committed | key `3acb79e7…`, **15.62 s** cold / 0.23 s warm | **fails**: `no __hytab section`, **0.04 s** |
+| with `find_section` picking the 70 MB section by size | n/a | key `3acb79e7…`, **15.27 s** cold / 0.23 s warm |
+
+Decomposition on the same runs (`wb.find_section` timed separately):
+
+| phase | unhardened | hardened |
+|---|---|---|
+| read binary + find the 16×256 input bijection in `__const` | 0.022 s | 0.022 s |
+| locate the mask seed (16-byte windows of `__const`, schedule checksum) | 0.073 s (51 candidates) | 0.024 s (13 candidates) |
+| unmask 70 MB in Python | 15.045 s | 15.456 s |
+| the 8,192 affine-consistency tests + voting | 0.19 s | 0.20 s |
+
+So: **the rename buys one loader exception, worth 0.04 s of machine time and one
+line of Python; the seed search is not the cost either (0.07 s vs 0.02 s, both
+noise against a 15 s unmask); and the algebra is 0.2 s of a 15.5 s run.** The
+de-symbolised artifact is not more expensive to break, it is only more expensive
+to *start* breaking. Note also that the extractor found the same mask seed in both
+binaries — the seed lives in `__const`, which this pass does not touch, because
+renaming it would mean touching code.
+
+### 9.5 What this generation does not get from the pass
+
+§7 applies unchanged. In addition, for F4 specifically:
+
+1. the table scrub is a no-op, so the "two builds share no table rows" benefit
+   claimed in §3 for F1/F2/F3 does not exist here — two F4 builds from the same
+   `hy_table.bin` embed the same table;
+2. the 2^16 pair tables are exactly XOR-separable (README §5.29), and nothing in
+   a metadata pass changes that;
+3. the artifact still prints `check: ok`, so it still tells you it passed its own
+   test — it just no longer tells you the answer.

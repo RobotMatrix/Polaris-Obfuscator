@@ -635,3 +635,50 @@ dl5 的 `Z`（成对解码表的输出双射）在 F4 里不存在，因为 16 �
 r8/c8；把步长退回上一代的 `k*1024`，只有 `k=0`（两种步长地址相同）仍是 8 维，`k=1..3`
 落进表 0 内部、跨度全 16 维。两次 256 项读即可分辨，任何“0/16”结论前先跑这一步——
 忘了 `+k*HY_W16_TAB` 的唯一症状就是这个 16 维。
+
+## 十七、去符号化（export hardening）在 F4 上的实测：只藏名字，不藏代数（2026-11-18）
+
+上一代（dl5/vm2）的 hardened 数字在 `reports/EXPORT-HARDENING.md` §1–§8，本节是同一套流程
+在**当前出货形状（F4）**上重跑的结果，不覆盖也不修改上面任何旧数字。
+
+```bash
+$ cd demos/wbaes
+$ python3 tools/harden_export.py --src . --out /tmp/wbaes-f4-hard \
+        --seed polaris-f4-export-2026-11-18 --probe --vmtest --m1
+# exit 0，4.89 s；产物 /tmp/wbaes-f4-hard/wbaes_hard（70,296,208 B）
+```
+
+三步在 F4 上各自做了什么：
+
+| 步骤 | F4 上的结果 |
+|---|---|
+| 表 scrub（`hy_scrub`） | **零作用**：`tables_reenencoded: 0`、`bytes_changed: 0`。F4 的列前是四张 2^16×16 位 pair 表，没有 256 项 S-box 形状的 lane 表可选；`hy_table.bin` 进出一致（都是 `d5c57b33…`），封印常量因此也没动 |
+| 自检向量 | NIST 明/密文字节与 5 条 printf 串消失；改为 seed `0x4428bb0b` 派生明文 + `FNV-1a-64(ct)=0xaec4da0d308d2fdd`，通过时只打 `check: ok` |
+| Mach-O | `__hytab`→`__rpw3sxyhfp`、`__hsvm`→`__r77nbreolp`，16 个符号按 seed 改名（`_hsvm_entry`→`_mrtisyvda7`，`_hsvm_table`→`_r2wqkkzdie`），本地/调试符号删除，ad-hoc 重签 |
+
+验证（全部本机实测）：密文 `2c0b8f87b6aa8d4a8c7b12d8d2227c8d` 与 `openssl`、与
+`wbaes_f4_max` 三方一致；seed 向量 `3a1d7226…` → `836855128d9a7afb5ea8dfd0ef09282b`
+与产物外 AES 一致；roundtrip 通过；VM 调度块翻字节 `83685512…`→`5aabe85a…`→`83685512…`
+（PASS，说明改名后的 `__hsvm` 仍喂着降级代码）；`hy_selftest` 18/18 轮一致；降级入口 206
+条指令、**0** 条间接跳转。
+
+M1 检测分：`wbaes_f4_clean` **155 → 0**，`wbaes_f4_max` **100 → 0**（`wbaes_f4_max` 本来就
+没有调试串和 KAT，剩下可去的只有 15 个符号、2 个段名、1 条 `hy_seal` 元数据）。体积
+70,707,184 → 70,296,208 B（−410,976 B，−0.58 %），全是元数据。
+
+**代价（攻击者侧，同机同表，cold = 无解掩缓存，warm = `--cache` 命中）**：
+
+| | `wbaes_f4_max` | `wbaes_f4_hard` |
+|---|---|---|
+| `attacks/residual/w16_extract.py` 原样 | 取回 `3acb79e7…`，**15.62 s** cold / 0.23 s warm | **加载器直接失败**：`no __hytab section`，**0.04 s** |
+| 只把 `find_section` 改成"按大小取 70 MB 段" | 不需要 | 取回 `3acb79e7…`，**15.27 s** cold / 0.23 s warm |
+
+拆开看：读文件 + 找 `__const` 里的 16×256 输入双射 0.022 s（两边一样）；找掩码种子
+0.073 s（51 个候选）vs 0.024 s（13 个候选）——都是噪声；**Python 解掩 70 MB 15.0 s vs
+15.5 s**；8,192 次仿射一致性检验 0.19 s vs 0.20 s。所以差异只有那 0.04 s 的异常和**一行
+Python**，工作量因子完全没动；而且掩码种子本身在 `__const` 里，本次不改（改它要动代码）。
+
+结论：这一代和上一代一样，**去符号化买到的是"名字标签 + 免费 KAT"，不是取钥成本**。它值得
+作为第三个靶子放进红队包（`wbaes_f4_hard`，描述只是"同一把钥、同一张表，名字被抹掉"），
+但**不能写成加固代**：表是逐字节相同的，pair 表的 XOR 可分性、9 轮形状、70 MB 体积一样没变。
+把 `wbaes_f4_hard` 说成比 `wbaes_f4_max` 难，是把"要读一行 loader"当成了密码学强度。
