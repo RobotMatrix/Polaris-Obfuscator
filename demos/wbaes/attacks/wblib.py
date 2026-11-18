@@ -252,18 +252,31 @@ def find_section(path, want_sect="__hytab"):
         _, cputype, _, _, ncmds, sizeofcmds, _, _ = struct.unpack(endian + "IiiIIIII", hdr)
         cmds = f.read(sizeofcmds)
     off = 0
+    biggest = None
     for _ in range(ncmds):
         cmd, cmdsize = struct.unpack_from(endian + "II", cmds, off)
         if cmd == 0x19:
+            segname = cmds[off + 8:off + 24].rstrip(b"\x00").decode()
             nsects = struct.unpack_from(endian + "I", cmds, off + 64)[0]
             base = off + 72
             for i in range(nsects):
                 s = cmds[base + i * 80: base + (i + 1) * 80]
-                if s[:16].rstrip(b"\x00").decode() == want_sect:
-                    size = struct.unpack_from(endian + "Q", s, 40)[0]
-                    fileoff = struct.unpack_from(endian + "I", s, 48)[0]
+                name = s[:16].rstrip(b"\x00").decode()
+                size = struct.unpack_from(endian + "Q", s, 40)[0]
+                fileoff = struct.unpack_from(endian + "I", s, 48)[0]
+                if name == want_sect:
                     return fileoff, size
+                # A pass that renames sections keeps the payload, so fall back to
+                # the only megabyte-scale section in __DATA (the baked table) when
+                # the expected name is gone.
+                if segname == "__DATA" and size >= (1 << 20):
+                    if biggest is None or size > biggest[1]:
+                        biggest = (fileoff, size, name)
         off += cmdsize
+    if biggest:
+        print("note: no %s section; using __DATA,%s (%d bytes) as the table"
+              % (want_sect, biggest[2], biggest[1]))
+        return biggest[0], biggest[1]
     raise SystemExit("%s: no %s section" % (path, want_sect))
 
 
