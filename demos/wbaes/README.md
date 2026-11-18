@@ -11,7 +11,7 @@
 | 存放位置 | `demos/wbaes/wbaes_key.h` —— **全仓库唯一明文密钥** |
 | 自验明文 | `6bc1bee22e409f96e93d7e117393172a` |
 | 自验密文 | `2c0b8f87b6aa8d4a8c7b12d8d2227c8d`（openssl AES-128-ECB 交叉验证） |
-| 取钥状态 | **已被 `attacks/residual/w16_probe.py` 取回**：4,096 次仿射一致性检验、0.08 s。这一代的强度比 dl5/nl 低，见 5.29 |
+| 取钥状态 | **已被 `attacks/residual/w16_probe.py --binary <f4 产物>` 取回**：16/16 字节、4,096 次仿射一致性检验（0.14 s），`reproduces the shipped ciphertext: YES`。这一代的强度比 dl5/nl 低，见 5.29 |
 
 **设计原则**：明文密钥只存在于 `wbaes_key.h` 一处，且仅用于**编译期**生成查找表。
 密钥以 `key = key_part ⊕ key_mask` 两片分 XOR 存储（volatile 读取阻止编译器
@@ -1003,7 +1003,7 @@ python3 demos/wbaes/attacks/dca_attack.py --binary …/wbaes_vm2_clean --traces 
 2. **它比上一代快 20 %，表体积一模一样**：70,090,816 B 不变（列槽仍 798,720 B），
    每列查表 28 → 20。
 3. **它的取钥强度比 dl5/nl 低**。16 位值只能用仿射编码，于是 pair 表精确 XOR 可分
-   （100 % 复现，dl5 上 0.80 %），一条轴仍是一个密钥字节：**4,096 次廉价检验、0.08 s**
+   （100 % 复现，dl5 上 0.80 %），一条轴仍是一个密钥字节：**4,096 次廉价检验、0.08–0.14 s**
    （上一代出货产物要 16,384 次）。所以这是**性能代，不是加固代**。
 
 **构造**（每列 798,720 B）
@@ -1049,7 +1049,7 @@ python3 demos/wbaes/attacks/dca_attack.py --binary …/wbaes_vm2_clean --traces 
 
 | 脚本 | 在 F4 产物上 | 实测代价 |
 |---|---|---|
-| `w16_probe.py`（这一代真正的取钥路径） | **16/16 字节 `3acb79e7…`，`reproduces the shipped ciphertext: YES`** | 4,096 次仿射一致性检验 **0.08 s**；全程 32.3 s（15.3 s 解掩 + 12.3 s 分解扫描） |
+| `w16_probe.py --binary <产物>`（这一代真正的取钥路径） | **16/16 字节 `3acb79e7…`，`reproduces the shipped ciphertext: YES`**，rc=0 | 4,096 次仿射一致性检验 **0.14 s**；全程 53–57 s（18.0 s 解掩 + 4.4 s 8 维 span 检查 + 24.5 s 解码表扫描） |
 | `bge_attack.py` | `incomplete (0/16 bytes)` rc=1：它读的是上一代的 lane 偏移（1024 B 步长），在 F4 里那是 pair 表内部 | 15.2 s（含解掩） |
 | `hs_attack.py` | 在自己的族判据处停止：`round 0 is not F1/T32` rc=1 | 15.4 s（解掩） |
 | `consistency_attack.py` | `0/16`，8 个半列各 5–12 个碰撞对、0 候选 rc=1；它的签名是 8 位 pair 和，F4 上是 16 位 | 0.05 s |
@@ -1059,6 +1059,19 @@ python3 demos/wbaes/attacks/dca_attack.py --binary …/wbaes_vm2_clean --traces 
 
 **别把这五个 null 当成挡住**：F4 的密钥是 `w16_probe.py` 用 4,096 次廉价检验直接拿到的，
 不需要轨迹、不需要搜索 16 位编码。五个脚本失败只是因为它们写的是上一代的形状。
+
+**复现这条取钥要传对入口**：`w16_probe.py` 在 2026-11-18 之前没有 Mach-O 分支，`--table`
+只接受 `gen_hybrid` 写出的裸掩码表。把导出的 `wbaes_f4_max` 当 `--table` 传进去，它会把整个
+70,707,184 B 从偏移 0 解掩（真正的表在 `__hytab`，本产物偏移 49,280），于是每个字节都错、
+却不报错：pair 表 distinct 值 41,325–41,519（不是 65,536）、XOR 拟合 8,192/1,048,576、
+`incomplete: 0/16 key bytes`。现在推荐 `--binary`（自己切段、自己找种子）；`--table` 收到
+Mach-O 会直接报错，不再静默读错。
+
+**“地址读对没有”的廉价判据（脚本 §2b 自动跑）**：pair 表 `T[a][b] = A(φ(a)) ^ B(ψ(b)) ^ c`，
+A、B 都是 8×8，所以每一行、每一列的 GF(2) 跨度都是 8 维。16 张表在正确偏移上全部 r8/c8；
+把步长退回上一代的 `k*1024`，只有 `k=0`（两种步长地址相同）仍是 8 维，`k=1..3` 落进表 0
+内部、跨度全是 16 维。两次 256 项读就能判定，不必做任何密钥检验——**忘了 `+k*HY_W16_TAB`
+的唯一症状就是这个 16 维**。
 
 **上限（不要夸大）**
 
@@ -1103,7 +1116,8 @@ $CL -O2 -std=c++17 -DWBAES_HAVE_VM -I. tests/test_vm_offsets.cpp wbaes_vm.o -o t
 - ⚠️ 编码是 GF(2) 线性仿射，**不抵抗 DFA**（差分故障分析）——抗 DFA 需要非线性
   双射编码 + T-box/混合双射分离 + 内部编码消除网络（Chow 完整版）
 - ⚠️ **当前出货的一代（F4，5.29）承诺的只有"密文等于 AES"**：它的表层比上一代更容易取钥
-  （16 位 pair 表精确 XOR 可分，4,096 次廉价检验 / 0.08 s），买到的是一块 20 % 的耗时。
+  （16 位 pair 表精确 XOR 可分，4,096 次廉价检验 / 0.08–0.14 s，`w16_probe.py --binary`），
+  买到的是一块 20 % 的耗时。
   不要把它当加固代读；加固的部分只有 DFA 双算、封印、掩码与 VM 的数据驱动。
 - ⚠️ 仿射矩阵由密钥派生且确定性生成：同一密钥每次编译表相同；
   生产版应每次构建注入随机种子

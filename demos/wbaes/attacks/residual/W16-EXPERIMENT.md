@@ -316,6 +316,9 @@ $CL -O2 -std=c++17 -DWBAES_HAVE_VM -I. tests/test_vm_offsets.cpp wbaes_vm.o \
 # 4. W2
 cd attacks/residual && python3 w16_probe.py --table /tmp/w16/demos/wbaes/hy_table.bin \
     --work /tmp/w16/demos/wbaes
+#    --table takes the *masked* segment bytes; an already-unmasked copy is re-XORed
+#    by load_variant and gives 0/16. On an exported Mach-O use --binary instead:
+python3 w16_probe.py --binary /path/to/wbaes_f4_max
 
 # 5. W3 (traces need the patched header, so build them from this tree)
 python3 ../trace_harness/build_traces.py \

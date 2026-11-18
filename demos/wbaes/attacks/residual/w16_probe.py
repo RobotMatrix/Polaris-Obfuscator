@@ -26,7 +26,10 @@ What this script measures, in this order:
      tests does the whole key cost?
   5. key -> AES -> the shipped ciphertext.
 
-usage: python3 w16_probe.py --table hy_table.bin --work .
+usage, on the shipped artifact (preferred):
+  python3 w16_probe.py --binary ../../../../exported-binaries/wbaes-challenge/macos/wbaes_f4_max
+usage, on a table gen_hybrid just wrote:
+  python3 w16_probe.py --table hy_table.bin --work <dir with hy_in.h / hy_seal.h>
 """
 
 import argparse
@@ -125,13 +128,21 @@ def check_encoding_must_be_affine(rng, samples=4096):
 # ---------------------------------------------------------------------------
 def main(argv=None):
     ap = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
-    ap.add_argument("--table", required=True)
-    ap.add_argument("--work", default=".")
-    ap.add_argument("--seed", type=int, default=0xC0FFEE)
+    ap.add_argument("--binary", default=None,
+                    help="exported artifact (Mach-O); the __hytab section is unmasked")
+    ap.add_argument("--table", default=None,
+                    help="raw masked table written by gen_hybrid (+ --work for hy_in.h)")
+    ap.add_argument("--work", default=".",
+                    help="directory holding hy_in.h / hy_seal.h (raw-table mode only)")
+    ap.add_argument("--seed", type=int, default=None, help="mask seed (found if omitted)")
+    ap.add_argument("--rng-seed", type=int, default=0xC0FFEE,
+                    help="seed for the step-0 arithmetic samples")
     a = ap.parse_args(argv)
+    if not a.binary and not a.table:
+        ap.error("one of --binary or --table is required")
 
     import random
-    rng = random.Random(a.seed)
+    rng = random.Random(a.rng_seed)
     t_start = time.time()
 
     print("== 0. arithmetic preconditions (checked before the table was built) ==")
@@ -149,10 +160,20 @@ def main(argv=None):
     print("      the numerical form of the proof in the report.")
 
     print("\n== 1. artifact ==")
-    art, seed, secs = W.load(a.table, a.work)
-    print("   table %s, %d bytes, mask seed 0x%08x, env 0x%08x"
-          % (os.path.basename(a.table), len(art.tab), seed, art.env))
-    print("   unmasked in %.1fs (one pass over 70 MB)" % secs)
+    if a.binary:
+        art, seed, secs = W.load_binary(a.binary, a.seed)
+        label = os.path.basename(a.binary)
+    else:
+        art, seed, secs = W.load(a.table, a.work)
+        label = os.path.basename(a.table)
+    print("   artifact %s, table %d bytes, mask seed 0x%08x, env 0x%08x"
+          % (label, len(art.tab), seed, art.env))
+    print("   unmasked in %.1fs (one pass over %d bytes)" % (secs, len(art.tab)))
+    print("   pair-table geometry (wbaes_hybrid.h:335): col_base(rnd, col) + k*HY_W16_TAB,")
+    print("   HY_W16_TAB = %d, tag = hy_tag(dir, rnd, col, HY_K_W16_L + k)" % wb.W16_TAB)
+    for col in range(4):
+        print("     col %d: base %d, tables at %s"
+              % (col, W.col_base(col), " / ".join(str(W.pair_off(col, k)) for k in range(4))))
 
     print("\n== 2. the pair tables: is the sum layer really 16 bits? ==")
     t1 = time.time()
@@ -168,6 +189,36 @@ def main(argv=None):
     print("   min %d, max %d  (65536 = a bijection on the index)"
           % (min(census), max(census)))
     print("   read and counted in %.2fs" % (time.time() - t1))
+
+    print("\n== 2b. is the offset right?  (GF(2) span of every row and column) ==")
+    print("   T[a][b] = A(phi(a)) ^ B(psi(b)) ^ c, A and B 8x8, so every row span and")
+    print("   every column span is 8-dimensional. Random bytes span 16. Two 256-entry")
+    print("   reads per dimension: this is the cheap 'right offset?' test, and it is")
+    print("   the check that catches a reader using the previous generation's stride.")
+    t2a = time.time()
+    ok8 = 0
+    for col in range(4):
+        line = []
+        for k in range(4):
+            rr, cc = W.span_dims(W.pair_tab(art, col, k))
+            line.append("k%d r%d/c%d" % (k, rr[0] if len(rr) == 1 else -1,
+                                         cc[0] if len(cc) == 1 else -1))
+            if rr == [8] and cc == [8]:
+                ok8 += 1
+        print("   col %d: %s" % (col, "  ".join(line)))
+    print("   tables with every row and column span exactly 8: %d/16 (%.2fs)"
+          % (ok8, time.time() - t2a))
+    print("   control, the dl5 lane stride (k*%d) instead of k*%d:" % (wb.W1024, wb.W16_TAB))
+    ctrl8 = 0
+    for k in range(4):
+        off = W.col_base(0) + k * wb.W1024
+        rr, cc = W.span_dims(W.read_pair(art, off, W.pair_tag(0, k)))
+        if rr == [8] and cc == [8]:
+            ctrl8 += 1
+        print("     k=%d off %d: row span %s, column span %s" % (k, off, rr, cc))
+    print("   -> k=0 is the same address under both strides (%d/4 look 8-dimensional);"
+          % ctrl8)
+    print("      k=1..3 are inside table 0 under the old stride and read random data.")
 
     print("\n== 3. the dl4/BGE step, in 16-bit values ==")
     hits = tot = 0

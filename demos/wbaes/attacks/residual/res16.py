@@ -43,11 +43,35 @@ K_W16_D = 208          # 208..211: the four 2^16-index decode tables
 W16_TAB = wb.U16       # one pair table: 2^16 entries * 2 B = 131072 B
 
 
+def is_macho(path):
+    with open(path, "rb") as f:
+        return f.read(4) in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf")
+
+
 def load(table_path, workdir, env_args=wb.DEFAULT_ENV):
-    """Unmask an F4 artifact and hand back (tab, env, p0, p0i, seed, tab_obj, secs)."""
+    """Unmask a raw F4 table (as gen_hybrid writes it) and hand back (art, seed, secs).
+
+    `workdir` must hold the hy_in.h / hy_seal.h the generator wrote next to the
+    table. A Mach-O is refused rather than unmasked: the mask starts at the
+    __hytab section, not at file byte 0, so treating the binary as a table yields
+    bytes that are wrong everywhere while every read still "succeeds" (0/16 key
+    bytes, no error). Use load_binary() for an exported artifact.
+    """
+    if is_macho(table_path):
+        raise SystemExit(
+            "%s is a Mach-O, not a raw table: the mask starts at __hytab, so reading "
+            "the file as a table gives garbage. Use --binary / res16.load_binary()."
+            % os.path.basename(table_path))
     t0 = time.time()
     art, seed = R.load_variant(table_path, workdir, env_args=env_args)
     return art, seed, time.time() - t0
+
+
+def load_binary(path, seed=None, env_args=wb.DEFAULT_ENV):
+    """Unmask the __hytab section of an exported artifact (wbaes_f4_max, ...)."""
+    t0 = time.time()
+    art, _t = R.load_shipped(path, seed=seed, cache=None, env_args=env_args)
+    return art, art.seed, time.time() - t0
 
 
 def col_base(col, rnd=0, direction=0):
@@ -57,12 +81,30 @@ def col_base(col, rnd=0, direction=0):
     return wb.dec_mc(rnd) + wb.COL * col
 
 
-def pair_tab(art, col, k, rnd=0, direction=0):
-    """One 2^16-index pair table as Q[a][b] (a = low index byte), 16-bit values."""
-    off = col_base(col, rnd, direction) + k * W16_TAB
-    tag = wb.hy_tag(direction, rnd, col, K_W16_L + k)
+def pair_off(col, k, rnd=0, direction=0):
+    """Byte offset of pair table k: col_base + k*HY_W16_TAB (wbaes_hybrid.h:335).
+
+    The previous generation put a 256-entry lane table every 1024 B; F4 puts one
+    2^16-entry pair table every HY_W16_TAB = 131072 B. k=0 is the same address in
+    both, which is exactly why a reader that forgets the stride still looks
+    half-right.
+    """
+    return col_base(col, rnd, direction) + k * W16_TAB
+
+
+def pair_tag(col, k, rnd=0, direction=0):
+    return wb.hy_tag(direction, rnd, col, K_W16_L + k)
+
+
+def read_pair(art, off, tag):
+    """One 2^16-index table at `off` as Q[a][b] (a = low index byte), 16-bit values."""
     r16 = art.tab_obj.r16
     return [[r16(off, a | (b << 8), tag) for b in range(256)] for a in range(256)]
+
+
+def pair_tab(art, col, k, rnd=0, direction=0):
+    """One 2^16-index pair table as Q[a][b] (a = low index byte), 16-bit values."""
+    return read_pair(art, pair_off(col, k, rnd, direction), pair_tag(col, k, rnd, direction))
 
 
 def pair_row(art, col, k, lane_off, rnd=0, direction=0):
@@ -71,12 +113,26 @@ def pair_row(art, col, k, lane_off, rnd=0, direction=0):
     lane_off = 0 -> vary the low index byte (the pair's first lane),
     lane_off = 1 -> vary the high index byte (the pair's second lane).
     """
-    off = col_base(col, rnd, direction) + k * W16_TAB
-    tag = wb.hy_tag(direction, rnd, col, K_W16_L + k)
+    off = pair_off(col, k, rnd, direction)
+    tag = pair_tag(col, k, rnd, direction)
     r16 = art.tab_obj.r16
     if lane_off == 0:
         return [r16(off, v, tag) for v in range(256)]
     return [r16(off, v << 8, tag) for v in range(256)]
+
+
+def span_dims(Q, bits=16):
+    """(row ranks, column ranks) of a table's GF(2) difference spans.
+
+    F4 writes T[a][b] = A(phi(a)) ^ B(psi(b)) ^ c with A, B 8x8 blocks, so every
+    row spans an affine 8-dimensional subspace and so does every column. Random
+    bytes -- what a wrong offset returns -- span all 16. This is the cheap test
+    for "did I read the right address": two 256-entry reads per dimension, no key
+    test, no decomposition.
+    """
+    rr = [rank_of([Q[a][b] ^ Q[a][0] for b in range(256)], bits) for a in range(256)]
+    cc = [rank_of([Q[a][b] ^ Q[0][b] for a in range(256)], bits) for b in range(256)]
+    return sorted(set(rr)), sorted(set(cc))
 
 
 def decode_tab(art, col, row, rnd=0, direction=0):

@@ -59,6 +59,11 @@ python3 recoding_peel.py --cache /tmp/nl_plain.bin
 
 # (d) 跨实例（会编译 gen_hybrid.cpp 到 /tmp/wbaes-res/cross，并在那里生成两份表）
 python3 cross_instance.py
+
+# (f) F4：16 位列合并，直接从导出的产物取钥（4,096 次检验，全程约 55 s）
+python3 w16_probe.py --binary ../../../../exported-binaries/wbaes-challenge/macos/wbaes_f4_max
+#     也可以喂 gen_hybrid 刚写出的裸掩码表（带掩码的 __hytab 段字节，不是解掩后的副本）：
+python3 w16_probe.py --table /tmp/w16/demos/wbaes/hy_table.bin --work /tmp/w16/demos/wbaes
 ```
 
 退出码沿用 `attacks/` 的约定：只有拿到 16/16 字节且复现产物密文才 rc=0。

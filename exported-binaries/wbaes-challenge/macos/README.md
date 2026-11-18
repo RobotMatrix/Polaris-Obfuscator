@@ -30,8 +30,8 @@
 | `wbaes_vm2_clean` | `-O2`，dl5 + **一次 VM 调用算完整张偏移表，宿主从 `@hsvm_mem` 读回** | 有 | `4f06…`（**已提取**，`attacks/residual/hs_attack.py`） | `7672415a…` |
 | `wbaes_vm2_max` | `-O2` + 8 pass，同上 | 有 | `4f06…`（**已提取**，同上） | `7672415a…` |
 
-| `wbaes_f4_clean` | `-O2`，**16 位列合并** + dl5 的 32 位重编码 + VM | 有 | `3acb…`（**已提取**，`attacks/residual/w16_probe.py`） | `2c0b8f87…` |
-| `wbaes_f4_max` | `-O2` + 8 pass，同上 | 有 | `3acb…`（**已提取**，同上） | `2c0b8f87…` |
+| `wbaes_f4_clean` | `-O2`，**16 位列合并** + dl5 的 32 位重编码 + VM | 有 | `3acb79e72c06bebbbdcda86dc62f009b`（**已复核**，见 §1d） | `2c0b8f87…` |
+| `wbaes_f4_max` | `-O2` + 8 pass，同上 | 有 | `3acb79e72c06bebbbdcda86dc62f009b`（同上） | `2c0b8f87…` |
 
 **`*_f4` 是当前一代**（2026-11-18，`demos/wbaes` HEAD 构建）。一句话说清它的三种性质：
 
@@ -40,8 +40,9 @@
 2. **它比 `*_vm2` 快 20 %，表体积一模一样**：表 70,090,816 B（不变），每列查表 28 → 20；
    同机交错 `bench_wbaes 3000`：加密 16.94 → 13.24 µs、解密 16.21 → 13.53 µs。
 3. **它的取钥强度比 `*_nl` / `*_vm2` 低**：16 位 pair 表精确 XOR 可分，密钥在
-   **4,096 次廉价检验、0.08 s 代数**内取回（`w16_probe.py`，`reproduces the shipped
-   ciphertext: YES`）。所以这一代是**性能代，不是加固代**。
+   **4,096 次廉价检验**内取回（`attacks/residual/w16_probe.py --binary <产物>` 实测
+   16/16、`reproduces the shipped ciphertext: YES`；取钥那一步 0.08–0.14 s，全程约 55 s
+   含两次 70 MB 解掩与解码表扫描）。所以这一代是**性能代，不是加固代**。
 
 构造：MixColumns 线性 ⇒ 四个 lane 两两成对、四个输出行也两两成对，半列部分和是 16 位；
 两张 2^16 项 × 16 位输出的 pair 表在一次 16 位 XOR 里相遇，四张 2^16 项解码表去掉仿射编码、
@@ -318,7 +319,9 @@ roundtrip   : PASS
 ## 已知弱点（先说清楚，免得误判难度）
 
 0. **当前一代 `*_f4` 在取钥强度上比 `*_nl` / `*_vm2` 弱**：它的 16 位 pair 表精确 XOR 可分，
-   4096 次仿射一致性检验（0.08 s 代数，全程 32 s 含解掩）就能取回 `3acb…` 并复现密文。
+   4096 次仿射一致性检验（0.14 s 代数，全程 53–57 s 含 70 MB 解掩）就能取回 `3acb…` 并复现
+   密文：`python3 attacks/residual/w16_probe.py --binary <产物>`，`reproduces the shipped
+   ciphertext: YES`，见 §1d。
    这一代出货的理由是性能（快 20 %、体积不变）与"密文等于 AES"，不是加固。
    它仍然挡住的是**改表/改调度块**（封印 + DFA 双算 + VM 数据驱动），不是**读表**。
 1. **表级密钥提取：旧构建可行，新构建在朴素攻击下失效（实测）。**
@@ -431,6 +434,67 @@ roundtrip   : PASS
    所以这一代的正确定位是：**“朴素路径已关，但结构性攻击 5.6 秒、轨迹攻击 1 秒就出钥”**，
    不是“抗提取”。老的两条脚本（DCA/BGE）仍是 0/16，它们只覆盖了地址维度的泄漏，
    没有处理“输出双射吸收密钥”这一层。
+
+### §1d `*_f4`（16 位列合并）：密钥与“已提取”这一说法要分开看
+
+```
+wbaes_f4_max            → ciphertext 2c0b8f87b6aa8d4a8c7b12d8d2227c8d   （自检 PASS）
+openssl -K 3acb79e72c06bebbbdcda86dc62f009b
+                        → 2c0b8f87b6aa8d4a8c7b12d8d2227c8d   （逐字节一致）
+sha256 4d72a95a48d6ce99b3ac4bf0a088b98b87dee8700ed17611ea2c27d1db35dba3
+                        （与 sha256.txt 一致）
+```
+
+**密钥确认**：`3acb79e72c06bebbbdcda86dc62f009b`。两个独立来源互证——二进制自检打印的
+密文，和 openssl 用这把钥算出的密文，逐字节相同。
+
+**结构确认（本次实测，不依赖仓库脚本）**：解掩后（`HY_TOTAL` 仍 70,090,816 B，与
+`*_nl` 同尺寸，所以 `wblib` 的几何常量对 f4 仍然有效），round 0 / col 0 的四张 16 位
+pair 表落在 `col_base + k * 131,072`（`k = 0..3`），tag 是 `hy_tag(dir, round, col, 200+k)`
+——即 `HY_K_W16_L + k`。四张表读出来各有 **8 维行跨度和 8 维列跨度**，正是
+`fill_col_w16` 里 `A(φ(a) ⊕ ψ(b))`（两个字节都是同一个 S 值经 MC 系数的 GF 倍）的形状。
+换句话说：**16 位列合并并没有把可分解性做掉，只是包了一层 16×16 的线性仿射**。
+
+**复现命令（2026-11-18 修好加载器后，脚本自己切 `__hytab`、自己解掩）**：
+
+```
+cd demos/wbaes/attacks/residual
+python3 w16_probe.py --binary ../../../../exported-binaries/wbaes-challenge/macos/wbaes_f4_max
+  → 16 axes, 4096 tests, 0.14s
+    recovered key: 3acb79e72c06bebbbdcda86dc62f009b
+    AES-128(6bc1bee22e409f96e93d7e117393172a) = 2c0b8f87b6aa8d4a8c7b12d8d2227c8d
+    reproduces the shipped ciphertext: YES
+    rc=0，全程 53–57 s（三次实测；18.0 s 解掩 + 4.4 s 8 维 span 检查 + 24.5 s 解码表扫描）
+```
+
+`--table <裸掩码表> --work <含 hy_in.h/hy_seal.h 的目录>` 的老用法照旧可用（`--table` 要的是
+**带掩码**的 `__hytab` 原始字节，不是解掩后的副本）：
+
+```
+python3 -c "import sys; sys.path.insert(0,'attacks'); import wblib as wb; \
+  B='.../wbaes_f4_max'; o,s=wb.find_section(B,'__hytab'); \
+  open('/tmp/f4_masked.bin','wb').write(open(B,'rb').read()[o:o+s])"
+
+python3 attacks/residual/w16_probe.py --table /tmp/f4_masked.bin --work demos/wbaes
+  → 同一把钥，4096 次仿射一致性检验；本轮 55.9 s（18.0 s 解掩 + 4.4 s span + 24.5 s 解码表扫描）
+```
+
+我另外写了一条独立实现（`hy_in.h` 的 P0 取逆 + 每条轴 256 猜测，8192 次检验，
+复用已解掩的缓存 0.27 s）也给出同一把钥，四条轴互不共享任何中间量——**两条独立实现
+一致 + openssl 复核**，这才算证明。
+
+**两个坑，都会给出 `incomplete: 0/16` 而且不报错**：
+
+1. **把 Mach-O 当 `--table`**（改动前的行为）：掩码从 `__hytab`（本产物偏移 49,280）开始，
+   不是从文件 0 开始。旧加载器会把整个 70,707,184 B 从偏移 0 解掩，于是每个字节都错，
+   但每一步都“成功”：pair 表 distinct 值 41,325–41,519（不是 65,536）、XOR 拟合
+   8,192/1,048,576、0/16。现在直接把 Mach-O 传给 `--table` 会报错并提示用 `--binary`。
+2. **把“已解掩”的副本当 `--table`**：`reslib.load_variant` 会拿 `hy_seal.h` 的四个字
+   再解一次掩，等于对明文又 XOR 一遍，同样 0/16。
+
+两次 0/16 都是**入参/加载器错**，不是几何错，也不是攻击强度：`res16.pair_tab` 的 base
+一直是 `col_base + k*HY_W16_TAB`。所以先跑 §2b 的 8 维 span 判据再谈攻击——16 张表全 r8/c8
+才说明地址读对了。
 
 2. **DFA（故障注入）已被检测。** 加密与解密都做两遍独立遍历并比对，
    不一致时输出随机垃圾（不给故障密文），所以经典 DFA 拿不到差分样本。
