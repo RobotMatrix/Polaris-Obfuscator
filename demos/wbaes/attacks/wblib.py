@@ -264,12 +264,15 @@ def find_section(path, want_sect="__hytab"):
                 name = s[:16].rstrip(b"\x00").decode()
                 size = struct.unpack_from(endian + "Q", s, 40)[0]
                 fileoff = struct.unpack_from(endian + "I", s, 48)[0]
+                flags = struct.unpack_from(endian + "I", s, 64)[0]
                 if name == want_sect:
                     return fileoff, size
                 # A pass that renames sections keeps the payload, so fall back to
                 # the only megabyte-scale section in __DATA (the baked table) when
-                # the expected name is gone.
-                if segname == "__DATA" and size >= (1 << 20):
+                # the expected name is gone. S_ZEROFILL (0x1) sections hold no
+                # bytes in the file, so __bss must not be mistaken for the table.
+                if (segname == "__DATA" and size >= (1 << 20)
+                        and (flags & 0xFF) != 0x1 and fileoff != 0):
                     if biggest is None or size > biggest[1]:
                         biggest = (fileoff, size, name)
         off += cmdsize
