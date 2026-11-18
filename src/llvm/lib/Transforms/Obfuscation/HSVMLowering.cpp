@@ -4,6 +4,9 @@
 //   @hsvm.bytecode : constant array of i8, 8 bytes per instruction
 //   @hsvm_entry    : declared "i32 ()" - its body is replaced by the lowered
 //                    program, which returns the final value of r0
+//   @hsvm_mem      : optional mutable [4096 x i8] global; when present it becomes
+//                    the VM's memory plane, so the host can read what the program
+//                    stored after the call (absent: a private alloca is used)
 //
 // This slice lowers the register-class opcodes (Nop, Movi, Mov, Add..Shr) and
 // the stop instruction. Memory and control flow arrive in the next slice; until
@@ -137,8 +140,23 @@ PreservedAnalyses HSVMLowering::run(Module &M, ModuleAnalysisManager &AM) {
     EB.CreateStore(InitVal,
                    EB.CreateGEP(RegsTy, Regs, {EB.getInt32(0), EB.getInt32(i)}));
   // The interpreter's memory starts zeroed; an alloca does not, so fill it.
+  // If the module defines @hsvm_mem as a [4096 x i8] global, the program runs on
+  // that array instead of a private alloca, so the host can read words the
+  // program stored once the call returns. That is how a batch of results leaves
+  // the VM without an ISA change: the program stores them with St and the host
+  // reads the exported buffer. Nothing else about the program's semantics
+  // changes - the buffer is still cleared at entry, exactly like the alloca was.
   ArrayType *MemTy = ArrayType::get(Type::getInt8Ty(Ctx), kMemBytes);
-  AllocaInst *Mem = EB.CreateAlloca(MemTy, nullptr, "hsvm.mem");
+  Value *Mem = nullptr; // i8* to element 0 of the memory plane
+  if (GlobalVariable *GM = M.getNamedGlobal("hsvm_mem")) {
+    if (GM->getValueType() != MemTy || GM->isConstant())
+      report_fatal_error("hsvm: @hsvm_mem must be a mutable [4096 x i8] global");
+    Mem = EB.CreateInBoundsGEP(MemTy, GM, {EB.getInt32(0), EB.getInt32(0)},
+                               "hsvm.mem");
+  } else {
+    AllocaInst *A = EB.CreateAlloca(MemTy, nullptr, "hsvm.mem");
+    Mem = EB.CreateInBoundsGEP(MemTy, A, {EB.getInt32(0), EB.getInt32(0)});
+  }
   EB.CreateMemSet(Mem, EB.getInt8(0), kMemBytes, MaybeAlign(4));
 
   // One block per instruction, plus a fall-off-the-end block.
@@ -160,7 +178,7 @@ PreservedAnalyses HSVMLowering::run(Module &M, ModuleAnalysisManager &AM) {
   };
 
   auto memByte = [&](IRBuilder<> &B, Value *addr) {
-    return B.CreateGEP(MemTy, Mem, {B.getInt32(0), addr});
+    return B.CreateGEP(Type::getInt8Ty(Ctx), Mem, addr);
   };
   // Byte address must be 4-aligned and leave room for a word; otherwise the
   // interpreter faults and so must we.

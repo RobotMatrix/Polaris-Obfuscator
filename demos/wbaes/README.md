@@ -889,6 +889,101 @@ dl5 改的就是这两处，**不改**函数（密文逐字节一致）、VM、D
 （0 冲突），所以要打只能靠“未知双射一致性”统计——需要约 2^12 条轨迹，本次未实现；
 (4) F0 前置 512 KiB 与其它族区段重叠（互不读取，但静态读者可能误判）。
 
+### 5.28 VM 层 P0：一次调用算完整张偏移表，宿主从 VM 内存读回（2026-11-18）
+
+§5.26 那版 VM（43 条指令）**一次调用只算一个偏移**，唯一出口是 `r0`，所以一个块要 288 次调用
+（16 偏移 × 9 轮 × 2 方向），每块为此多付 ≈6 µs。这一节把 `WB-DESIGN-V2.md` §13 的两条 P0 一起做掉：
+
+| P0 | 做法 | 结果 |
+|---|---|---|
+| P0-a：偏移只算一次 | 字节码自己走 2 方向 × 9 轮 × 16 字节，`St` 把 288 个偏移写进 VM 内存；宿主算一次就缓存 | 每块 288 次 → **0** 次；整张表 **1 次调用 / 0.86 µs**，在第一次加解密时付 |
+| P0-b：把值取出来 | pass 支持 `@hsvm_mem`：模块里定义了 `unsigned char hsvm_mem[4096]` 就用它当 VM 内存面（没有则退回原来的 alloca） | 不需要 ISA v3 / `Tst`，ISA 仍是 v2，解释器/oracle 未动 |
+
+**为什么不是“把九轮搬进字节码”**：偏移只依赖调度块和布局字，与明文/密钥无关，是**每构建固定**的；
+把九轮做成 VM 循环一个偏移也省不下来，反而把 69 MB 数据面耦合进字节码。所以这里落的是
+“一次算完 + 宿主缓存”，§13 的两条 P0 合成一条实现，理由写在这里而不是留给读者猜。
+
+**字节码**（`wbaes_vm.cpp`，ISA v2、61 条指令 / 488 字节 / 16 寄存器 / 4 KiB 内存，6 条 `Tld`、1 条 `St`）：
+
+```
+for dir in 0,1:                                     # 0 = 加密, 1 = 解密
+  for round in 0..8:
+    fam = Tld[dir*16 + (round & 12)] 的第 (round & 3) 个字节     ← 调度块族字节
+    acc = Tld[32 + 4*dir] + round * Tld[40 + 4*dir]              ← base + round*stride
+    for i in 0..15:
+      off = acc + (i>>2) * Tld[48]                                ← 列槽
+             + (fam == 0 ? ((i&3) >= 2 ? Tld[56] : 0)             ← F0: 第二张 pair 表
+                          : (i&3) * Tld[52])                      ← F1/F2/F3: 每 lane 一张
+      St Mem[4 * (dir*144 + round*16 + i)], off                   ← 写 VM 内存
+  r0 = 0, halt                                                    ← 结果不再挤在 r0 里
+```
+
+三个循环用 `Brz`/`Jmp` 收尾，1/9/12/16/24 这些常数都由 3/2/0/4 现算（`Sub`/`Shl`），
+所以字节码里仍然**没有** 69 MB 布局的任何常量——`tests/test_vm_offsets` 用非本机布局字
+（base 1000、col stride 12288…）验证这一点，现在既有逐 (dir,round) 的旧接口，
+也有一次取 288 项的 `hy_vm_plan()`，两条路都要和 C 参考逐项相等。
+
+**内存怎么出 VM**（`src/llvm/lib/Transforms/Obfuscation/HSVMLowering.cpp`）：降低时先找
+`@hsvm_mem`，类型是 `[4096 x i8]` 且不是常量就把它当内存面，每次调用照样先 `bzero` 4 KiB
+（语义与 alloca 版一致）；找不到就退回 alloca。所以 `research/hsvm` 的 28 个 ctest 和
+`scripts/verify_vmp_gate.sh` 行为一个字没变（它们不定义这个全局），ISA 文件、`sync_isa.py`、
+解释器、oracle 都不用碰。
+
+**计划的生命周期**：`hy_vm_plan()` 把 288 个偏移取回 `hy_vm_off[2][9][16]`（1152 B，
+同时检查每项 `<= HY_TOTAL - HY_U32`，越界即判定 VM 故障）；之后每个块只比一次
+**调度块快照**（64 B `memcmp`）：一样就用缓存，不一样就重新跑一次 VM。
+所以 V2 仍然是真的：改坏调度块第 48 字节 → 快照不等 → 重走 VM → 偏移变 → 密文变。
+
+**实测（同一张表、同一台机器，`bench_wbaes 3000`，3 次运行取最小值）**
+
+| 配置 | 加密 | 解密 |
+|---|---|---|
+| 关 VM（下界） | 17.23 µs | 16.68 µs |
+| 改前：每块 288 次 `hsvm_entry` | 23.34 µs | 23.15 µs |
+| 改后：一次调用 + 缓存 | **16.93 µs** | **16.85 µs** |
+
+VM 的固定开销（每块 ≈6 µs）整个消失，开 VM 与关 VM 落在同一档（差值在噪声内）。
+单次成本实测：整张表一次调用 **0.86 µs**（288 个偏移），切成 18 次 (dir,round) 调用要
+**15.2 µs**——那正是原来每块 288 次调用在付的钱。
+（本机当时负载 ≈3.5、`mds_stores` 占 170% CPU，绝对数比 §5.27 记录的 22.29 / 10.02 µs 高，
+所以只拿同一台机器、同一张表的前后两行做比较。）
+
+**V1–V6（产物 `wbaes_vm2_clean`，密钥 `4f06…`）**
+
+| 判据 | 命令 | 结果 |
+|---|---|---|
+| V1 产物里有 VM | `nm wbaes_vm2_clean \| grep hsvm` | `_hsvm_bytecode` `_hsvm_entry` `_hsvm_mem` `_hsvm_table` `_hsvm_table_len` |
+| | `otool -s __DATA __hsvm` | 61 条 8 字节指令 / 488 B；6 条 `0x10`(tld)、1 条 `0x0c`(st)、5 `brz`、4 `jmp` |
+| | `_hsvm_entry` 反汇编 | 206 条指令，间接 `br x*` **0** 条（无分发循环）；`bzero` 目标 = `_hsvm_mem` |
+| V2 VM 真被执行 | `-DWBAES_VM_SCHEDTEST` | 完好 `7672415a…` → 翻第 48 字节 `00ec5944…` → 恢复 `7672415a…` |
+| V3 函数不变 | 混合 + `--fam 0/1/2/3` 五次生成 | 五次密文全 `7672415a6313c58518fc95c9cb6922b8` |
+| V4 性能 | `bench_wbaes 3000` | 见上表：23.34/23.15 → 16.93/16.85 µs，与关 VM 同档 |
+| V5 双算不退化 | `-DWBAES_DFA_SELFTEST` | 密文 `2ec972ad…`、回环 `9583108b…`，`vector-match: FAIL` |
+| V6 自检 | `gen_hybrid` / demo / `tests/test_vm_offsets` | 生成端 rc=0（`table-check`/`seal-check` PASS）、`roundtrip: PASS`、`vm-offsets: PASS`（含 288 项批量计划） |
+
+**两条已提交的攻击脚本在新产物上仍然失败**（`4f06…` 这一代，脚本里的已知答案常量已同步到新钥，
+判定逻辑一个字没改）：
+
+```
+python3 demos/wbaes/attacks/bge_attack.py --binary exported-binaries/wbaes-challenge/macos/wbaes_vm2_clean
+  → 0.0076 轴外命中（随机 0.0039）→ 每列 0 个候选 → incomplete (0/16 bytes)      rc=1
+python3 demos/wbaes/attacks/dca_attack.py --binary …/wbaes_vm2_clean --traces …/dl4_traces.bin
+  → A: 真钥秩 45–245/256；B: 6 个 (tag, half) 组合全 0 候选 → incomplete 0/16   rc=1
+```
+
+**代价与边界（不要夸大）**
+
+- VM 不再**每块**执行：每进程（每次换表）执行一次 0.86 µs 的计划计算，之后每块只做 64 B 快照比较。
+  “热路径由字节码驱动”在这一代只对**表加载**成立，对每块不再成立——这是用 6 µs/块换来的，
+  写在这里而不是留给读者自己发现。`VM-REQUIREMENT.md` 的 V2/V4 注已同步改口径。
+- 偏移的**数值**与改前逐位相同（`tests/test_vm_offsets` 与 V3 密文都证明），所以静态读表的人
+  看到的地址序列不变；这一代买到的是耗时，不是新的静态屏障。
+- 计划缓存是宿主内存里的 1152 B，就在解掩后的表旁边；dump 内存的对手能读到它，
+  但那些值本来就能由表尾调度块 + 公开定位公式算出来，所以不算新增泄漏面。
+- **这一代仍被 residual 攻击打穿**（与 VM 无关）：`attacks/residual/hs_attack.py` 在
+  `wbaes_vm2_clean` 上 3.16 s 取回 `4f065a03…`，`reproduces the shipped ciphertext: YES`。
+  表结构和 dl5 一样，换钥不等于换结构；两条 P0 买到的是耗时，不是新的静态屏障。
+
 ## 6. 安全性边界（教学版声明）
 
 本实现是 Chow 思路的**简化教学版**，与完整 Chow white-box 差距：

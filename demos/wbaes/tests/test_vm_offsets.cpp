@@ -6,6 +6,10 @@
 // are not the shipped ones: if any constant were baked into the bytecode
 // instead of read through Tld, those cases would disagree.
 //
+// Both ways of asking for the offsets are checked: one call for the whole 288
+// entry plan (hy_vm_plan, the path the runtime uses) and one (dir, round) slice
+// at a time (hy_vm_offsets). They must agree with the reference and each other.
+//
 //   test_vm_offsets      exit 0 = PASS
 #include <cstdint>
 #include <cstdio>
@@ -60,6 +64,30 @@ static int check_block(const char *what, uint8_t blk[64]) {
     return bad ? 1 : 0;
 }
 
+// The batch form: one call must hand over all 288 offsets, for both directions,
+// exactly where the slice-by-slice form reads them.
+static int check_plan(const char *what, uint8_t blk[64]) {
+    hy_vm_set_table(blk, 64);
+    static uint32_t plan[2][HY_VM_ROUNDS][16];
+    if (hy_vm_plan(plan) != 0) {
+        printf("%-22s FAIL (VM faulted)\n", what);
+        return 1;
+    }
+    int bad = 0;
+    for (int dir = 0; dir < 2; dir++)
+        for (int round = 0; round < HY_VM_ROUNDS; round++)
+            for (int i = 0; i < 16; i++) {
+                const uint32_t want = expect(blk, dir, round, i);
+                if (plan[dir][round][i] != want) {
+                    if (bad++ < 4)
+                        printf("%s dir=%d round=%d i=%d: got 0x%08x want 0x%08x\n", what,
+                               dir, round, i, plan[dir][round][i], want);
+                }
+            }
+    printf("%-22s %s (288 offsets, one call)\n", what, bad ? "FAIL" : "PASS");
+    return bad ? 1 : 0;
+}
+
 int main(void) {
     int fail = 0;
     uint8_t blk[64];
@@ -78,6 +106,7 @@ int main(void) {
     wr32(blk + 52, 1024u);
     wr32(blk + 56, 262144u);
     fail |= check_block("shipped-layout mixed", blk);
+    fail |= check_plan("plan: shipped mixed", blk);
 
     // Same layout, every family forced, one block per family.
     for (int fam = 0; fam < 4; fam++) {
@@ -105,6 +134,7 @@ int main(void) {
         blk[16 + round] = (uint8_t)((round + 1) & 3);
     }
     fail |= check_block("foreign-layout mixed", blk);
+    fail |= check_plan("plan: foreign mixed", blk);
 
     // A table shorter than the words the program reads must fault, not read on.
     hy_vm_set_table(blk, 40);

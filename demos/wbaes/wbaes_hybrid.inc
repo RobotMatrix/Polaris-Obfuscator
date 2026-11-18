@@ -83,18 +83,49 @@ static int g_dfa_once = 1;
 #endif
 
 #ifdef WBAES_HAVE_VM
-// Sixteen table offsets per round, for both directions, computed by the HSV
-// bytecode at the start of every block. They are loop-invariant, and that is
-// exactly why they are recomputed per block: the addresses a block reads are
-// the ones the VM produced for that block, so a schedule byte the VM consumes
-// changes the ciphertext instead of being checked and then ignored.
-static int hy_vm_plan(int dir, uint32_t off[HY_MC_ROUNDS][16]) {
-    for (int r = 0; r < HY_MC_ROUNDS; r++) {
-        if (hy_vm_offsets(dir, r, off[r]) != 0) return -1; // VM faulted
-        for (int i = 0; i < 16; i++)
-            if (off[r][i] > HY_TOTAL - HY_U32) return -1; // would read past the table
+static_assert(HY_VM_ROUNDS == HY_MC_ROUNDS, "the VM plan must cover every round");
+
+// The offset plan for both directions, computed once by the HSV bytecode and then
+// reused by every block. The offsets depend only on the schedule block and the
+// layout words, never on plaintext or key, so recomputing them per block was the
+// same 288 numbers bought 288 times.
+//
+// One call computes all of it: the program walks 2 directions x 9 rounds x 16
+// state bytes and leaves 288 words in VM memory, which the pass exports as
+// @hsvm_mem; hy_vm_plan() reads them out. Nothing here derives an offset itself.
+//
+// What is checked per block is the 64-byte schedule block the plan was built
+// from. If any byte differs from the snapshot (a patched image, a fault), the
+// plan is computed again through the VM before it is used, so a damaged schedule
+// byte still moves the addresses the reader takes - it does not get to be
+// checked and then ignored.
+static uint32_t hy_vm_off[2][HY_MC_ROUNDS][16];
+static uint8_t hy_vm_sched[HY_SCHED_BYTES];
+static int hy_vm_ready = 0;
+
+static int hy_vm_plan_refresh(void) {
+    uint32_t plan[2][HY_VM_ROUNDS][16];
+    hy_vm_ready = 0;
+    if (hy_vm_plan(plan) != 0) return -1; // VM faulted
+    for (int d = 0; d < 2; d++) {
+        for (int r = 0; r < HY_MC_ROUNDS; r++) {
+            for (int i = 0; i < 16; i++) {
+                const uint32_t v = plan[d][r][i];
+                if (v > HY_TOTAL - HY_U32) return -1; // would read past the table
+                hy_vm_off[d][r][i] = v;
+            }
+        }
     }
+    memcpy(hy_vm_sched, HYKTAB + HY_SCHED_OFF, HY_SCHED_BYTES);
+    hy_vm_ready = 1;
     return 0;
+}
+
+static int hy_vm_plan_get(void) {
+    if (hy_vm_ready &&
+        memcmp(hy_vm_sched, HYKTAB + HY_SCHED_OFF, HY_SCHED_BYTES) == 0)
+        return 0;
+    return hy_vm_plan_refresh();
 }
 #endif
 
@@ -140,13 +171,12 @@ static void hy_encrypt(const uint8_t in[16], uint8_t out[16]) {
         return;
     }
 #ifdef WBAES_HAVE_VM
-    uint32_t off[HY_MC_ROUNDS][16];
-    if (hy_vm_plan(0, off) != 0) { // VM fault: no offsets, no ciphertext
+    if (hy_vm_plan_get() != 0) { // VM fault: no offsets, no ciphertext
         wbaes_key::g_key_tampered |= 0x8000u;
         for (int i = 0; i < 16; i++) out[i] = (uint8_t)(wb_runtime_rand() & 0xFF);
         return;
     }
-    const uint32_t(*poff)[16] = off;
+    const uint32_t(*poff)[16] = hy_vm_off[0];
 #else
     const uint32_t(*poff)[16] = nullptr;
 #endif
@@ -187,13 +217,12 @@ static void hy_decrypt(const uint8_t in[16], uint8_t out[16]) {
         return;
     }
 #ifdef WBAES_HAVE_VM
-    uint32_t off[HY_MC_ROUNDS][16];
-    if (hy_vm_plan(1, off) != 0) {
+    if (hy_vm_plan_get() != 0) {
         wbaes_key::g_key_tampered |= 0x8000u;
         for (int i = 0; i < 16; i++) out[i] = (uint8_t)(wb_runtime_rand() & 0xFF);
         return;
     }
-    const uint32_t(*poff)[16] = off;
+    const uint32_t(*poff)[16] = hy_vm_off[1];
 #else
     const uint32_t(*poff)[16] = nullptr;
 #endif
