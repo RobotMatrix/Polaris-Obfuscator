@@ -18,8 +18,8 @@ driver writes everything into `--out` and never edits `--src`.
 |---|---|---|
 | `harden_export.py` | driver | table scrub → KAT replacement → build → Mach-O scrub → self-check, plus the optional probe/bench/VM/vm-negative builds |
 | `hy_scrub.cpp` | 1. table | pre-composes every 256-entry S-box-shaped table with a per-build affine map and absorbs the inverse into the 64K decode tables it feeds. 0 bytes / 0 ops at run time. **No target in the F4 generation** (its front is 2^16-entry 16-bit pair tables, not S-box rows): it verifies the artifact, writes it back byte-for-byte and reports `tables_reenencoded: 0` — see its header and README §5.29 |
-| `macho_scrub.py` | 3. metadata | post-link rename of every custom section and every defined symbol from the build seed, drops local/debug symbols, rebuilds `LC_SYMTAB`/`LC_DYSYMTAB`, re-signs ad hoc |
-| `m1_detect.py` | measure | the attacker's first ten minutes as a score: `nm`, `otool -l`, `__cstring`, S-box byte search, NIST vector search, 256-entry table classifier, build-metadata scan |
+| `macho_scrub.py` | 3. metadata | post-link rename of every custom section and every defined symbol from the build seed, drops local/debug symbols, rebuilds `LC_SYMTAB`/`LC_DYSYMTAB`, empties `LC_DYLD_EXPORTS_TRIE` (the second name table), re-signs ad hoc |
+| `m1_detect.py` | measure | the attacker's first ten minutes as a score: `nm`, `otool -l`, `__cstring`, the export trie and the string table, S-box byte search, NIST vector search, 256-entry table classifier, build-metadata scan |
 | `m1scan.c` | measure | the byte half of M1: counts 256-byte windows that are permutations and 4-uniform (an S-box row up to invertible maps on both sides). Compiled on demand by `m1_detect.py` |
 | `hy_selftest.cpp` | diagnose | compares every round of a rewritten table against the original, one line per `(dir, round)`. This is what caught the index-permutation dead end — see the header of `hy_scrub.cpp` |
 | `vm_negative_test.cpp` | prove | V2 of `VM-REQUIREMENT.md` on the hardened tree: flip one schedule byte the code never reads directly, and the ciphertext must move because the VM recomputes the offsets from the renamed section |
@@ -35,6 +35,13 @@ table is padded to the old size, so no load command moves) and fixes the
 `LC_DYSYMTAB` ranges plus the stub indirection table, then re-signs ad hoc —
 an arm64 macOS binary with a stale embedded signature is killed on exec.
 
+The symbol table is **not** the only place those names live. ld64 also writes the
+defined names into `LC_DYLD_EXPORTS_TRIE`, and the tool refused to write an
+artifact whose trie or string table still matched `WBAES|hsvm|hy_vm|wbaes|hytab|
+_ZN` after the rewrite. Rewriting one name table and leaving the other is worse
+than doing nothing: the artifact looks anonymous to `nm` while `dyld_info
+-exports` still prints every original name at its address.
+
 For a device build the last step must sign with the real identity and
 entitlements instead; `codesign -s -` is enough only because this artifact is a
 `macos` challenge binary.
@@ -43,6 +50,7 @@ entitlements instead; `codesign -s -` is enough only because this artifact is a
 
 ```bash
 nm -a /tmp/wbaes-hard/wbaes_hard          # 16 seeded names + libc imports
+dyld_info -exports /tmp/wbaes-hard/wbaes_hard   # no entries
 otool -l /tmp/wbaes-hard/wbaes_hard | grep sectname
 strings -a /tmp/wbaes-hard/wbaes_hard | grep -Ei 'aes|wbaes|hytab|hsvm|sbox|mixcolumns|rcon'
 python3 demos/wbaes/tools/m1_detect.py --bin /tmp/wbaes-hard/wbaes_hard --seal demos/wbaes

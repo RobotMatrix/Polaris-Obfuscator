@@ -20,6 +20,14 @@ editor, not custom analysis):
                        over the table blob after the (trivial) unmask
                        (40 pts if any are found)
   S7 build metadata    toolchain/build paths and pass names (10 pts each)
+  S8 export trie       the names in LC_DYLD_EXPORTS_TRIE / LC_DYLD_INFO_ONLY's
+                       export range, plus the LC_SYMTAB string table, matched
+                       against WBAES|hsvm|hy_vm|wbaes|hytab and C++ mangling
+                       (6 pts each, cap 60).  This is the signal whose absence
+                       made the first de-symbolised build score 0 while
+                       `dyld_info -exports` still printed every original name:
+                       rewriting LC_SYMTAB is not scrubbing an artifact, it is
+                       scrubbing one of its two name tables.
 
 Usage:
   python3 m1_detect.py --bin <path> [--seal <dir with hy_seal.h>] [--json]
@@ -34,7 +42,7 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from macho_scrub import MachO  # noqa: E402
+from macho_scrub import MachO, parse_export_trie  # noqa: E402
 
 SBOX = bytes([
     0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
@@ -60,6 +68,9 @@ NIST_CT = bytes.fromhex("7672415a6313c58518fc95c9cb6922b8")
 
 SYM_TELL = re.compile(
     r"aes|hsvm|hytab|sbox|mixcol|rcon|kHyTab|test_pt|test_ct|WBAES|hybrid|wbaes", re.I)
+# Names in the export trie / string table. `_ZN`/`_ZNK` catch a C++ mangled name
+# whatever it spells; the rest are the words this artifact's names are made of.
+EXPORT_TELL = re.compile(r"WBAES|hsvm|hy_vm|wbaes|hytab|_ZN|_ZNK", re.I)
 SECT_TELL = re.compile(r"hytab|hsvm|aes|sbox|wb|hy", re.I)
 STR_TELL = re.compile(
     r"aes|wbaes|hsvm|hytab|sbox|mixcol|rcon|plaintext|ciphertext|vector-match|"
@@ -180,6 +191,22 @@ def detect(path, seal_dir=None, with_tables=True):
     meta_hits = {k.decode(): data.count(k) for k in META if data.count(k)}
     sig["S7_build_metadata"] = {"count": len(meta_hits), "hits": meta_hits,
                                 "points": min(30, 10 * len(meta_hits))}
+
+    # S8: the second name table. LC_SYMTAB is one; dyld's export trie is the
+    # other, and until this signal existed nothing here read it.
+    exp_names = [e["name"] for e in m.exports()]
+    strtab_names = []
+    tab = m.symtab()
+    if tab is not None:
+        _o, _symoff, nsyms, stroff, strsize = tab
+        blob = bytes(m.data[stroff:stroff + strsize])
+        strtab_names = [s.decode("latin1") for s in blob.split(b"\0") if s]
+    exp_hits = sorted({n for n in exp_names + strtab_names if EXPORT_TELL.search(n)})
+    sig["S8_export_trie_names"] = {
+        "count": len(exp_hits), "hits": exp_hits[:20],
+        "exports": len(exp_names), "strtab": len(strtab_names),
+        "points": min(60, 6 * len(exp_hits)),
+    }
 
     total = sum(v["points"] for v in sig.values())
     return {"binary": path, "size": len(data), "signals": sig, "score": total}

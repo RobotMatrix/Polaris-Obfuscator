@@ -663,7 +663,11 @@ $ python3 tools/harden_export.py --src . --out /tmp/wbaes-f4-hard \
 条指令、**0** 条间接跳转。
 
 M1 检测分：`wbaes_f4_clean` **155 → 0**，`wbaes_f4_max` **100 → 0**（`wbaes_f4_max` 本来就
-没有调试串和 KAT，剩下可去的只有 15 个符号、2 个段名、1 条 `hy_seal` 元数据）。体积
+没有调试串和 KAT，剩下可去的只有 15 个符号、2 个段名、1 条 `hy_seal` 元数据）。这两组数是
+S1–S7 口径；红队指出 `LC_DYLD_EXPORTS_TRIE` 泄漏后新增 S8（读导出 trie + 字符串表），
+同一批产物变成 `wbaes_f4_clean` **215 → 0**、`wbaes_f4_max` **160 → 0**，而**旧版**
+`wbaes_f4_hard` / `wbaes_f4_strip` 由 0 变 **60**（trie 里 16 个原始名），修复后的重导出
+才真正是 **0**。详见 `reports/EXPORT-HARDENING.md` §10。体积
 70,707,184 → 70,296,208 B（−410,976 B，−0.58 %），全是元数据。
 
 **代价（攻击者侧，同机同表，cold = 无解掩缓存，warm = `--cache` 命中）**：

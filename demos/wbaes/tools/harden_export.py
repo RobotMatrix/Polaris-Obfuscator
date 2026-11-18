@@ -179,6 +179,32 @@ def run(cmd, **kw):
     return r
 
 
+def _macho(path):
+    sys.path.insert(0, HERE)
+    from macho_scrub import MachO
+    return MachO(path)
+
+
+def count_exports(path):
+    """How many names the dyld export trie carries (the second name table)."""
+    return len(_macho(path).exports())
+
+
+TELL_RE = re.compile(r"WBAES|hsvm|hy_vm|wbaes|hytab|_ZN|_ZNK", re.I)
+
+
+def tell_names(path):
+    """Tell-strings left in the export trie or the LC_SYMTAB string table."""
+    m = _macho(path)
+    names = [e["name"] for e in m.exports()]
+    tab = m.symtab()
+    if tab is not None:
+        _o, _symoff, _n, stroff, strsize = tab
+        blob = bytes(m.data[stroff:stroff + strsize])
+        names += [s.decode("latin1") for s in blob.split(b"\0") if s]
+    return sorted({n for n in names if TELL_RE.search(n)})
+
+
 def patch_demo(path, key):
     """Two anchored edits. Fails loudly if the tree moved under us."""
     src = open(path).read()
@@ -329,10 +355,22 @@ static inline uint64_t hy_fnv64(const uint8_t *p, unsigned n) {
 
     # ---- 6. Mach-O -----------------------------------------------------
     if not a.skip_macho:
-        run([sys.executable, os.path.join(HERE, "macho_scrub.py"),
-             "--in", os.path.join(out, "wbaes_hard_raw"),
-             "--out", os.path.join(out, "wbaes_hard"), "--seed", a.seed])
+        raw_exports = count_exports(os.path.join(out, "wbaes_hard_raw"))
+        r = run([sys.executable, os.path.join(HERE, "macho_scrub.py"),
+                 "--in", os.path.join(out, "wbaes_hard_raw"),
+                 "--out", os.path.join(out, "wbaes_hard"), "--seed", a.seed])
+        log["macho_scrub"] = r.stdout.strip().splitlines()
         log["binary"] = os.path.join(out, "wbaes_hard")
+        # Gate: the export trie is the second name table, and it is the one the
+        # first version of this pass missed. Refuse to ship an artifact whose
+        # trie or string table still spells a name.
+        left = count_exports(log["binary"])
+        tell = tell_names(log["binary"])
+        log["export_trie"] = {"names_in_raw": raw_exports, "names_in_output": left,
+                              "tell_names_in_output": tell}
+        if left or tell:
+            raise SystemExit("export hardening failed: %d trie name(s), %d tell "
+                             "string(s) left: %s" % (left, len(tell), tell[:8]))
     else:
         log["binary"] = log["binary_raw"]
 

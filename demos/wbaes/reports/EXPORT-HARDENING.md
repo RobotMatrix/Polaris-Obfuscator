@@ -20,7 +20,9 @@ Everything below is measured on this host (arm64, 10 CPUs, `pagesize=16384`,
 
 ## 0. Verdict first
 
-* **The naming tells are gone and the score for them is 0.** M1 goes **155 → 0**.
+* **The naming tells are gone and the score for them is 0.** M1 goes **155 → 0**
+  (the score as the scan stood then; **160 → 0** under the scan that now also reads
+  the export trie — §10).
   `nm` shows sixteen seeded names and libc imports; the two custom sections are
   `__DATA,__dmgo6ml7n3` and `__DATA,__xqqjb37njx`; two builds share **no** symbol
   and **no** section name; the NIST plaintext and ciphertext appear **0** times;
@@ -80,6 +82,10 @@ paths never reach `__TEXT` because there is no `__FILE__`, no assert and no
 | S6 256-entry S-box-class tables | 40 if any | 0 → **0** | 0 → **0** | **0** |
 | S7 build metadata | 10/hit, cap 30 | 1 → **10** | 0 → **0** | −10 |
 | **total** | | **155** | **0** | **−155** |
+
+This table is S1–S7, the scan as it stood on 2026-11-18. S8 (export trie and string
+table) was added after the red team found the trie leak; under it the same two
+artifacts score **160 → 0** and the F4 pair is in §10.
 
 S6 is the one that does not move, and §3 explains why that is a property of the
 design rather than a gap in the hardening.
@@ -302,6 +308,10 @@ instructions with **0** indirect branches.
 
 ### 9.2 M1: 100 → 0
 
+> Superseded for the score column by §10.2: the builds below still carried the
+> 16 names in `LC_DYLD_EXPORTS_TRIE`, which the scan did not read. The S1/S2/S7
+> decomposition is still correct.
+
 | artifact | S1 | S2 | S3 | S4 | S5 | S6 | S7 | total |
 |---|---|---|---|---|---|---|---|---|
 | `wbaes_f4_clean` (debug build, in `exported-binaries/…/macos/`) | 60 | 30 | 15 | 0 | 40 | 0 | 10 | **155** |
@@ -369,3 +379,103 @@ renaming it would mean touching code.
    a metadata pass changes that;
 3. the artifact still prints `check: ok`, so it still tells you it passed its own
    test — it just no longer tells you the answer.
+
+---
+
+## 10. The leak this pass missed: `LC_DYLD_EXPORTS_TRIE`
+
+Added after the 2026-11 red team reported it. Everything in §9 above was measured
+on builds that still carried the leak; the numbers in this section are the
+re-measurement, and they replace §9.2's score column for the F4 pair.
+
+### 10.1 What was wrong
+
+`macho_scrub.py` rewrote `LC_SYMTAB` and stopped there. ld64 writes the defined
+names a **second** time, into the dyld export trie (`LC_DYLD_EXPORTS_TRIE`), and
+that copy was untouched:
+
+```
+$ dyld_info -exports wbaes_f4_strip        # the build shipped on 2026-11-18
+    -exports:
+        offset      symbol
+        0x000006CC  __ZN5WBAES8enc_coreERK11WBAESTablesS2_PKhPh
+        0x000006C0  __ZN5WBAES8enc_gateEv
+        0x000006F0  __ZN5WBAES4initEv
+        ...
+        0x00003284  _hsvm_entry
+        0x00003000  _hy_vm_plan
+        0x042E4050  _hsvm_bytecode
+        ...
+$ nm wbaes_f4_strip | head -3
+00000001000006c0 T _afry33fb4r                # same address, seeded name
+```
+
+16 names in a 384-byte trie: the six `WBAES` C++ members, `_hsvm_entry`,
+`_hsvm_bytecode`, `_hsvm_table`, `_hsvm_table_len`, `_hsvm_mem`, the three
+`_hy_vm_*` symbols, `_main` and `__mh_execute_header`. Pairing the trie's
+addresses with the renamed sections (`__hytab` → `__rpw3sxyhfp`) recovers the
+whole map the rename was supposed to remove. `strip -x -S` does not touch it
+either: `-x` drops local symbols and `-S` the debug map, and the export trie is
+neither — it is the linker's dynamic symbol table, and the strip build shipped
+with exactly the same 16 names in it.
+
+### 10.2 Why partial scrubbing is worse than none
+
+A build with every name intact is obviously labelled, and its owner knows it.
+A build whose `nm` output is 16 seeded names reads as anonymous and is not: the
+scan we publish as the measure of that anonymity (M1) returned **0** for it,
+because nothing in M1 read the trie. The false negative is the dangerous part,
+not the leak: it is a claim of anonymity that a reviewer trusts. Measured on the
+two artifacts as shipped on 2026-11-18:
+
+| artifact (export trie full of names) | M1 before S8 | M1 with S8 |
+|---|---|---|
+| `wbaes_f4_hard` (pre-fix) | 0 | **60** |
+| `wbaes_f4_strip` (pre-fix) | 0 | **60** |
+| `wbaes_f4_max` (unhardened) | 100 | **160** |
+| `wbaes_f4_clean` (debug build) | 155 | **215** |
+
+### 10.3 The fix
+
+* `macho_scrub.py` walks the trie (ULEB node offsets, NUL-terminated labels,
+  terminal flags/address — the same parser `attacks/residual/macho_symbols.py`
+  uses), then writes the minimal empty trie (`00 00`: root node, no terminal, no
+  children), sets `datasize` to 2 and zeroes the 384 bytes it used to occupy.
+  A main executable does not consult exports at load time — `LC_MAIN` carries the
+  entry point — so nothing observable changes. `--exports zero` zeroes the load
+  command instead; `--exports keep` exists for dylibs, where exports are the ABI.
+* The pass now **refuses to write** an artifact whose export trie or string table
+  still matches `WBAES|hsvm|hy_vm|wbaes|hytab|_ZN|_ZNK`. The first version had no
+  such post-condition, which is exactly why the trie shipped intact.
+* `m1_detect.py` grew **S8**: it parses the export trie and the `LC_SYMTAB`
+  string table (6 points per name, cap 60). It scores the pre-fix builds 60 and
+  the fixed ones 0.
+
+### 10.4 Verification of the re-export (2026-11-18, same seed and sources)
+
+| check | `wbaes_f4_hard` | `wbaes_f4_strip` |
+|---|---|---|
+| sha256 | `e752afb6362102ae5614a5d4520ad4d375a9147dbc5e5910c7b66f26d8dc2c29` | `5c6ff453464b8a172d24b344d39e35d0da1c0602c2394ffc72077bc88cd3a9bc` |
+| size | 70,296,208 B (unchanged) | 70,295,280 B (unchanged) |
+| runs | `check: ok`, exit 0 | `check: ok`, exit 0 |
+| `codesign -vvv` | valid on disk, satisfies DR | valid on disk, satisfies DR |
+| `dyld_info -exports` | no entries | no entries |
+| names in trie | 0 | 0 |
+| M1 (with S8) | **0** | **0** |
+| table section sha256 | `d5c57b33…91e269` | `d5c57b33…91e269` (same bytes, same key) |
+| `__hsvm` bytecode sha256 | `7ad7a45c…45a46` | `7ad7a45c…45a46` |
+| NIST pair via the probe build | `2c0b8f87…7c8d` | `2c0b8f87…7c8d` |
+| schedule byte 48 flipped / restored | `46fc11e8…` / `check: ok` | `3079d0ad…` / `check: ok` |
+
+The two builds differ only in the link flags (`-Wl,-x,-S`), i.e. 928 bytes of
+symbol and debug metadata; the 70,090,816-byte table section, the 488-byte
+bytecode and the key are identical in both, and identical to `wbaes_f4_max`.
+Moving a byte in the schedule block at `__DATA`+70,090,800 changes the ciphertext
+(or fails the self-check, on the builds that print nothing) and restoring the byte
+restores the exact sha256 — the seal still bites, and the trie edit did not
+disconnect it.
+
+`macho_symbols.py` on both: 27 symbols (16 seeded definitions + 11 libc
+imports), **no** exports block, 21 function starts of which 10 have no symbol,
+and no `WBAES|hsvm|hy_vm|wbaes|hytab|_ZN` match anywhere in the output.
+
