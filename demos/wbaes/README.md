@@ -4,13 +4,14 @@
 
 | 项目 | 值 |
 |---|---|
-| 密钥（hex） | `3ae9dfcb63087f5e4ef82fd5daf48eab` |
+| 密钥（hex） | `3acb79e72c06bebbbdcda86dc62f009b` |
 | 长度 | AES-128（16 字节） |
-| 生成方式 | `openssl rand -hex 16` |
-| 生成日期 | 2026-10-29 |
+| 生成方式 | `rotate_key.py`（`os.urandom(16)`） |
+| 生成日期 | 2026-11-18（F4 这一代，见 5.29） |
 | 存放位置 | `demos/wbaes/wbaes_key.h` —— **全仓库唯一明文密钥** |
 | 自验明文 | `6bc1bee22e409f96e93d7e117393172a` |
-| 自验密文 | `7e5232eeaad5b1b17f7a5c009037225d`（pycryptodome AES-128-ECB 预计算，已 openssl 交叉验证） |
+| 自验密文 | `2c0b8f87b6aa8d4a8c7b12d8d2227c8d`（openssl AES-128-ECB 交叉验证） |
+| 取钥状态 | **已被 `attacks/residual/w16_probe.py` 取回**：4,096 次仿射一致性检验、0.08 s。这一代的强度比 dl5/nl 低，见 5.29 |
 
 **设计原则**：明文密钥只存在于 `wbaes_key.h` 一处，且仅用于**编译期**生成查找表。
 密钥以 `key = key_part ⊕ key_mask` 两片分 XOR 存储（volatile 读取阻止编译器
@@ -985,6 +986,113 @@ python3 demos/wbaes/attacks/dca_attack.py --binary …/wbaes_vm2_clean --traces 
   `wbaes_vm2_clean` 上 3.16 s 取回 `4f065a03…`，`reproduces the shipped ciphertext: YES`。
   表结构和 dl5 一样，换钥不等于换结构；两条 P0 买到的是耗时，不是新的静态屏障。
 
+### 5.29 F4 出货：16 位列合并，性能代（2026-11-18）
+
+这一代把 `attacks/residual/W16-EXPERIMENT.md` 测过的 16 位合并从补丁变成仓库里的实现：
+`gen_hybrid.cpp` 与 `wbaes_hybrid.h` 只有一种形状（`HY_FAM_W16`），F0..F3 四族**删掉**了，
+不是留成死分支——它们在同一步长下把部分和放在 8 位表里，表达不了 16 位合并，留着只会让读者
+以为还有选择。四族调度、`SCHED_ENC/DEC`、`--fam 0..3` 一起删；`--fam` 只保留 `4`，
+传 `0..3` 直接 rc 2。VM、调度块 64 B、288 个偏移、每构建掩码种子、封印、DFA 双算、
+负向测试全部未动（`wbaes_vm.cpp` 一个字节没改；`tests/test_vm_offsets` 的"出货布局"用例
+改成 F4 的族字节与 lane stride 131,072）。
+
+**三句话，先说清楚**
+
+1. **它的保证是"密文就是 AES"**。同钥同明文下与 `openssl enc -aes-128-ecb` 逐字节相等，
+   双向可逆——这是这一代唯一对外承诺。
+2. **它比上一代快 20 %，表体积一模一样**：70,090,816 B 不变（列槽仍 798,720 B），
+   每列查表 28 → 20。
+3. **它的取钥强度比 dl5/nl 低**。16 位值只能用仿射编码，于是 pair 表精确 XOR 可分
+   （100 % 复现，dl5 上 0.80 %），一条轴仍是一个密钥字节：**4,096 次廉价检验、0.08 s**
+   （上一代出货产物要 16,384 次）。所以这是**性能代，不是加固代**。
+
+**构造**（每列 798,720 B）
+
+| 区段 | 字节 | 内容 |
+|---|---|---|
+| `[0,524288)` | 512 KiB | 4 张 2^16 项 × 16 位输出的 pair 表：行对 0,1 / lane 0,1、行对 0,1 / lane 2,3、行对 2,3 / lane 0,1、行对 2,3 / lane 2,3 |
+| `[524288,528384)` | 4 KiB | 空（沿用出货步长的对齐缝，留着是为了不改 `HY_COL` 与 VM 的偏移） |
+| `[528384,536576)` | 8 KiB | 32 位重编码：12 正 + 12 逆 S 表、12 个每轮常量（与 dl5 相同，未改） |
+| `[536576,798720)` | 256 KiB | 4 张 2^16 项解码表（每个输出行一张） |
+
+半列部分和 `Y01 = T_L01[b0|b1<<8] ^ T_R01[b2|b3<<8]`，16 位值上的**一次 XOR**；编码 `E`
+是每构建随机的 16×16 GF(2) 可逆矩阵 + 常量（每行对一份，两个半边同 E，常量在 XOR 里抵消）。
+解码表取 16 位下标 → `E^-1` → 加列常量 → 输出双射。全路径没有 8 位合并。
+
+**闸门（新钥 `3acb79e7…`，本机实跑）**
+
+| 判据 | 命令 | 结果 |
+|---|---|---|
+| A1 密文=AES | `openssl enc -aes-128-ecb -K 3acb…` | pt `6bc1bee2…172a` → **`2c0b8f87b6aa8d4a8c7b12d8d2227c8d`**，与产物一致 |
+| A1 双向/随机 | `probe`（8 个随机明文，逐块） | 8/8 加密相等、8/8 解回明文 |
+| A1 生成端自检 | `gen_hybrid` | rc 0：`spn-mds: PASS`、`table-check PASS`、`seal-check PASS` |
+| A1 的负向对照 | 注入一次结构故障（`E` 与其逆不配） | 加密侧 **rc 8**、解密侧 **rc 9** |
+| A2 VM 真被执行 | `-DWBAES_VM_SCHEDTEST` | 完好 `2c0b8f87…` → 翻调度块第 48 字节 `0d95f13482690349cb09f0e8e5fe9a6b` → 恢复 `2c0b8f87…` |
+| A2 DFA | `-DWBAES_DFA_SELFTEST` | 密文 `c703bf11d9b37bc3acea04fd6aea8b27`、回环 `ee7a7dd279868e38979d485750a1956f`，`vector-match: FAIL`（按设计是垃圾） |
+| A2 VM 偏移 | `tests/test_vm_offsets` | `vm-offsets: PASS`（含 F4 出货布局 + 288 项批量计划） |
+| 族维度 | `--fam 0` / `--fam 1` / `--fam 3` | 各 **rc 2**：`this build has one shape (--fam 4); 0..3 cannot express a 16-bit combine` |
+| 封印 | `hy_seal.h` / 运行期自检 | seal `0x502cea34`，全表 + 每 4096 字节抽样双检，`seal-check PASS` |
+| A5 VM 侧回归 | `ctest` (research/hsvm) / `verify_vmp_gate.sh` | 28/28 通过；`PASS: hsvm pass gate`（VM 未改，跑来确证） |
+
+**A3 性能（同一张表、同一台机器，`bench_wbaes 3000`，交错三轮取最好值）**
+
+| 构建 | 加密（三轮） | 解密（三轮） |
+|---|---|---|
+| `wbaes_vm2_clean`（上一代，dl5 + VM） | 16.94 / 16.95 / 17.03 µs | 16.36 / 16.67 / 16.21 µs |
+| **F4（本代）** | **13.25 / 13.38 / 13.24 µs** | **13.74 / 13.65 / 13.53 µs** |
+| 差值 | **16.94 → 13.24 µs（−21.8 %）** | **16.21 → 13.53 µs（−16.5 %）** |
+
+两代都用同一条 `bench_wbaes.cpp`（include 发布 TU，测的就是发布路径），"上一代"是从 HEAD
+源码 + 上一代表重建的，先确认它复现 `7672415a…` 才计时。
+
+**A4 攻击：五个脚本全部是实测的"便宜"**
+
+| 脚本 | 在 F4 产物上 | 实测代价 |
+|---|---|---|
+| `w16_probe.py`（这一代真正的取钥路径） | **16/16 字节 `3acb79e7…`，`reproduces the shipped ciphertext: YES`** | 4,096 次仿射一致性检验 **0.08 s**；全程 32.3 s（15.3 s 解掩 + 12.3 s 分解扫描） |
+| `bge_attack.py` | `incomplete (0/16 bytes)` rc=1：它读的是上一代的 lane 偏移（1024 B 步长），在 F4 里那是 pair 表内部 | 15.2 s（含解掩） |
+| `hs_attack.py` | 在自己的族判据处停止：`round 0 is not F1/T32` rc=1 | 15.4 s（解掩） |
+| `consistency_attack.py` | `0/16`，8 个半列各 5–12 个碰撞对、0 候选 rc=1；它的签名是 8 位 pair 和，F4 上是 16 位 | 0.05 s |
+| `zk_attack.py` | 不适用：断言 zk 布局 70,107,200 B，本产物 70,090,816 B rc=1 | 0.03 s |
+| `dca_attack.py` | `lane slot (col 0, k 0) not in trace` rc=1：找的是上一代 lane 表地址 | 0.08 s |
+| `w16_traces.py`（地址侧真问题） | pair 表下标 = P0(两个明文字节) **512/512**（公开）；解码表下标 = 两个 16 位 pair 值的 XOR **1024/1024** | 64 条真实轨迹，1160 次访问/块 |
+
+**别把这五个 null 当成挡住**：F4 的密钥是 `w16_probe.py` 用 4,096 次廉价检验直接拿到的，
+不需要轨迹、不需要搜索 16 位编码。五个脚本失败只是因为它们写的是上一代的形状。
+
+**上限（不要夸大）**
+
+- **取钥强度是降的**：pair 表 `T[a][b] == X[a]^Y[b]` 在 16 位值上 1,048,576/1,048,576 精确成立；
+  dl5 靠逐 lane 非线性双射才压到 0.80 %。位置数从 64 降到 16，检验数从 16,384 降到 4,096。
+- dl5 的 `Z` 在这里**不存在**：16 位编码必须仿射，非线性编码无法被任何 2^16 索引表撤销
+  （证明与实测见 `W16-EXPERIMENT.md` §1）。
+- 体积不变是**选择**：打包列槽能省 294,912 B（0.42 %），代价是调度块、VM 的 288 个偏移和
+  所有读者偏移全部重算；不值。
+- 仍成立的部分：DFA 双算、封印（全表 + 抽样）、每构建随机掩码种子、VM 计划缓存与调度块快照。
+  它们的价值是"改表/改调度块 → 输出变垃圾"，不是"读表拿不到钥"。
+
+**导出**：`exported-binaries/wbaes-challenge/macos/wbaes_f4_clean` / `wbaes_f4_max`
+（`strip -S` 后 70,707,168 / 70,707,184 B），sha256 见该目录 `sha256.txt`。
+
+**怎么重建**
+
+```bash
+CL=../../src/build/bin/clang++
+python3 rotate_key.py                                  # 换钥（写 wbaes_key.h / wbaes_testvec.h）
+$CL -O2 -std=c++17 -I. gen_hybrid.cpp -o gen_hybrid && ./gen_hybrid hy_table.bin
+$CL -O2 -std=c++17 -DWBAES_BAKED -DWBAES_NO_MIR -DWBAES_HAVE_VM -I. \
+    -mllvm -passes=hsvm -c wbaes_vm.cpp -o wbaes_vm.o
+$CL -O2 -std=c++17 -DWBAES_BAKED -DWBAES_NO_MIR -DWBAES_HAVE_VM -I. \
+    demo_wbaes.cpp hy_tab.S wbaes_vm.o -o wbaes_f4_clean
+$CL -O2 -std=c++17 -DWBAES_BAKED -DWBAES_NO_MIR -DWBAES_HAVE_VM -I. \
+    demo_wbaes.cpp hy_tab.S wbaes_vm.o \
+    -mllvm -passes=alias,gvenc,indcall,indbr,mba,sub,bcf,fla -o wbaes_f4_max
+$CL -O2 -std=c++17 -DWBAES_HAVE_VM -I. tests/test_vm_offsets.cpp wbaes_vm.o -o test_vm_offsets
+```
+
+（换钥后**必须重建 `gen_hybrid` 再生成**：旧的可执行文件里是旧钥，它自己的自检也会用旧
+自验向量通过，于是会安静地生成一张旧钥的表。）
+
 ## 6. 安全性边界（教学版声明）
 
 本实现是 Chow 思路的**简化教学版**，与完整 Chow white-box 差距：
@@ -994,6 +1102,9 @@ python3 demos/wbaes/attacks/dca_attack.py --binary …/wbaes_vm2_clean --traces 
 - 密钥分片 XOR 存储，二进制中密钥/轮密钥明文序列 0 命中（已验证）
 - ⚠️ 编码是 GF(2) 线性仿射，**不抵抗 DFA**（差分故障分析）——抗 DFA 需要非线性
   双射编码 + T-box/混合双射分离 + 内部编码消除网络（Chow 完整版）
+- ⚠️ **当前出货的一代（F4，5.29）承诺的只有"密文等于 AES"**：它的表层比上一代更容易取钥
+  （16 位 pair 表精确 XOR 可分，4,096 次廉价检验 / 0.08 s），买到的是一块 20 % 的耗时。
+  不要把它当加固代读；加固的部分只有 DFA 双算、封印、掩码与 VM 的数据驱动。
 - ⚠️ 仿射矩阵由密钥派生且确定性生成：同一密钥每次编译表相同；
   生产版应每次构建注入随机种子
 

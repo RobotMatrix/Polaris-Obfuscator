@@ -33,8 +33,8 @@ attacks/residual/
   res16.py                 (f) 16 位合并形状的读取器、Decomp16、16 位值的密钥判别
   w16_probe.py             (f) 16 位合并：前置算术、XOR 可分解性、分解、取钥、代价
   w16_traces.py            (f) 16 位合并：地址轨迹侧（pair 表下标 vs P0、解码表 16 位下标）
-  w16/F4.patch             (f) 该变体的生成器/头文件补丁（仓库里的两个文件未改）
-                               （构造、实测与结论见 W16-EXPERIMENT.md）
+                               （构造、实测与结论见 W16-EXPERIMENT.md；该形状自 2026-11-18 起
+                                 就是 demos/wbaes 的实现：F4 的补丁文件已删除，代码在树里）
 ```
 
 与 `attacks/` 下已有脚本的关系：这四个脚本**不修改** `wblib.py`、`bge_attack.py`、

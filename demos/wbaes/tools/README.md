@@ -17,7 +17,7 @@ driver writes everything into `--out` and never edits `--src`.
 | file | stage | why it exists |
 |---|---|---|
 | `harden_export.py` | driver | table scrub → KAT replacement → build → Mach-O scrub → self-check, plus the optional probe/bench/VM/vm-negative builds |
-| `hy_scrub.cpp` | 1. table | pre-composes every 256-entry S-box-shaped table with a per-build affine map and absorbs the inverse into the 64K decode tables it feeds. 0 bytes / 0 ops at run time |
+| `hy_scrub.cpp` | 1. table | pre-composes every 256-entry S-box-shaped table with a per-build affine map and absorbs the inverse into the 64K decode tables it feeds. 0 bytes / 0 ops at run time. **No target in the F4 generation** (its front is 2^16-entry 16-bit pair tables, not S-box rows): it verifies the artifact, writes it back byte-for-byte and reports `tables_reenencoded: 0` — see its header and README §5.29 |
 | `macho_scrub.py` | 3. metadata | post-link rename of every custom section and every defined symbol from the build seed, drops local/debug symbols, rebuilds `LC_SYMTAB`/`LC_DYSYMTAB`, re-signs ad hoc |
 | `m1_detect.py` | measure | the attacker's first ten minutes as a score: `nm`, `otool -l`, `__cstring`, S-box byte search, NIST vector search, 256-entry table classifier, build-metadata scan |
 | `m1scan.c` | measure | the byte half of M1: counts 256-byte windows that are permutations and 4-uniform (an S-box row up to invertible maps on both sides). Compiled on demand by `m1_detect.py` |

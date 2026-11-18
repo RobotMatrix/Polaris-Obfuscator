@@ -18,9 +18,16 @@
 > MixColumns rows (half the positions), and the second row pair is redundant — the
 > first already pins the key byte (the other half).
 > The construction is a 20 %/17 % per-block speed-up and costs nothing in volume; as a
-> key barrier it is a small step backwards. Not shipped: the key was not rotated, no
-> `wbaes_w16_*` binary was exported, and `gen_hybrid.cpp` / `wbaes_hybrid.h` /
-> `hy_table.bin` in the repository are untouched (the variant is a patch, §8).
+> key barrier it is a small step backwards.
+>
+> **Shipped (2026-11-18), as a performance generation.** This construction is now the
+> repository's only shape: `gen_hybrid.cpp` and `wbaes_hybrid.h` carry F4 as code (the
+> patch file is gone), the four eight-bit families were removed, the key was rotated to
+> `3acb79e7…`, and `wbaes_f4_clean` / `wbaes_f4_max` are exported. The measurement
+> below stands as measured; the current gate table, timings and attack costs for the
+> shipped build are in `README.md` §5.29, and the strength position is stated there and
+> in `WB-DESIGN-V2.md` §16: AES-compatible, 20 % faster, **weaker** against key
+> extraction than dl5/nl, because the pair table is exactly XOR-separable.
 
 All numbers below are from this machine (macOS arm64, clang-16 16.0.6 at
 `src/build/bin/clang++`, Python 3.12.5, stdlib only). The variant was built and
@@ -270,10 +277,12 @@ pair table. That is how four tables per column come out of the same 16 offsets p
 
 ## 8. Scope, and how to reproduce
 
-* Not shipped: no key rotation, no `exported-binaries/wbaes-challenge/macos/wbaes_w16_*`,
-  no change to `demos/wbaes/gen_hybrid.cpp`, `wbaes_hybrid.h` or `hy_table.bin`. The
-  variant is `attacks/residual/w16/F4.patch` (274 lines, applies with `patch -p1` from
-  the repository root).
+* Shipped since 2026-11-18: F4 **is** the repository's shape. `gen_hybrid.cpp` and
+  `wbaes_hybrid.h` carry it as code, `attacks/residual/w16/F4.patch` was deleted (a
+  patch that no longer applies to anything is worse than no patch), and the key was
+  rotated. The reproduction below is the historical recipe for the measurement run;
+  for the shipped build use `README.md` §5.29, which builds from the tree without any
+  patching step.
 * The scripts are `attacks/residual/res16.py` (F4 readers, `Decomp16`, the 16-bit key
   test), `w16_probe.py` (W2: preconditions, fit, decompositions, key, cost) and
   `w16_traces.py` (W3: the address-side measurement). `run_shipped.py` is the driver
@@ -283,10 +292,10 @@ pair table. That is how four tables per column come out of the same 16 offsets p
   the 100 % fit, the unchanged ciphertext) does not.
 
 ```sh
-# 1. scratch tree + the variant
+# HISTORICAL RECIPE (the measurement run). The tree no longer needs steps 1's patch:
+# F4 is the shipped shape, and `git archive HEAD demos/wbaes` now contains it.
 mkdir -p /tmp/w16 && cd /tmp/w16
 git -C $REPO archive HEAD demos/wbaes | tar x
-patch -p1 < $REPO/demos/wbaes/attacks/residual/w16/F4.patch
 cd demos/wbaes
 
 # 2. table + binaries
@@ -322,6 +331,7 @@ python3 w16_traces.py --table /tmp/w16/demos/wbaes/hy_table.bin \
 2. It is not a key barrier: the encoding it needs is forced to be affine, the pair
    table becomes exactly XOR-separable, and one axis of it is still one key byte.
 3. The measured work factor is 4,096 cheap tests for the whole key (2^8 per byte,
-   down from 16,384), i.e. script-level, so this generation was not shipped.
-4. Worth shipping only as the performance rewrite it is, with the strength still
-   booked where it was: DFA, seals, VM — not the table layer.
+   down from 16,384), i.e. script-level. It is shipped anyway, as a performance
+   generation, with that stated here and in README §5.29.
+4. Shipped as the performance rewrite it is (2026-11-18), with the strength still
+   booked where it was: DFA, seals, VM — not the table layer. README §5.29.

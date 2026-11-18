@@ -83,7 +83,9 @@ PASS: fused 32-bit T-box round == SubBytes+ShiftRows+MixColumns+AddRoundKey on 2
 ```
 PASS: 4 round families agree on 2000 vectors (plain / t32 / t8 / keyed)
 ```
-这四族现在已按轮调度进 `gen_hybrid.cpp`（下一节）。
+这四族当时按轮调度进 `gen_hybrid.cpp`。**F4 那一代（2026-11-18）把它们连同调度一起删了**：
+16 位合并只能有一种形状（F0..F3 在同一步长下把部分和放在 8 位表里），留着就是死分支。
+本节记录的是 dl3 的实测，作为历史仍然成立；现行代码里只有 `HY_FAM_W16`，见 README §5.29。
 
 **踩到的坑（值得记住）**：F3 最初把轮密钥并进表的**索引**（`S(x ^ k)`），三族全错。
 原因是 SubBytes 非线性——常数在 S 之前 XOR 进去不会以常数的形式出来。

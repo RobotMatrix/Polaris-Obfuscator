@@ -7,6 +7,14 @@ table 70,090,816 B). Hardened with `tools/harden_export.py`, seed
 Everything below is measured on this host (arm64, 10 CPUs, `pagesize=16384`,
 `hw.cachelinesize=128`) by the committed scripts. Nothing is estimated.
 
+> **Scope note (2026-11-18).** Step 1 (the table scrub) has no target in the F4
+> generation that is shipped now: its column front is four 2^16-entry pair tables
+> of 16-bit values, not 256-entry S-box rows, so `tools/hy_scrub.cpp` writes the
+> table back byte-for-byte and reports `tables_reenencoded: 0`. Steps 2 and 3
+> (known-answer replacement, Mach-O rename) are unaffected. The numbers below are
+> the dl5/vm2 run and stay valid for that artifact; they say nothing about F4,
+> whose key falls at 4,096 affine-consistency tests (README §5.29).
+
 ---
 
 ## 0. Verdict first
