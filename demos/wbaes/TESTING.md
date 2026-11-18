@@ -21,6 +21,8 @@ python3 tools/verify_all.py --attacks --research   # 再加攻击脚本冒烟 + 
 | 检查 | 含义 | 失败通常意味着 |
 |---|---|---|
 | `exists` | 产物在 `exported-binaries/wbaes-challenge/macos/` | 导出没做 / 路径改了 |
+| `size` | 与 `tools/baseline.json` 记录的体积逐字节一致 | 表几何或元数据变了（必须确认是有意改动，然后 `--update-baseline`） |
+| `cold start` | 进程启动 + 70 MB 解掩 + 封印校验 + 1 块的耗时，允许比基线慢 25% | 解掩/校验路径变慢，或表变大 |
 | `sha256` | 与同目录 `sha256.txt` 一致 | 产物被替换，或 sha256.txt 没更新（两种情况都要查清） |
 | `ciphertext` | 自检打印的密文等于该代的期望值 | 生成器/运行时改坏了函数 |
 | `self-check` | `vector-match: PASS` | 同上，或自检代码被改动 |
@@ -31,9 +33,21 @@ python3 tools/verify_all.py --attacks --research   # 再加攻击脚本冒烟 + 
 ## 它刻意不检查什么
 
 ```
+✗ 每块加解密速度：demo 只跑一块，测不出单块成本（它测的是"启动 + 解掩 + 1 块"= cold start）
+  单块数字来自 bench_wbaes，记录在 WB-DESIGN-V2 / FINAL-ASSESSMENT，不在这个门里
 ✗ 攻击强度：任何"某脚本失败/成功"都不是回归判据
    —— 历史上五个脚本全失败、密钥仍被 1.4 s 拿到；脚本成功也只是那条路径的结论
 ✓ 强度只在 FINAL-ASSESSMENT.md 里以"每密钥字节的检验次数"记账
+```
+
+## 基线（体积 / 冷启动）
+
+```
+tools/baseline.json 记录每代的 size 与 cold_s（首次运行用 --update-baseline 生成）
+  size     逐字节比对，任何偏差都算 FAIL（几何/元数据是可复现的）
+  cold_s   允许比基线慢 25%（--tol 可调），噪声主要来自页缓存与主机负载
+有意改动（换表几何、加字段）之后必须显式刷新基线，否则门会红——这是设计意图：
+  体积/耗时的变化必须被"承认过一次"，不能悄悄漂移
 ```
 
 ## 改动类型 → 必跑的最小集合

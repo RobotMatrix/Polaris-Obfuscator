@@ -24,11 +24,13 @@ Usage:
 """
 import argparse
 import hashlib
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEMO = os.path.dirname(HERE)
@@ -54,8 +56,14 @@ results = []          # (status, generation, check, detail)
 
 
 def record(ok, gen, check, detail=""):
-    results.append(("PASS" if ok else "FAIL", gen, check, detail))
-    print("%-4s %-9s %-22s %s" % ("PASS" if ok else "FAIL", gen, check, detail))
+    """ok=True pass, False fail, None not applicable (no baseline, tool missing).
+
+    None must not read as FAIL: before a baseline exists every size and timing check
+    would otherwise report a failure on a perfectly good tree.
+    """
+    status = "SKIP" if ok is None else ("PASS" if ok else "FAIL")
+    results.append((status, gen, check, detail))
+    print("%-4s %-9s %-22s %s" % (status, gen, check, detail))
     return ok
 
 
@@ -114,25 +122,75 @@ def has_dispatch_loop(binary):
     return any(re.search(r"\bbr\s+x\d+", ln) for ln in body)
 
 
-def check_generation(name, binary_name, key, expected_ct, expect_vm, quick, shas):
+def load_baseline(path):
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (ValueError, OSError):
+        return {}
+
+
+def check_size(name, binary_name, size, baseline, tol):
+    """Artifact size against the recorded baseline.
+
+    Size is a hard check: the table geometry and the metadata are deterministic, so a
+    change of even a few hundred bytes is a real change and has to be acknowledged by
+    updating the baseline on purpose.
+    """
+    want = (baseline.get(binary_name) or {}).get("size")
+    if not want:
+        record(None, name, "size", "%d B (no baseline)" % size)
+        return
+    delta = size - want
+    ok = delta == 0
+    pct = 100.0 * delta / want
+    record(ok, name, "size", "%d B (%+d, %+.3f%%)" % (size, delta, pct))
+
+
+def check_speed(name, binary_name, seconds, baseline, tol):
+    """Cold start: process start, table unmask, seal check and one block.
+
+    This is the figure the demo can actually produce without a bench harness, and it is
+    dominated by the 70 MB unmask, so it tracks load-path regressions rather than the
+    per-block cost. Per-block numbers live in the bench (bench_wbaes) and in the docs;
+    they are recorded here only when a bench binary is supplied.
+    """
+    want = (baseline.get(binary_name) or {}).get("cold_s")
+    if not want:
+        record(None, name, "cold start", "%.3f s (no baseline)" % seconds)
+        return
+    ratio = seconds / want
+    ok = ratio <= 1.0 + tol
+    record(ok, name, "cold start", "%.3f s vs %.3f s baseline (%.2fx, tol %.0f%%)"
+           % (seconds, want, ratio, tol * 100))
+
+
+def check_generation(name, binary_name, key, expected_ct, expect_vm, quick, shas, baseline, tol):
     path = os.path.join(BIN_DIR, binary_name)
     if not os.path.exists(path):
         record(False, name, "exists", "missing %s" % binary_name)
-        return
-    record(True, name, "exists", "%d B" % os.path.getsize(path))
+        return None
+    size = os.path.getsize(path)
+    record(True, name, "exists", "%d B" % size)
+    check_size(name, binary_name, size, baseline, tol)
 
     want = shas.get(binary_name)
     got = sha256_file(path)
     record(want == got if want else None, name, "sha256", got[:16] + (" (no manifest line)" if not want else ""))
 
+    t0 = time.perf_counter()
     try:
         p = run(path)
     except subprocess.TimeoutExpired:
         record(False, name, "runs", "timeout")
         return
+    elapsed = time.perf_counter() - t0
+    check_speed(name, binary_name, elapsed, baseline, tol)
     if p.returncode != 0:
         record(False, name, "runs", "exit %d: %s" % (p.returncode, (p.stderr or p.stdout)[:80]))
-        return
+        return None
     text = p.stdout
     m = re.search(r"ciphertext\s*:?\s*([0-9a-f]{32})", text)
     ct = m.group(1) if m else ""
@@ -154,6 +212,8 @@ def check_generation(name, binary_name, key, expected_ct, expect_vm, quick, shas
         missing = [s for s in needed if s not in syms]
         record(not missing, name, "vm symbols", "present" if not missing else "missing " + ",".join(missing))
         record(not has_dispatch_loop(path), name, "no dispatch loop", "")
+
+    return {"size": size, "cold_s": round(elapsed, 3)}
 
 
 def check_attacks(quick):
@@ -185,6 +245,12 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     ap.add_argument("--quick", action="store_true", help="skip openssl and negative tests")
     ap.add_argument("--only", default="", help="comma separated generation names")
+    ap.add_argument("--baseline", default=os.path.join(HERE, "baseline.json"),
+                    help="recorded sizes and cold-start times")
+    ap.add_argument("--update-baseline", action="store_true",
+                    help="rewrite the baseline from this run (use after an intended change)")
+    ap.add_argument("--tol", type=float, default=0.25,
+                    help="allowed cold-start slowdown vs baseline (default 25%%)")
     ap.add_argument("--attacks", action="store_true", help="also smoke the attack scripts")
     ap.add_argument("--research", action="store_true", help="also run research/hsvm ctest")
     a = ap.parse_args(argv)
@@ -196,17 +262,26 @@ def main(argv=None):
     only = {s.strip() for s in a.only.split(",") if s.strip()}
 
     print("%-4s %-9s %-22s %s" % ("", "gen", "check", "detail"))
+    baseline = load_baseline(a.baseline)
+    fresh = dict(baseline)
     for name, binary, key, ct, vm in GENERATIONS:
         if only and name not in only:
             continue
-        check_generation(name, binary, key, ct, vm, a.quick, shas)
+        meas = check_generation(name, binary, key, ct, vm, a.quick, shas, baseline, a.tol)
+        if meas:
+            fresh[binary] = meas
+    if a.update_baseline:
+        with open(a.baseline, "w") as f:
+            json.dump(fresh, f, indent=2, sort_keys=True)
+            f.write("\n")
+        print("baseline written to %s (%d generations)" % (a.baseline, len(fresh)))
     if a.attacks:
         check_attacks(a.quick)
     if a.research:
         check_research(a.quick)
 
     failed = [r for r in results if r[0] == "FAIL"]
-    skipped = [r for r in results if r[0] is None]
+    skipped = [r for r in results if r[0] == "SKIP"]
     print("\n%d checks, %d passed, %d failed, %d skipped"
           % (len(results), len(results) - len(failed) - len(skipped), len(failed), len(skipped)))
     if failed:
