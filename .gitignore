@@ -40,3 +40,4 @@ exported-binaries/ida-compare-pair/*
 !exported-binaries/ida-compare-pair/README.md
 !exported-binaries/ida-compare-pair/UnityWBAES.cs
 !exported-binaries/ida-compare-pair/f5_allpass.c
+exported-binaries/wbaes-challenge/redteam-*/wbaes_*
