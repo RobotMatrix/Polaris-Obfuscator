@@ -10,6 +10,8 @@
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
 #include "llvm/IR/Module.h"
+#include "llvm/MC/MCContext.h"
+#include "llvm/MC/MCSymbol.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ObfuscationSeed.h"
@@ -19,12 +21,18 @@
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <map>
 #include <random>
 #include <set>
 #include <vector>
 using namespace llvm;
 
 static uint32_t obfRand() { return (uint32_t)llvm::nextObfRandom(); }
+
+// Defined with the S1 name generator further down; the S2 key/label need the
+// same per-build seed and must not consume the junk-code RNG stream.
+static uint64_t mixNameHash(uint64_t H, uint64_t V);
+static uint64_t splitNameSeed();
 
 // ---- S1 split-chunk symbols ----------------------------------------------
 // The MIR split scatters basic blocks inside the enclosing symbol's interval,
@@ -42,6 +50,34 @@ static cl::opt<bool> SplitSymbols(
 static cl::opt<std::string> SplitSymbolsSidecar(
     "split-symbols-sidecar", cl::Hidden, cl::init(""),
     cl::desc("Append the split-chunk -> symbol map to this file"));
+
+// ---- S2 computed branches ------------------------------------------------
+// The split leaves the edges between chunks followable: `b` carries a
+// displacement, and the ADRP+ADD+BR the split emits elsewhere names the
+// target's own block symbol.  Either way a recursive-descent disassembler
+// rebuilds the original CFG without knowing how the blocks were laid out.
+// With this flag a selected edge is turned into
+//
+//     adrp  xB, <table>@PAGE
+//     add   xB, xB, <table>@PAGEOFF
+//     ldrsw xT, [xB, #idx]      ; entry = (target - table) + key
+//     sub   xT, xT, #key
+//     add   xB, xT, xB
+//     br    xB
+//
+// so the successor exists only as a data word in __TEXT,__const and the code
+// carries no displacement and no reference to the target block.  The table
+// stores *table-relative* offsets, not addresses: it needs no rebase (it is
+// slide-safe) and its raw contents are not the final delta until the
+// per-build key is subtracted.  Off by default.
+static cl::opt<bool> ComputedBranches(
+    "computed-branches", cl::Hidden, cl::init(false),
+    cl::desc("Turn split cross-chunk edges into table-driven computed branches"));
+// (function, edge kind, source block, target block, table index) per edge, plus
+// the refusals, so the measurement does not have to infer them from the binary.
+static cl::opt<std::string> ComputedBranchesSidecar(
+    "computed-branches-sidecar", cl::Hidden, cl::init(""),
+    cl::desc("Append the computed-branch edge map to this file"));
 
 #define DEBUG_TYPE "aarch64-obfuscation"
 
@@ -125,10 +161,32 @@ public:
   // Seeded label at the function entry (linkage parity with real symbols).
   std::string emitEntrySymbol(MachineFunction &MF);
 
+  // S2: table-driven edges (see ComputedBranches above).
+  unsigned addCbEntry(MachineBasicBlock *To);
+  bool pickDeadRegs(MachineBasicBlock &MBB, MachineInstr *Before, unsigned N,
+                    std::vector<MCPhysReg> &Out);
+  void emitCbSeq(MachineBasicBlock &MBB, MachineBasicBlock::iterator At,
+                 MCPhysReg Base, MCPhysReg Tmp, unsigned Idx,
+                 std::vector<MachineInstr *> *FixPoint);
+  bool isChunkHead(MachineBasicBlock *MBB) const;
+  bool crossChunk(MachineBasicBlock *From, MachineBasicBlock *To) const;
+  void convertComputedBranches(MachineFunction &MF);
+  void emitComputedBranchTable(MachineFunction &MF);
+
 private:
   // Blocks produced by the split, in emission order; emitChunkSymbols labels
   // the first instruction of each one.
   std::vector<MachineBasicBlock *> ChunkBlocks;
+  // S2: one target table per function, in table-index order.
+  std::vector<MCSymbol *> CbTargets;
+  // Layout run each block belongs to: -1 = the un-split head region, otherwise
+  // the index of the chunk head that starts the run.  A "cross-chunk edge" is
+  // one whose two ends have different ids -- this is the same partition the S1
+  // chunk symbols describe, and it is what the split actually breaks.
+  std::map<MachineBasicBlock *, int> ChunkId;
+  std::string CbTableLabel;
+  std::string CbRecords;
+  unsigned CbConverted = 0, CbSkipped = 0, CbRefused = 0;
   MachineRegisterInfo *MRI = nullptr;
   const AArch64InstrInfo *TII = nullptr;
   const TargetRegisterInfo *TRI = nullptr;
@@ -406,6 +464,23 @@ void AArch64RubbishCodePass::emitIndirectBranch(
     std::vector<MachineInstr *> &FixPoint) {
   DebugLoc DL;
   MachineBasicBlock::iterator At = From.end();
+  if (ComputedBranches) {
+    // Two scratch registers, so the spill/reload pair covers X16 and X17.
+    MachineInstr *Spill =
+        BuildMI(From, At, DL, TII->get(AArch64::STPXpre))
+            .addReg(AArch64::SP, RegState::Define)
+            .addReg(AArch64::X16)
+            .addReg(AArch64::X17)
+            .addReg(AArch64::SP)
+            .addImm(-16)
+            .getInstr();
+    Anchors.insert(Spill);
+    FixPoint.push_back(Spill);
+    emitCbSeq(From, At, AArch64::X16, AArch64::X17, addCbEntry(To), &FixPoint);
+    To->setMachineBlockAddressTaken();
+    To->setLabelMustBeEmitted();
+    return;
+  }
   MachineInstr *Save =
       BuildMI(From, At, DL, TII->get(AArch64::STRXpre))
           .addReg(AArch64::SP, RegState::Define)
@@ -440,15 +515,461 @@ void AArch64RubbishCodePass::emitIndirectBranch(
 
 void AArch64RubbishCodePass::emitX16Reload(
     MachineBasicBlock *To, std::vector<MachineInstr *> &FixPoint) {
-  MachineInstr *Reload =
-      BuildMI(*To, To->begin(), DebugLoc(), TII->get(AArch64::LDRXpost))
-          .addReg(AArch64::SP, RegState::Define)
-          .addReg(AArch64::X16, RegState::Define)
-          .addReg(AArch64::SP)
-          .addImm(16)
-          .getInstr();
+  MachineInstr *Reload;
+  if (ComputedBranches) {
+    // The computed-branch sequence clobbers X16 and X17, and emitIndirectBranch
+    // spilled both as a pair.
+    Reload = BuildMI(*To, To->begin(), DebugLoc(), TII->get(AArch64::LDPXpost))
+                 .addReg(AArch64::SP, RegState::Define)
+                 .addReg(AArch64::X16, RegState::Define)
+                 .addReg(AArch64::X17, RegState::Define)
+                 .addReg(AArch64::SP)
+                 .addImm(16)
+                 .getInstr();
+  } else {
+    Reload = BuildMI(*To, To->begin(), DebugLoc(), TII->get(AArch64::LDRXpost))
+                 .addReg(AArch64::SP, RegState::Define)
+                 .addReg(AArch64::X16, RegState::Define)
+                 .addReg(AArch64::SP)
+                 .addImm(16)
+                 .getInstr();
+  }
   Anchors.insert(Reload);
   FixPoint.push_back(Reload);
+}
+
+// ---- S2: table-driven cross-chunk edges ----------------------------------
+
+// One key for the whole build, 12 bits so `sub #key` stays a single
+// instruction.  It only has to keep the table's raw contents from being the
+// final delta; see reports/SPLIT-COMPUTED-BRANCHES.md for what that is worth.
+static unsigned cbTableKey() {
+  static unsigned K = [] {
+    uint64_t H = mixNameHash(splitNameSeed(), 0x53324b4559ULL); // "S2KEY"
+    return unsigned((H >> 17) % 4095) + 1;
+  }();
+  return K;
+}
+
+// Temp label (leading 'L' keeps it out of the nlist) for this function's table.
+static std::string makeCbTableLabel(StringRef Module, StringRef Fn) {
+  static unsigned Salt = 0;
+  uint64_t H =
+      mixNameHash(splitNameSeed(), (uint64_t)(size_t)hash_value(Module));
+  H = mixNameHash(H, (uint64_t)(size_t)hash_value(Fn));
+  H = mixNameHash(H, ++Salt);
+  char Buf[40];
+  snprintf(Buf, sizeof(Buf), "L__pcb%012llx",
+           (unsigned long long)((H >> 16) & 0xffffffffffffULL));
+  return std::string(Buf);
+}
+
+unsigned AArch64RubbishCodePass::addCbEntry(MachineBasicBlock *To) {
+  MCSymbol *Sym = To->getSymbol();
+  To->setMachineBlockAddressTaken();
+  To->setLabelMustBeEmitted();
+  CbTargets.push_back(Sym);
+  return CbTargets.size() - 1;
+}
+
+bool AArch64RubbishCodePass::isChunkHead(MachineBasicBlock *MBB) const {
+  for (MachineBasicBlock *C : ChunkBlocks)
+    if (C == MBB)
+      return true;
+  return false;
+}
+
+bool AArch64RubbishCodePass::crossChunk(MachineBasicBlock *From,
+                                        MachineBasicBlock *To) const {
+  auto A = ChunkId.find(From), B = ChunkId.find(To);
+  if (A == ChunkId.end() || B == ChunkId.end())
+    return false;
+  return A->second != B->second;
+}
+
+// Pick N general-purpose registers that are dead on every outgoing path at
+// Before.  Caller-saved only (RegListX skips x8/x16/x17/x18/x29/x30) and the
+// live-out set is the union over the successors' live-ins, so a register that
+// is live into *either* arm of a conditional is never handed out.
+bool AArch64RubbishCodePass::pickDeadRegs(MachineBasicBlock &MBB,
+                                          MachineInstr *Before, unsigned N,
+                                          std::vector<MCPhysReg> &Out) {
+  LivePhysRegs LiveRegs;
+  LiveRegs.init(*MBB.getParent()->getSubtarget().getRegisterInfo());
+  LiveRegs.addLiveOutsNoPristines(MBB);
+  for (auto I = MBB.rbegin(), E = MBB.rend(); I != E; ++I) {
+    if (&*I == Before)
+      break;
+    LiveRegs.stepBackward(*I);
+  }
+  if (Before != MBB.end())
+    LiveRegs.stepBackward(*Before);
+  for (MCPhysReg Reg : RegListX) {
+    if (Out.size() == N)
+      break;
+    if (LiveRegs.available(*MRI, Reg))
+      Out.push_back(Reg);
+  }
+  return Out.size() == N;
+}
+
+// adrp/add <table>; ldrsw; sub #key; add base; br.  Clobbers Base and Tmp.
+void AArch64RubbishCodePass::emitCbSeq(MachineBasicBlock &MBB,
+                                       MachineBasicBlock::iterator At,
+                                       MCPhysReg Base, MCPhysReg Tmp,
+                                       unsigned Idx,
+                                       std::vector<MachineInstr *> *FixPoint) {
+  DebugLoc DL;
+  MCSymbol *Tbl =
+      MBB.getParent()->getMMI().getContext().getOrCreateSymbol(CbTableLabel);
+  auto Add = [&](MachineInstr *MI) {
+    Anchors.insert(MI);
+    if (FixPoint)
+      FixPoint->push_back(MI);
+  };
+  Add(BuildMI(MBB, At, DL, TII->get(AArch64::ADRP))
+          .addReg(Base, RegState::Define)
+          .addSym(Tbl, AArch64II::MO_PAGE)
+          .getInstr());
+  Add(BuildMI(MBB, At, DL, TII->get(AArch64::ADDXri))
+          .addReg(Base, RegState::Define)
+          .addReg(Base)
+          .addSym(Tbl, static_cast<unsigned char>(AArch64II::MO_PAGEOFF |
+                                                 AArch64II::MO_NC))
+          .addImm(0)
+          .getInstr());
+  // The uimm12s4 operand holds the byte offset divided by 4.
+  Add(BuildMI(MBB, At, DL, TII->get(AArch64::LDRSWui))
+          .addReg(Tmp, RegState::Define)
+          .addReg(Base)
+          .addImm((int64_t)Idx)
+          .getInstr());
+  Add(BuildMI(MBB, At, DL, TII->get(AArch64::SUBXri))
+          .addReg(Tmp, RegState::Define)
+          .addReg(Tmp)
+          .addImm((int64_t)cbTableKey())
+          .addImm(0)
+          .getInstr());
+  // Only the shifted-register form has an encoding; shift 0 is the plain add.
+  Add(BuildMI(MBB, At, DL, TII->get(AArch64::ADDXrs))
+          .addReg(Base, RegState::Define)
+          .addReg(Tmp)
+          .addReg(Base)
+          .addImm(0)
+          .getInstr());
+  Add(BuildMI(MBB, At, DL, TII->get(AArch64::BR)).addReg(Base).getInstr());
+}
+
+// ARMRC_CB_ALL=1 widens the selection from "crosses the split" to "every
+// direct branch in the function"; it only exists to measure the two settings.
+static bool cbAllEdges() {
+  static bool All = getenv("ARMRC_CB_ALL") != nullptr;
+  return All;
+}
+
+// Rewrite the selected edges of one function.  Selection: an edge whose target
+// is a split chunk head (i.e. an edge that crosses the split), never into the
+// entry block (the prologue keeps exactly one visible entry), and never into a
+// chunk that already starts with the split's SP reload.
+void AArch64RubbishCodePass::convertComputedBranches(MachineFunction &MF) {
+  if (!ComputedBranches)
+    return;
+  std::string FnName = MF.getFunction().getName().str();
+  auto Refuse = [&](MachineBasicBlock &MBB, MachineBasicBlock *To,
+                    const char *Why) {
+    ++CbRefused;
+    CbRecords += std::string("refused\t") + FnName + "\t" + Why + "\t" +
+                 std::to_string(MBB.getNumber()) + "\t" +
+                 std::to_string(To->getNumber()) + "\n";
+  };
+  ChunkId.clear();
+  {
+    int Cur = -1, Next = 0;
+    for (MachineBasicBlock &B : MF) {
+      if (isChunkHead(&B))
+        Cur = Next++;
+      ChunkId[&B] = Cur;
+    }
+  }
+  auto StartsWithSpillReload = [](MachineBasicBlock *MBB) {
+    if (MBB->empty())
+      return false;
+    unsigned Opc = MBB->front().getOpcode();
+    return Opc == AArch64::LDRXpost || Opc == AArch64::LDPXpost;
+  };
+
+  for (MachineBasicBlock &MBB : MF) {
+    MachineBasicBlock::iterator TermIt = MBB.getFirstTerminator();
+    if (TermIt == MBB.end())
+      continue;
+    MachineInstr *Term = &*TermIt;
+    unsigned Opc = Term->getOpcode();
+    // Exactly one terminator, at the end: anything else (BR sequences, blocks
+    // that still carry a dead `B` after a Bcc) is left alone, because rewriting
+    // the first of several terminators would leave unreachable branch code.
+    {
+      unsigned NumTerms = 0;
+      bool Last = (Term->getNextNode() == nullptr);
+      for (MachineInstr &I : MBB)
+        if (I.isTerminator())
+          ++NumTerms;
+      if (NumTerms != 1 || !Last) {
+        ++CbRefused;
+        CbRecords += "refused\t" + FnName + "\tterm-chain\t" +
+                     std::to_string(MBB.getNumber()) + "\t-\n";
+        continue;
+      }
+    }
+    if (getenv("ARMRC_CB_DEBUG")) {
+      errs() << "[cb] mbb=" << MBB.getNumber() << " term="
+             << TII->getName(Opc) << " ops=" << Term->getNumOperands()
+             << " succ=" << MBB.succ_size() << " chunk="
+             << (isChunkHead(&MBB) ? 1 : 0) << " id="
+             << ChunkId[&MBB] << " end=";
+      for (MachineBasicBlock *S : MBB.successors())
+        errs() << S->getNumber() << ",";
+      errs() << "\n";
+    }
+
+    // --- unconditional ---
+    if (Opc == AArch64::B) {
+      if (Term->getNumOperands() != 1 || !Term->getOperand(0).isMBB())
+        continue;
+      MachineBasicBlock *To = Term->getOperand(0).getMBB();
+      if (!crossChunk(&MBB, To) && !cbAllEdges()) {
+        Refuse(MBB, To, "not-cross-chunk");
+        continue;
+      }
+      if (To->isEntryBlock()) {
+        Refuse(MBB, To, "entry-block");
+        continue;
+      }
+      if (StartsWithSpillReload(To)) {
+        Refuse(MBB, To, "sp-reload-target");
+        continue;
+      }
+      std::vector<MCPhysReg> R;
+      if (!pickDeadRegs(MBB, Term, 2, R)) {
+        ++CbSkipped;
+        CbRecords += "skip\t" + FnName + "\tregs\t" +
+                     std::to_string(MBB.getNumber()) + "\t" +
+                     std::to_string(To->getNumber()) + "\n";
+        continue;
+      }
+      unsigned Idx = addCbEntry(To);
+      Term->eraseFromParent();
+      emitCbSeq(MBB, MBB.end(), R[0], R[1], Idx, nullptr);
+      ++CbConverted;
+      CbRecords += "cb\t" + FnName + "\tb\t" + std::to_string(MBB.getNumber()) +
+                   "\t" + std::to_string(To->getNumber()) + "\t" +
+                   std::to_string(Idx) + "\n";
+      continue;
+    }
+
+    // --- conditional ---
+    unsigned CCOp = 0;   // instruction that materializes the condition in NZCV
+    unsigned Cond = AArch64CC::EQ;
+    MCPhysReg TestReg = AArch64::NoRegister;
+    int64_t TestMask = 0;
+    bool IsTest = false;
+    // AArch64 branch instructions carry a `bb` operand plus whatever the asm
+    // printer needs; Bcc has three operands (cond, bb, and a symbol slot), so
+    // the target is found by type rather than by position.
+    MachineBasicBlock *Taken = nullptr;
+    for (unsigned i = 0; i < Term->getNumOperands(); i++)
+      if (Term->getOperand(i).isMBB()) {
+        Taken = Term->getOperand(i).getMBB();
+        break;
+      }
+    if (!Taken)
+      continue;
+    switch (Opc) {
+    case AArch64::CBZW:
+    case AArch64::CBZX:
+    case AArch64::CBNZW:
+    case AArch64::CBNZX: {
+      bool Is64 = (Opc == AArch64::CBZX || Opc == AArch64::CBNZX);
+      bool IsNz = (Opc == AArch64::CBNZW || Opc == AArch64::CBNZX);
+      if (!Term->getOperand(0).isReg())
+        continue;
+      CCOp = Is64 ? AArch64::SUBSXri : AArch64::SUBSWri;
+      TestReg = Term->getOperand(0).getReg();
+      Cond = IsNz ? AArch64CC::NE : AArch64CC::EQ;
+      break;
+    }
+    case AArch64::TBZW:
+    case AArch64::TBZX:
+    case AArch64::TBNZW:
+    case AArch64::TBNZX: {
+      bool Is64 = (Opc == AArch64::TBZX || Opc == AArch64::TBNZX);
+      bool IsNz = (Opc == AArch64::TBNZW || Opc == AArch64::TBNZX);
+      if (!Term->getOperand(0).isReg() || !Term->getOperand(1).isImm())
+        continue;
+      unsigned Bit = (unsigned)Term->getOperand(1).getImm();
+      if (Bit >= (Is64 ? 64u : 32u))
+        continue;
+      CCOp = Is64 ? AArch64::ANDSXri : AArch64::ANDSWri;
+      TestReg = Term->getOperand(0).getReg();
+      TestMask = 1LL << Bit;
+      IsTest = true;
+      Cond = IsNz ? AArch64CC::NE : AArch64CC::EQ;
+      break;
+    }
+    case AArch64::Bcc: {
+      if (!Term->getOperand(0).isImm())
+        continue;
+      Cond = (unsigned)Term->getOperand(0).getImm();
+      break;
+    }
+    default:
+      continue;
+    }
+    // The second arm is the block laid out next, not a successor-list entry:
+    // the split moves blocks around and edits successor lists by hand, so the
+    // recorded CFG is not what the assembler emits.  A conditional terminator
+    // falls through to whatever follows it in layout order.
+    MachineBasicBlock *Fall = nullptr;
+    if (MachineFunction::iterator FallIt = std::next(MBB.getIterator());
+        FallIt != MF.end())
+      Fall = &*FallIt;
+    if (!Fall) {
+      Refuse(MBB, Taken, "no-fallthrough");
+      continue;
+    }
+    if (!crossChunk(&MBB, Taken) && !crossChunk(&MBB, Fall) && !cbAllEdges()) {
+      Refuse(MBB, Taken, "not-cross-chunk");
+      continue;
+    }
+    if (Taken->isEntryBlock() || Fall->isEntryBlock()) {
+      Refuse(MBB, Taken->isEntryBlock() ? Taken : Fall, "entry-block");
+      continue;
+    }
+    if (StartsWithSpillReload(Taken) || StartsWithSpillReload(Fall)) {
+      Refuse(MBB, Taken, "sp-reload-target");
+      continue;
+    }
+    std::vector<MCPhysReg> R;
+    if (!pickDeadRegs(MBB, Term, 3, R)) {
+      ++CbSkipped;
+      CbRecords += "skip\t" + FnName + "\tregs-cond\t" +
+                   std::to_string(MBB.getNumber()) + "\t" +
+                   std::to_string(Taken->getNumber()) + "\n";
+      continue;
+    }
+    unsigned IdxT = addCbEntry(Taken);
+    unsigned IdxF = addCbEntry(Fall);
+    DebugLoc DL = Term->getDebugLoc();
+    if (CCOp) {
+      if (IsTest)
+        BuildMI(MBB, TermIt, DL, TII->get(CCOp))
+            .addReg(AArch64::XZR, RegState::Define)
+            .addReg(TestReg)
+            .addImm(TestMask)
+            .addImm(0);
+      else
+        BuildMI(MBB, TermIt, DL, TII->get(CCOp))
+            .addReg(AArch64::XZR, RegState::Define)
+            .addReg(TestReg)
+            .addImm(0)
+            .addImm(0);
+    }
+    // Both arms become data: two loads, one csel, one br.
+    MCSymbol *Tbl = MF.getMMI().getContext().getOrCreateSymbol(CbTableLabel);
+    MCPhysReg Base = R[0], Tmp = R[1], Aux = R[2];
+    auto Add = [&](MachineInstr *MI) { Anchors.insert(MI); };
+    Add(BuildMI(MBB, TermIt, DL, TII->get(AArch64::ADRP))
+            .addReg(Base, RegState::Define)
+            .addSym(Tbl, AArch64II::MO_PAGE)
+            .getInstr());
+    Add(BuildMI(MBB, TermIt, DL, TII->get(AArch64::ADDXri))
+            .addReg(Base, RegState::Define)
+            .addReg(Base)
+            .addSym(Tbl, static_cast<unsigned char>(AArch64II::MO_PAGEOFF |
+                                                   AArch64II::MO_NC))
+            .addImm(0)
+            .getInstr());
+    Add(BuildMI(MBB, TermIt, DL, TII->get(AArch64::LDRSWui))
+            .addReg(Tmp, RegState::Define)
+            .addReg(Base)
+            .addImm((int64_t)IdxT)
+            .getInstr());
+    Add(BuildMI(MBB, TermIt, DL, TII->get(AArch64::LDRSWui))
+            .addReg(Aux, RegState::Define)
+            .addReg(Base)
+            .addImm((int64_t)IdxF)
+            .getInstr());
+    Add(BuildMI(MBB, TermIt, DL, TII->get(AArch64::SUBXri))
+            .addReg(Tmp, RegState::Define)
+            .addReg(Tmp)
+            .addImm((int64_t)cbTableKey())
+            .addImm(0)
+            .getInstr());
+    Add(BuildMI(MBB, TermIt, DL, TII->get(AArch64::SUBXri))
+            .addReg(Aux, RegState::Define)
+            .addReg(Aux)
+            .addImm((int64_t)cbTableKey())
+            .addImm(0)
+            .getInstr());
+    Add(BuildMI(MBB, TermIt, DL, TII->get(AArch64::CSELXr))
+            .addReg(Tmp, RegState::Define)
+            .addReg(Tmp)
+            .addReg(Aux)
+            .addImm((int64_t)Cond)
+            .getInstr());
+    Add(BuildMI(MBB, TermIt, DL, TII->get(AArch64::ADDXrs))
+            .addReg(Base, RegState::Define)
+            .addReg(Tmp)
+            .addReg(Base)
+            .addImm(0)
+            .getInstr());
+    Add(BuildMI(MBB, TermIt, DL, TII->get(AArch64::BR)).addReg(Base).getInstr());
+    Term->eraseFromParent();
+    ++CbConverted;
+    CbRecords += "cb\t" + FnName + "\tcond\t" +
+                 std::to_string(MBB.getNumber()) + "\t" +
+                 std::to_string(Taken->getNumber()) + "\t" +
+                 std::to_string(IdxT) + "\n";
+    CbRecords += "cb\t" + FnName + "\tcond-fall\t" +
+                 std::to_string(MBB.getNumber()) + "\t" +
+                 std::to_string(Fall->getNumber()) + "\t" +
+                 std::to_string(IdxF) + "\n";
+  }
+}
+
+// One table per function in __TEXT,__const:
+//   .long <chunk symbol> - <table> + <key>
+// Table-relative, so the entry needs no rebase and no slide fixup, and it is
+// not the final delta until the key is subtracted.  Emitted as inline asm at
+// the top of the function: the directives switch the section and switch it
+// back, so no bytes land in __text.
+void AArch64RubbishCodePass::emitComputedBranchTable(MachineFunction &MF) {
+  if (!ComputedBranches || CbTargets.empty())
+    return;
+  if (!MF.getTarget().getTargetTriple().isOSBinFormatMachO()) {
+    static bool Warned = false;
+    if (!Warned) {
+      Warned = true;
+      errs() << "[computed-branches] only implemented for Mach-O, skipped\n";
+    }
+    return;
+  }
+  unsigned Key = cbTableKey();
+  std::string S = ".section __TEXT,__const\n.p2align 2\n";
+  S += CbTableLabel + ":\n";
+  for (MCSymbol *T : CbTargets) {
+    S += ".long " + T->getName().str() + " - " + CbTableLabel + " + " +
+         std::to_string(Key) + "\n";
+  }
+  S += ".section __TEXT,__text,regular,pure_instructions\n";
+  char *Persist = new char[S.size() + 1];
+  memcpy(Persist, S.c_str(), S.size() + 1);
+  MachineBasicBlock &Entry = MF.front();
+  BuildMI(Entry, Entry.begin(), nullptr, TII->get(AArch64::INLINEASM))
+      .addExternalSymbol(Persist)
+      .addImm(InlineAsm::Extra_HasSideEffects);
+  if (getenv("ARMRC_DEBUG"))
+    errs() << "[computed-branches] " << MF.getFunction().getName()
+           << " entries=" << CbTargets.size() << " key=" << Key << "\n";
 }
 
 // Split MBB between Header and Tail and move the body to the end of the
@@ -571,8 +1092,9 @@ AArch64RubbishCodePass::splitBasicBlock(MachineBasicBlock *MBB,
 
   Body->moveBefore(&*MF->end());
   // S1: both halves of the split are chunks; the head stays with MBB and keeps
-  // the real function symbol, so only Body and End are candidates.
-  if (SplitSymbols) {
+  // the real function symbol, so only Body and End are candidates.  S2 needs
+  // the same set even when S1 is off: it is the set of cross-chunk edges.
+  if (SplitSymbols || ComputedBranches) {
     ChunkBlocks.push_back(Body);
     ChunkBlocks.push_back(End);
   }
@@ -845,7 +1367,7 @@ void AArch64RubbishCodePass::obfuscateControlFlow(MachineFunction &MF) {
   std::vector<MachineBasicBlock *> RMBNewBlocks;
   randomMoveBasicBlock(MF, FixPoint, RMBNewBlocks);
   // S1: the fragments randomMoveBasicBlock cut out are chunks as well.
-  if (SplitSymbols) {
+  if (SplitSymbols || ComputedBranches) {
     for (MachineBasicBlock *NB : RMBNewBlocks) {
       if (NB != &MF.front())
         ChunkBlocks.push_back(NB);
@@ -1063,6 +1585,32 @@ static void appendSplitSidecar(const std::string &Records) {
   Ofs << Records;
 }
 
+// Per-function record for the measurement, appended like the S1 sidecar.
+static void appendComputedBranchSidecar(const std::string &Fn, unsigned Conv,
+                                        unsigned Skip, unsigned Refused,
+                                        unsigned Entries,
+                                        const std::string &Table,
+                                        const std::string &Records) {
+  if (ComputedBranchesSidecar.empty())
+    return;
+  static bool HeaderWritten = false;
+  std::ofstream Ofs(ComputedBranchesSidecar, std::ios::app);
+  if (!Ofs.is_open()) {
+    errs() << "[computed-branches] cannot open " << ComputedBranchesSidecar
+           << "\n";
+    return;
+  }
+  if (!HeaderWritten) {
+    HeaderWritten = true;
+    Ofs << "polaris-computed-branches\t1\nseed\t" << std::hex
+        << splitNameSeed() << std::dec << "\nkey\t" << cbTableKey() << "\n";
+  }
+  Ofs << "fn\t" << Fn << "\tconv\t" << Conv << "\tskipped\t" << Skip
+      << "\trefused\t" << Refused << "\tentries\t" << Entries << "\ttable\t"
+      << Table << "\n";
+  Ofs << Records;
+}
+
 // A seeded label at the function's own entry, so a start stays named no matter
 // what happened to the function's real symbol.  Without it a *local-linkage*
 // function is the only kind of start that loses its name to `ld -x` (measured
@@ -1129,14 +1677,33 @@ void AArch64RubbishCodePass::emitChunkSymbols(MachineFunction &MF) {
 }
 
 void AArch64RubbishCodePass::process(MachineFunction &MF, ObfuscateOption &OO) {
+  // S2: the table label has to exist before the split emits its own edges
+  // (emitIndirectBranch adds entries while obfuscateControlFlow runs).
+  if (ComputedBranches)
+    CbTableLabel = makeCbTableLabel(
+        MF.getFunction().getParent()->getModuleIdentifier(),
+        MF.getFunction().getName().str());
   obfuscateControlFlow(MF);
+  if (ComputedBranches)
+    convertComputedBranches(MF);
   if (!getenv("ARMRC_NO_DATAFLOW"))
     obfuscateDataFlow(MF);
+  if (ComputedBranches)
+    emitComputedBranchTable(MF);
   // Labels go in last, so they sit at the chunk's true first instruction.
   emitChunkSymbols(MF);
   for (MachineBasicBlock &MBB : MF) {
     MBB.setMachineBlockAddressTaken();
     MBB.setLabelMustBeEmitted();
+  }
+  if (ComputedBranches) {
+    appendComputedBranchSidecar(MF.getFunction().getName().str(), CbConverted,
+                                CbSkipped, CbRefused, CbTargets.size(),
+                                CbTableLabel, CbRecords);
+    if (getenv("ARMRC_DEBUG"))
+      errs() << "[computed-branches] " << MF.getFunction().getName()
+             << " conv=" << CbConverted << " skipped=" << CbSkipped
+             << " refused=" << CbRefused << "\n";
   }
 }
 
@@ -1170,6 +1737,11 @@ bool AArch64RubbishCodePass::runOnMachineFunction(MachineFunction &MF) {
   // function must not suppress splits in a later function.
   MergedMBBs.clear();
   ChunkBlocks.clear();
+  CbTargets.clear();
+  ChunkId.clear();
+  CbTableLabel.clear();
+  CbRecords.clear();
+  CbConverted = CbSkipped = CbRefused = 0;
   MRI = &MF.getRegInfo();
   TII = MF.getSubtarget<AArch64Subtarget>().getInstrInfo();
   TRI = MF.getSubtarget().getRegisterInfo();
