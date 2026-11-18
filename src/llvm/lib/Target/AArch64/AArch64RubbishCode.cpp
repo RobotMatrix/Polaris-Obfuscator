@@ -23,6 +23,7 @@
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <algorithm>
 #include <map>
 #include <random>
 #include <set>
@@ -52,6 +53,29 @@ static cl::opt<bool> SplitSymbols(
 static cl::opt<std::string> SplitSymbolsSidecar(
     "split-symbols-sidecar", cl::Hidden, cl::init(""),
     cl::desc("Append the split-chunk -> symbol map to this file"));
+
+// ---- S4 per-build chunk granularity --------------------------------------
+// The fixed rule below is `BlockSize = 4`, i.e. a split point on the 4th
+// eligible instruction of a block and then every 8th -- the same in every
+// function of every build, so the chunk count and the chunk sizes of a given
+// function are a stable signature that transfers between builds.  With
+// -split-granularity=random the length of each chunk is drawn from
+// [min, max] eligible instructions, per block, from the build seed
+// (splitNameSeed(), not nextObfRandom() -- the junk-code layout must not
+// depend on this flag).  Same seed -> same layout; different seed -> different
+// split points, chunk counts and chunk sizes.
+static cl::opt<std::string> SplitGranularity(
+    "split-granularity", cl::Hidden, cl::init("fixed"),
+    cl::desc("fixed (default) | random: draw each chunk length from "
+             "-split-chunk-min..-split-chunk-max from the build seed"));
+static cl::opt<unsigned> SplitChunkMin(
+    "split-chunk-min", cl::Hidden, cl::init(3),
+    cl::desc("Random granularity: shortest chunk, in eligible instructions"));
+static cl::opt<unsigned> SplitChunkMax(
+    "split-chunk-max", cl::Hidden, cl::init(7),
+    cl::desc("Random granularity: longest chunk, in eligible instructions"));
+
+static bool randomGranularity() { return SplitGranularity == "random"; }
 
 // ---- S2 computed branches ------------------------------------------------
 // The split leaves the edges between chunks followable: `b` carries a
@@ -201,10 +225,16 @@ public:
   // Seeded label at the function entry (linkage parity with real symbols).
   std::string emitEntrySymbol(MachineFunction &MF);
 
+  // S4: attribute blocks to the source function they came from.  The markers
+  // are emitted by MergeFunction (-merge-then-split) and erased here before
   // ISel, so they cost no bytes; what they buy is the ground truth "which
   // source function does this chunk belong to", which the binary no longer
   // carries once several functions share one interval.
+  bool collectScopeMarkers(MachineFunction &MF);
+  // Scope index of a block, or -1 (no merge markers in this function).
   int scopeOf(MachineBasicBlock *MBB) const {
+    auto It = ScopeOf.find(MBB);
+    return It == ScopeOf.end() ? -1 : It->second;
   }
 
   // S2: table-driven edges (see ComputedBranches above).
@@ -246,8 +276,10 @@ private:
   // one whose two ends have different ids -- this is the same partition the S1
   // chunk symbols describe, and it is what the split actually breaks.
   std::map<MachineBasicBlock *, int> ChunkId;
+  // S4: source-function scope (index from the merge sidecar) of each block.
   // Fragments inherit it through splitAt, so a chunk keeps the scope of the
   // source function whose body it was cut from.  -1 = unattributed.
+  std::map<MachineBasicBlock *, int> ScopeOf;
   std::string CbTableLabel;
   std::string CbRecords;
   unsigned CbConverted = 0, CbSkipped = 0, CbRefused = 0;
@@ -1526,6 +1558,7 @@ AArch64RubbishCodePass::splitBasicBlock(MachineBasicBlock *MBB,
       }
       MBB->removeSuccessor(Body);
       MF->deleteMachineBasicBlock(Body);
+      ScopeOf.erase(Body);
     }
     return nullptr;
   }
@@ -1548,6 +1581,8 @@ AArch64RubbishCodePass::splitBasicBlock(MachineBasicBlock *MBB,
     MergedMBBs.insert(MBB->getNumber());
     Body->eraseFromParent();
     End->eraseFromParent();
+    ScopeOf.erase(Body);
+    ScopeOf.erase(End);
     if (Header == Tail) {
       Point2->eraseFromParent();
     }
@@ -1556,6 +1591,13 @@ AArch64RubbishCodePass::splitBasicBlock(MachineBasicBlock *MBB,
 
   // X16 is allocatable, so spill it before the branch and reload at each
   // target. The slot is 16 bytes, so SP stays 16-byte aligned.
+  // S4: both fragments keep the scope of the block they were cut from, so the
+  // chunk -> source-function map is exact without relying on layout order.
+  auto Scope = ScopeOf.find(MBB);
+  if (Scope != ScopeOf.end()) {
+    ScopeOf[Body] = Scope->second;
+    ScopeOf[End] = Scope->second;
+  }
   emitX16Reload(Body, FixPoint);
   emitX16Reload(End, FixPoint);
   // MBB -> Body is the executed edge. MBB -> End replaces the old dead
@@ -1645,6 +1687,11 @@ void AArch64RubbishCodePass::randomMoveBasicBlock(
           break;
         }
         NewBlocks.push_back(NewBB);
+        // S4: a fragment keeps the source-function scope of the block it was
+        // cut from (only blocks of a merged body carry one).
+        auto Sc = ScopeOf.find(CurBB);
+        if (Sc != ScopeOf.end())
+          ScopeOf[NewBB] = Sc->second;
         BuildMI(*CurBB, CurBB->end(), nullptr, TII->get(AArch64::B))
             .addMBB(NewBB);
         if (NewBB->getFirstTerminator() != NewBB->end()) {
@@ -1859,6 +1906,31 @@ void AArch64RubbishCodePass::obfuscateDataFlow(MachineFunction &MF) {
   }
 }
 
+// S4: chunk length for one split opportunity, in "eligible instructions" (the
+// unit the fixed rule counts: BlockSize = 4 splits on the 4th, then every 8th).
+// Seeded by (build seed, function, block) so it is reproducible under
+// -obf-seed and, like makeChunkSymbolName, does not consume nextObfRandom() --
+// the junk-code layout must not depend on the granularity mode.
+static unsigned drawChunkLen(StringRef Fn, unsigned BlockNo, uint64_t &State) {
+  uint64_t S = State ? State
+                     : mixNameHash(splitNameSeed(),
+                                   (uint64_t)hash_value(Fn) ^
+                                       ((uint64_t)BlockNo << 32));
+  S = mixNameHash(S, 0x534c454e4b48554eULL);
+  State = S;
+  unsigned Lo = std::min(SplitChunkMin.getValue(), SplitChunkMax.getValue());
+  unsigned Hi = std::max(SplitChunkMin.getValue(), SplitChunkMax.getValue());
+  // Floor measured on demo6: a 2-instruction chunk puts the following
+  // conditional branch's block label at a position the Mach-O assembler
+  // refuses to relocate ("conditional branch requires assembler-local label",
+  // 10 errors), 3 assembles clean.  Clamp rather than fail the build.
+  if (Lo < 3)
+    Lo = 3;
+  if (Hi < Lo)
+    Hi = Lo;
+  return Lo + (unsigned)((S >> 24) % (Hi - Lo + 1));
+}
+
 void AArch64RubbishCodePass::obfuscateControlFlow(MachineFunction &MF) {
   std::vector<MachineBasicBlock *> WorkList;
   std::vector<MachineBasicBlock *> AvailableBlocks;
@@ -1881,6 +1953,7 @@ void AArch64RubbishCodePass::obfuscateControlFlow(MachineFunction &MF) {
       WorkList.push_back(&MBB);
   }
   unsigned Times = 1, BlockSize = 4;
+  const bool RandomGran = randomGranularity();
   if (getenv("ARMRC_NO_SPLIT"))
     Times = 0;
   std::vector<MachineInstr *> Instrs;
@@ -1916,6 +1989,15 @@ void AArch64RubbishCodePass::obfuscateControlFlow(MachineFunction &MF) {
         continue;
       }
       unsigned State = 0, Reset = 1, ShouldSplit = 0;
+      // S4: per-block chunk length.  Without the flag this stays 2*BlockSize
+      // and the state machine below is the original one, so an unflagged build
+      // lays out byte-identically.
+      uint64_t GranState = 0;
+      unsigned ChunkStep = 0;
+      unsigned ChunkLen =
+          RandomGran ? drawChunkLen(MF.getFunction().getName(),
+                                    MBB->getNumber(), GranState)
+                     : 2 * BlockSize;
       std::vector<MachineInstr *>::iterator Iter = Instrs.begin(),
                                             Bound = --Instrs.end(), Last;
       Iter++, Bound--;
@@ -1940,16 +2022,30 @@ void AArch64RubbishCodePass::obfuscateControlFlow(MachineFunction &MF) {
           if (Reset) {
             Last = Iter;
             State = 0;
+            ChunkStep = 0;
           }
           Reset = 0;
-          if (State == BlockSize - 1) {
+          if (RandomGran) {
+            // S4: one length per chunk, drawn from the build seed.  Split
+            // points -- and therefore chunk counts and chunk sizes -- are a
+            // property of this build, not of the source function.
+            if (++ChunkStep >= ChunkLen) {
+              SplitPoints.push_back(std::make_pair(*Last, *Iter));
+              Last = Iter;
+              ChunkStep = 0;
+              ChunkLen = drawChunkLen(MF.getFunction().getName(),
+                                      MBB->getNumber(), GranState);
+            }
+          } else if (State == BlockSize - 1) {
             ShouldSplit ^= 1;
             if (ShouldSplit) {
               SplitPoints.push_back(std::make_pair(*Last, *Iter));
             }
             Last = Iter;
+            State = 0;
+          } else {
+            State++;
           }
-          State = (State + 1) % BlockSize;
         }
       }
 
@@ -2139,6 +2235,36 @@ std::string AArch64RubbishCodePass::emitEntrySymbol(MachineFunction &MF) {
   return "entry\t" + MF.getFunction().getName().str() + "\t" + Sym + "\n";
 }
 
+// S4: read and remove the per-block scope markers MergeFunction emitted
+// (-merge-then-split).  They are inline asm, so none of them may reach ISel;
+// erasing them here keeps the object identical to a build without the flag.
+// What is left is the ground truth: block -> source function index, which the
+// merged symbol interval itself no longer carries.
+bool AArch64RubbishCodePass::collectScopeMarkers(MachineFunction &MF) {
+  static const char *Prefix = "polaris_merge_scope_";
+  bool Any = false;
+  for (MachineBasicBlock &MBB : MF) {
+    for (MachineBasicBlock::iterator It = MBB.begin(), E = MBB.end(); It != E;) {
+      MachineInstr &MI = *It++;
+      if (MI.getOpcode() != AArch64::INLINEASM || MI.getNumOperands() == 0)
+        continue;
+      MachineOperand &MO = MI.getOperand(0);
+      if (!MO.isSymbol())
+        continue;
+      StringRef Name = MO.getSymbolName();
+      if (!Name.startswith(Prefix))
+        continue;
+      unsigned Idx = 0;
+      if (Name.drop_front(strlen(Prefix)).getAsInteger(10, Idx))
+        continue;
+      ScopeOf[&MBB] = (int)Idx;
+      MI.eraseFromParent();
+      Any = true;
+    }
+  }
+  return Any;
+}
+
 // Give every split chunk its own label.  The label is emitted as inline asm at
 // the block's first instruction, so it reaches MC and becomes a real nlist
 // entry; ld64 derives LC_FUNCTION_STARTS from it as well.
@@ -2266,6 +2392,7 @@ bool AArch64RubbishCodePass::runOnMachineFunction(MachineFunction &MF) {
   CbRingLabel.clear();
   CbKeyW0 = CbKeyW1 = CbMaskKey = 0;
   ChunkId.clear();
+  ScopeOf.clear();
   CbTableLabel.clear();
   CbRecords.clear();
   CbConverted = CbSkipped = CbRefused = 0;
@@ -2274,6 +2401,12 @@ bool AArch64RubbishCodePass::runOnMachineFunction(MachineFunction &MF) {
   TII = MF.getSubtarget<AArch64Subtarget>().getInstrInfo();
   TRI = MF.getSubtarget().getRegisterInfo();
 
+  // S4: the merge markers are inline asm and must not reach ISel, whether or
+  // not this function is obfuscated.
+  bool HadScope = collectScopeMarkers(MF);
+  if (HadScope && getenv("ARMRC_DEBUG"))
+    errs() << "[split-scope] " << MF.getName() << " markers=" << ScopeOf.size()
+           << " mbb=" << MF.size() << "\n";
 
   ObfuscateOption OO;
   Anchors.clear();
@@ -2292,5 +2425,5 @@ bool AArch64RubbishCodePass::runOnMachineFunction(MachineFunction &MF) {
       return true;
     }
   }
-  return false;
+  return HadScope;
 }
