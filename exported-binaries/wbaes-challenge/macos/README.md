@@ -483,6 +483,15 @@ python3 attacks/residual/w16_probe.py --table /tmp/f4_masked.bin --work demos/wb
 复用已解掩的缓存 0.27 s）也给出同一把钥，四条轴互不共享任何中间量——**两条独立实现
 一致 + openssl 复核**，这才算证明。
 
+那条独立实现已经落成通用脚本 `attacks/residual/w16_extract.py`，只吃二进制路径
+（P0 从 `__TEXT,__const` 现读，掩码自己解，缓存可复用）：
+
+```
+python3 attacks/residual/w16_extract.py <any f4 binary> --cache /tmp/x.bin
+  → AES-128 key: 3acb79e72c06bebbbdcda86dc62f009b
+    AES-128(6bc1bee2…) = 2c0b8f87…   8192 tests, 0.4 s（含解掩 18 s 首次）
+```
+
 **两个坑，都会给出 `incomplete: 0/16` 而且不报错**：
 
 1. **把 Mach-O 当 `--table`**（改动前的行为）：掩码从 `__hytab`（本产物偏移 49,280）开始，
