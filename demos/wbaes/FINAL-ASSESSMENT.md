@@ -85,12 +85,17 @@ W16 自 2026-11-18 起是**出货形状**（`wbaes_f4_clean` / `wbaes_f4_max`，
 最终导出前必须逐项确认：
 
 ```
-[ ] MIR 拆分：档 A（标签平权、回溯可用）或档 B（全平权、无回溯）已定选型并实测
-[ ] 符号与导出表：macho_symbols.py 对最终产物 0 命中 WBAES|hsvm|hy_vm|_ZN
-[ ] 表结构：选定的那一代已用 hs/consistency/bge/dca/zk 五条脚本复测，成本写进本文件
-[ ] verify_all.py 全过（含体积与冷启动基线）
-[ ] 对外 README 不含密钥，只给 known-answer 与 openssl 复核方式
-[ ] 若为"兼容 AES + 性能"而改发 f4，必须在同一份文档里写明强度下降（4,096 次检验）
+[x] MIR 拆分：档 B（全平权、无回溯）已定选型并实测（SPLIT-SYMBOLS-AB.md）
+[x] 符号与导出表：macho_symbols.py 对最终产物 0 命中 WBAES|hsvm|hy_vm|_ZN；m1_detect 总分 0
+[x] 表结构：选定代（vm2/nl）成本 16,384 检验 / 18.5 s / 64 轨迹 ~1 s，已写入本文件与 release/README.md
+[x] verify_all.py 全过（78/78）
+[x] 对外 README 不含密钥（grep 密钥 0 命中），只给 known-answer 与 openssl 复核方式
+[ ] 若为"兼容 AES + 性能"而改发 f4，必须在同一份文档里写明强度下降（4,096 次检验）——本次未改发
+```
+
+**已导出**：`exported-binaries/wbaes-challenge/release/wbaes_vm2_max`，
+70,294,736 B，sha256 `2cc368ff050ad1b24573c09d01a4ac7ed6aa99391fa6b0c277a6a45797788b9b`，
+strip + scrub（段名随机化、导出表置空、unwind 置空），自检与 openssl 同值。
 ```
 
 配套约束：

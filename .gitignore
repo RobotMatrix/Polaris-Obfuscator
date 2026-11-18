@@ -41,3 +41,4 @@ exported-binaries/ida-compare-pair/*
 !exported-binaries/ida-compare-pair/UnityWBAES.cs
 !exported-binaries/ida-compare-pair/f5_allpass.c
 exported-binaries/wbaes-challenge/redteam-*/wbaes_*
+exported-binaries/wbaes-challenge/release/wbaes_vm2_max
