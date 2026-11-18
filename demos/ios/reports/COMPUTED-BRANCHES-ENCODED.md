@@ -104,6 +104,9 @@ adrp x16,<table> ; add ; add x16,x16,w17,sxtw ; br x16
 ARMRC_CB_LIMIT=<n>                        # 仅测量：每函数最多转 n 条边（0=不限）
 ```
 
+> 这两个测量旋钮后来改成了 cl::opt：`ARMRC_CB_LIMIT` → `-mllvm -computed-branches-limit=<n>`，
+> `ARMRC_CB_ALL` → `-mllvm -computed-branches-all-edges`（语义不变；本文记录的命令是改名前的）。
+
 sidecar 片段（加密档，seed 12345）：
 
 ```

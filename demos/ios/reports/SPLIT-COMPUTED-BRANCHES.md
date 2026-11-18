@@ -119,6 +119,9 @@ L__pcb<seeded>:
 ARMRC_CB_ALL=1                                   # 只用于测量：把选边放宽到所有直接分支
 ```
 
+> 改名后：`ARMRC_CB_ALL` → `-mllvm -computed-branches-all-edges`（语义不变；
+> 下面的命令是改名前的记录）。
+
 sidecar 片段（seed 12345）：
 
 ```
