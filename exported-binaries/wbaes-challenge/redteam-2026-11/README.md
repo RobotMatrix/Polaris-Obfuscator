@@ -13,6 +13,7 @@ implementation: it takes a 16-byte block, runs it through a 70 MB table program
 | `wbaes_f4_max` | 70,707,184 | `4d72a95a48d6ce99b3ac4bf0a088b98b87dee8700ed17611ea2c27d1db35dba3` |
 | `wbaes_vm2_max` | 70,707,184 | `a68e3c7c713fd1f1f59935df1f84a18ee85e857d04072b8abbf2e8b9455cd9b3` |
 | `wbaes_f4_hard` | 70,296,208 | `84117df40bd992dc7cff13b2d03bedf0dc018756d3789626709381fdd3151a1f` |
+| `wbaes_f4_strip` | 70,295,280 | `6252749ec3bab56f722b6c39f09be1c127fcf10626715b785b9f25c7eff0685d` |
 
 `sha256.txt` repeats the hashes for checking the copies survived transfer.
 
@@ -23,8 +24,15 @@ what to attack.
 
 ## What is given
 
-- The three binaries, runnable as-is (`./wbaes_f4_max` prints a known-answer check,
-  `./wbaes_f4_hard` prints `check: ok`).
+- The four binaries, runnable as-is (`./wbaes_f4_max` prints a known-answer check;
+  the hardened and stripped builds print only `check: ok`, so verify a recovered key
+  against the pairs below plus `openssl`).
+- `wbaes_f4_strip` is `wbaes_f4_hard` linked with `-Wl,-x,-S`: no local symbols, no
+  debug map, and the remaining globals carry seeded names (`_44p2mt7gzt` style). Its
+  detectability score is 0 on the same scan that gives `wbaes_f4_max` 100. It runs the
+  same table and the same VM, and key extraction on it costs the same as on the other
+  F4 builds - symbol stripping changes what a reader sees first, not what the tables
+  contain.
 - One known-answer pair per binary, which is enough to verify a recovered key:
 
 ```

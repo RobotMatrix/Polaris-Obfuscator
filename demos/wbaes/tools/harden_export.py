@@ -247,6 +247,8 @@ def main():
     ap.add_argument("--bench", action="store_true")
     ap.add_argument("--vmtest", action="store_true")
     ap.add_argument("--m1", action="store_true")
+    ap.add_argument("--strip", action="store_true",
+                    help="link with -Wl,-x,-S so no local symbols or debug map survive")
     ap.add_argument("--skip-macho", action="store_true")
     a = ap.parse_args()
 
@@ -258,6 +260,8 @@ def main():
     # ---- 1. table ------------------------------------------------------
     for f in SOURCES:
         shutil.copy2(os.path.join(src_dir, f), os.path.join(out, f))
+    if a.strip:
+        FLAGS.append("-Wl,-x,-S")
     clang = a.clang
     run([clang, "-O2", "-std=c++17", "-I" + out, "-I" + src_dir,
          os.path.join(HERE, "hy_scrub.cpp"), "-o", os.path.join(out, "hy_scrub")])
