@@ -443,7 +443,10 @@ two artifacts as shipped on 2026-11-18:
   children), sets `datasize` to 2 and zeroes the 384 bytes it used to occupy.
   A main executable does not consult exports at load time — `LC_MAIN` carries the
   entry point — so nothing observable changes. `--exports zero` zeroes the load
-  command instead; `--exports keep` exists for dylibs, where exports are the ABI.
+  command instead; it loads as well (measured), but `dyld_info -exports` then
+  synthesises a list from `LC_SYMTAB` and prints the seeded names, so the empty
+  trie is the mode that ships: `dyld_info -exports` prints no entries at all.
+  `--exports keep` exists for dylibs, where exports are the ABI.
 * The pass now **refuses to write** an artifact whose export trie or string table
   still matches `WBAES|hsvm|hy_vm|wbaes|hytab|_ZN|_ZNK`. The first version had no
   such post-condition, which is exactly why the trie shipped intact.
