@@ -1,26 +1,26 @@
 {
   "wbaes_clean": {
-    "cold_s": 0.077,
+    "cold_s": 0.074,
     "size": 69781560
   },
   "wbaes_clean_in": {
-    "cold_s": 0.076,
+    "cold_s": 0.075,
     "size": 69781584
   },
   "wbaes_dl2_clean": {
-    "cold_s": 0.187,
+    "cold_s": 0.188,
     "size": 69798304
   },
   "wbaes_dl3_clean": {
-    "cold_s": 0.195,
+    "cold_s": 0.188,
     "size": 69798304
   },
   "wbaes_dl4_clean": {
-    "cold_s": 0.192,
+    "cold_s": 0.191,
     "size": 69798304
   },
   "wbaes_dl_clean": {
-    "cold_s": 0.191,
+    "cold_s": 0.186,
     "size": 69798224
   },
   "wbaes_f4_clean": {
@@ -28,15 +28,15 @@
     "size": 70707168
   },
   "wbaes_nl_clean": {
-    "cold_s": 0.19,
+    "cold_s": 0.189,
     "size": 70707000
   },
   "wbaes_vm2_clean": {
-    "cold_s": 0.187,
+    "cold_s": 0.191,
     "size": 70707168
   },
   "wbaes_vm_clean": {
-    "cold_s": 0.191,
+    "cold_s": 0.193,
     "size": 69798704
   }
 }

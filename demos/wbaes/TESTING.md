@@ -45,7 +45,7 @@ python3 tools/verify_all.py --attacks --research   # 再加攻击脚本冒烟 + 
 ```
 tools/baseline.json 记录每代的 size 与 cold_s（首次运行用 --update-baseline 生成）
   size     逐字节比对，任何偏差都算 FAIL（几何/元数据是可复现的）
-  cold_s   允许比基线慢 25%（--tol 可调），噪声主要来自页缓存与主机负载
+  cold_s   取三次运行的最小值，允许比基线慢 25%（--tol 可调）；单次采样在负载高的机器上会误报
 有意改动（换表几何、加字段）之后必须显式刷新基线，否则门会红——这是设计意图：
   体积/耗时的变化必须被"承认过一次"，不能悄悄漂移
 ```

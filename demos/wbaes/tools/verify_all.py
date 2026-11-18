@@ -180,13 +180,20 @@ def check_generation(name, binary_name, key, expected_ct, expect_vm, quick, shas
     got = sha256_file(path)
     record(want == got if want else None, name, "sha256", got[:16] + (" (no manifest line)" if not want else ""))
 
-    t0 = time.perf_counter()
-    try:
-        p = run(path)
-    except subprocess.TimeoutExpired:
-        record(False, name, "runs", "timeout")
-        return
-    elapsed = time.perf_counter() - t0
+    # best of three: a single cold-start sample on a loaded host swings by more than
+    # the tolerance for the small generations, which made the gate flaky.
+    elapsed = float("inf")
+    p = None
+    for _ in range(3):
+        t0 = time.perf_counter()
+        try:
+            p = run(path)
+        except subprocess.TimeoutExpired:
+            record(False, name, "runs", "timeout")
+            return None
+        elapsed = min(elapsed, time.perf_counter() - t0)
+        if p.returncode != 0:
+            break
     check_speed(name, binary_name, elapsed, baseline, tol)
     if p.returncode != 0:
         record(False, name, "runs", "exit %d: %s" % (p.returncode, (p.stderr or p.stdout)[:80]))
