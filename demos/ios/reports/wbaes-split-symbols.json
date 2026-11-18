@@ -1,0 +1,170 @@
+{
+ "binary": "W_cf_sym",
+ "file_size": 201800,
+ "text_size": 118168,
+ "nlist_total": 1602,
+ "nlist_defined": 1597,
+ "nlist_text": 1585,
+ "nlist_chunk_symbols": 1565,
+ "nlist_nonchunk_text": 19,
+ "function_starts": 1584,
+ "function_starts_with_symbol": 1584,
+ "real_function_starts": 19,
+ "fake_function_starts": 1565,
+ "sidecar_seed": "3039",
+ "sidecar_functions": {
+  "_ZN5WBAES8enc_coreERK11WBAESTablesS2_PKhPh": 747,
+  "_ZN5WBAES8dec_coreERK11WBAESTablesS2_PKhPh": 818
+ },
+ "sidecar_chunks": 1565,
+ "sidecar_chunks_resolved": 1565,
+ "sidecar_chunks_missing": [],
+ "ground_truth_functions": 2,
+ "ground_truth_function_starts": 19,
+ "ratio_starts_over_gt": 792.0,
+ "ratio_starts_over_baseline": 83.36842105263158,
+ "ratio_text_symbols_over_gt": 792.5,
+ "chunk_leaks": [],
+ "boundary_precision": 0.011994949494949494,
+ "leak_matches": [
+  "__ZN9wbaes_keyL7test_ptE",
+  "__ZN9wbaes_keyL7test_ctE",
+  "__ZN9wbaes_keyL14g_key_tamperedE",
+  "__ZN5WBAES4initEv",
+  "__ZN5WBAES8dec_coreERK11WBAESTablesS2_PKhPh",
+  "__ZN5WBAES8enc_coreERK11WBAESTablesS2_PKhPh",
+  "__ZN5WBAES8enc_gateEv",
+  "__ZNK5WBAES7decryptEPKhPh",
+  "__ZNK5WBAES7encryptEPKhPh",
+  "__ZN5WBAES4initEv",
+  "__ZN5WBAES8dec_coreERK11WBAESTablesS2_PKhPh",
+  "__ZN5WBAES8enc_coreERK11WBAESTablesS2_PKhPh",
+  "__ZN5WBAES8enc_gateEv",
+  "__ZNK5WBAES7decryptEPKhPh",
+  "__ZNK5WBAES7encryptEPKhPh"
+ ],
+ "chunk_map": [
+  {
+   "fn": "_ZN5WBAES8enc_coreERK11WBAESTablesS2_PKhPh",
+   "idx": 520,
+   "sym": "_kcac21c52732d",
+   "addr": "0x100000788"
+  },
+  {
+   "fn": "_ZN5WBAES8enc_coreERK11WBAESTablesS2_PKhPh",
+   "idx": 522,
+   "sym": "_kef66e3a926a7",
+   "addr": "0x1000008f0"
+  },
+  {
+   "fn": "_ZN5WBAES8enc_coreERK11WBAESTablesS2_PKhPh",
+   "idx": 524,
+   "sym": "_k5cb64cc4fefa",
+   "addr": "0x1000009dc"
+  },
+  {
+   "fn": "_ZN5WBAES8enc_coreERK11WBAESTablesS2_PKhPh",
+   "idx": 526,
+   "sym": "_k98f18e4695de",
+   "addr": "0x100000b28"
+  },
+  {
+   "fn": "_ZN5WBAES8enc_coreERK11WBAESTablesS2_PKhPh",
+   "idx": 528,
+   "sym": "_kba7cd64f500b",
+   "addr": "0x100000e2c"
+  },
+  {
+   "fn": "_ZN5WBAES8enc_coreERK11WBAESTablesS2_PKhPh",
+   "idx": 530,
+   "sym": "_kbce1213f38c9",
+   "addr": "0x100000fa0"
+  },
+  {
+   "fn": "_ZN5WBAES8enc_coreERK11WBAESTablesS2_PKhPh",
+   "idx": 532,
+   "sym": "_k346fd39c4be0",
+   "addr": "0x1000010c0"
+  },
+  {
+   "fn": "_ZN5WBAES8enc_coreERK11WBAESTablesS2_PKhPh",
+   "idx": 534,
+   "sym": "_kadf931e2d167",
+   "addr": "0x1000011c4"
+  },
+  {
+   "fn": "_ZN5WBAES8enc_coreERK11WBAESTablesS2_PKhPh",
+   "idx": 536,
+   "sym": "_kfbc96be8e4aa",
+   "addr": "0x1000012f0"
+  },
+  {
+   "fn": "_ZN5WBAES8enc_coreERK11WBAESTablesS2_PKhPh",
+   "idx": 538,
+   "sym": "_k783244dfdc5d",
+   "addr": "0x100001420"
+  },
+  {
+   "fn": "_ZN5WBAES8enc_coreERK11WBAESTablesS2_PKhPh",
+   "idx": 540,
+   "sym": "_k21d4e30b11e6",
+   "addr": "0x100001500"
+  },
+  {
+   "fn": "_ZN5WBAES8enc_coreERK11WBAESTablesS2_PKhPh",
+   "idx": 542,
+   "sym": "_kd1b82fc3e204",
+   "addr": "0x1000015fc"
+  },
+  {
+   "fn": "_ZN5WBAES8enc_coreERK11WBAESTablesS2_PKhPh",
+   "idx": 544,
+   "sym": "_k02a33088fbbd",
+   "addr": "0x100001718"
+  },
+  {
+   "fn": "_ZN5WBAES8enc_coreERK11WBAESTablesS2_PKhPh",
+   "idx": 546,
+   "sym": "_k27be638445fb",
+   "addr": "0x100001814"
+  },
+  {
+   "fn": "_ZN5WBAES8enc_coreERK11WBAESTablesS2_PKhPh",
+   "idx": 8,
+   "sym": "_kf12d255f5a99",
+   "addr": "0x100001830"
+  },
+  {
+   "fn": "_ZN5WBAES8enc_coreERK11WBAESTablesS2_PKhPh",
+   "idx": 548,
+   "sym": "_k72fe9c1bc12a",
+   "addr": "0x100001954"
+  },
+  {
+   "fn": "_ZN5WBAES8enc_coreERK11WBAESTablesS2_PKhPh",
+   "idx": 550,
+   "sym": "_k26a3ea8f570a",
+   "addr": "0x100001ac0"
+  },
+  {
+   "fn": "_ZN5WBAES8enc_coreERK11WBAESTablesS2_PKhPh",
+   "idx": 552,
+   "sym": "_k3c7e3816d1d5",
+   "addr": "0x100001b98"
+  },
+  {
+   "fn": "_ZN5WBAES8enc_coreERK11WBAESTablesS2_PKhPh",
+   "idx": 14,
+   "sym": "_k41fe8942b129",
+   "addr": "0x100001bb0"
+  },
+  {
+   "fn": "_ZN5WBAES8enc_coreERK11WBAESTablesS2_PKhPh",
+   "idx": 554,
+   "sym": "_kb126f85f3162",
+   "addr": "0x100001cf8"
+  }
+ ],
+ "chunk_map_total": 1565,
+ "chunk_map_note": "truncated to 20 of 1565; regenerate with s1_measure.py --sidecar"
+}

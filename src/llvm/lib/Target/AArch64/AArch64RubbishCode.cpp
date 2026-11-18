@@ -1,6 +1,7 @@
 #include "AArch64.h"
 #include "AArch64InstrInfo.h"
 #include "AArch64Subtarget.h"
+#include "llvm/ADT/Hashing.h"
 #include "llvm/CodeGen/LivePhysRegs.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
@@ -9,6 +10,7 @@
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ObfuscationSeed.h"
 #include "llvm/Support/raw_ostream.h"
@@ -16,12 +18,30 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <fstream>
 #include <random>
 #include <set>
 #include <vector>
 using namespace llvm;
 
 static uint32_t obfRand() { return (uint32_t)llvm::nextObfRandom(); }
+
+// ---- S1 split-chunk symbols ----------------------------------------------
+// The MIR split scatters basic blocks inside the enclosing symbol's interval,
+// so Mach-O still reports one function per real function (exported-binaries/
+// README.md, "Function Splitting").  With this flag every split chunk gets a
+// non-temporary local label at its first instruction: ld64 turns those into
+// nlist entries and LC_FUNCTION_STARTS entries, so the region reads as many
+// small functions.  Off by default -- artifacts without the flag are byte
+// identical to the previous behaviour.
+static cl::opt<bool> SplitSymbols(
+    "split-symbols", cl::Hidden, cl::init(false),
+    cl::desc("Emit a seeded local symbol at the start of every split chunk"));
+// Ground truth for the measurement: (function, chunk index, symbol) per chunk.
+// The file is appended to, so several TUs can share one sidecar.
+static cl::opt<std::string> SplitSymbolsSidecar(
+    "split-symbols-sidecar", cl::Hidden, cl::init(""),
+    cl::desc("Append the split-chunk -> symbol map to this file"));
 
 #define DEBUG_TYPE "aarch64-obfuscation"
 
@@ -100,7 +120,13 @@ public:
   void obfuscateControlFlow(MachineFunction &MF);
   bool containsCall(MachineBasicBlock *MBB);
 
+  // S1: one seeded local label per split chunk (see SplitSymbols above).
+  void emitChunkSymbols(MachineFunction &MF);
+
 private:
+  // Blocks produced by the split, in emission order; emitChunkSymbols labels
+  // the first instruction of each one.
+  std::vector<MachineBasicBlock *> ChunkBlocks;
   MachineRegisterInfo *MRI = nullptr;
   const AArch64InstrInfo *TII = nullptr;
   const TargetRegisterInfo *TRI = nullptr;
@@ -542,6 +568,12 @@ AArch64RubbishCodePass::splitBasicBlock(MachineBasicBlock *MBB,
   DirtyBB->setLabelMustBeEmitted();
 
   Body->moveBefore(&*MF->end());
+  // S1: both halves of the split are chunks; the head stays with MBB and keeps
+  // the real function symbol, so only Body and End are candidates.
+  if (SplitSymbols) {
+    ChunkBlocks.push_back(Body);
+    ChunkBlocks.push_back(End);
+  }
   if (getenv("ARMRC_DEBUG"))
     errs() << "[ARMRC] mbb=" << MBB->getNumber() << " body=" << Body->getNumber()
            << " end=" << End->getNumber() << " dirty=" << DirtyBB->getNumber()
@@ -810,6 +842,13 @@ void AArch64RubbishCodePass::obfuscateControlFlow(MachineFunction &MF) {
   std::vector<MachineInstr *> Nops, FixPoint;
   std::vector<MachineBasicBlock *> RMBNewBlocks;
   randomMoveBasicBlock(MF, FixPoint, RMBNewBlocks);
+  // S1: the fragments randomMoveBasicBlock cut out are chunks as well.
+  if (SplitSymbols) {
+    for (MachineBasicBlock *NB : RMBNewBlocks) {
+      if (NB != &MF.front())
+        ChunkBlocks.push_back(NB);
+    }
+  }
   for (MachineBasicBlock &MBB : MF) {
     insertNopInstruction(MBB, 1, Nops);
     bool isNew = false;
@@ -934,11 +973,112 @@ void AArch64RubbishCodePass::obfuscateControlFlow(MachineFunction &MF) {
   }
 }
 
+// Deterministic per-build chunk name: build seed + module + function + chunk
+// index + a process-local salt.  Same source still yields different names per
+// build/TU/function, and no substring of the original name survives.
+// splitmix64 finaliser: a plain xor-shift mix collapses here (two adjacent
+// chunk indices cancelled out and every chunk got the same label).
+static uint64_t mixNameHash(uint64_t H, uint64_t V) {
+  uint64_t X = H + V * 0x9e3779b97f4a7c15ULL;
+  X ^= X >> 30;
+  X *= 0xbf58476d1ce4e5b9ULL;
+  X ^= X >> 27;
+  X *= 0x94d049bb133111ebULL;
+  X ^= X >> 31;
+  return X;
+}
+
+// -obf-seed when the build sets one, otherwise a per-process clock seed (same
+// recipe as ObfuscationSeed, but this does not consume the RNG stream, so the
+// junk-code layout is unchanged whether or not -split-symbols is on).
+static uint64_t splitNameSeed() {
+  static uint64_t Seed = [] {
+    uint64_t S = getObfSeed();
+    if (!S)
+      S = (uint64_t)std::time(nullptr) ^ ((uint64_t)std::clock() << 17) ^
+          0x5A5A5A5AULL;
+    return S;
+  }();
+  return Seed;
+}
+
+static std::string makeChunkSymbolName(StringRef Module, StringRef Fn,
+                                       unsigned Idx) {
+  static uint64_t Salt = 0;
+  uint64_t H = mixNameHash(splitNameSeed(), (uint64_t)(size_t)hash_value(Module));
+  H = mixNameHash(H, (uint64_t)(size_t)hash_value(Fn));
+  H = mixNameHash(H, Idx);
+  H = mixNameHash(H, ++Salt);
+  char Buf[32];
+  snprintf(Buf, sizeof(Buf), "_k%012llx",
+           (unsigned long long)((H >> 16) & 0xffffffffffffULL));
+  return std::string(Buf);
+}
+
+// Give every split chunk its own label.  The label is emitted as inline asm at
+// the block's first instruction, so it reaches MC and becomes a real nlist
+// entry; ld64 derives LC_FUNCTION_STARTS from it as well.
+void AArch64RubbishCodePass::emitChunkSymbols(MachineFunction &MF) {
+  if (!SplitSymbols || ChunkBlocks.empty())
+    return;
+  if (!MF.getTarget().getTargetTriple().isOSBinFormatMachO()) {
+    static bool Warned = false;
+    if (!Warned) {
+      Warned = true;
+      errs() << "[split-symbols] only implemented for Mach-O, skipped\n";
+    }
+    return;
+  }
+  const Function &F = MF.getFunction();
+  std::string FnName = F.getName().str();
+  std::string ModName = F.getParent()->getModuleIdentifier();
+  std::set<MachineBasicBlock *> Seen;
+  std::string Records;
+  unsigned Idx = 0;
+  for (MachineBasicBlock *MBB : ChunkBlocks) {
+    if (!MBB || MBB->empty() || !Seen.insert(MBB).second)
+      continue;
+    std::string Sym = makeChunkSymbolName(ModName, FnName, Idx);
+    // A bare label starts a new atom and `ld -dead_strip` then drops the
+    // unreferenced chunk (measured: the linked binary segfaults).  Keeping
+    // .no_dead_strip lets the label stay in the nlist without turning the
+    // chunk into a dead-strippable atom.
+    std::string Text = ".no_dead_strip " + Sym + "\n" + Sym + ":\n";
+    char *Persist = new char[Text.size() + 1];
+    memcpy(Persist, Text.c_str(), Text.size() + 1);
+    BuildMI(*MBB, MBB->begin(), nullptr, TII->get(AArch64::INLINEASM))
+        .addExternalSymbol(Persist)
+        .addImm(InlineAsm::Extra_HasSideEffects);
+    Records += "chunk\t" + FnName + "\t" + std::to_string(Idx) + "\t" + Sym +
+               "\t" + std::to_string(MBB->getNumber()) + "\n";
+    ++Idx;
+  }
+  if (Idx == 0)
+    return;
+  if (getenv("ARMRC_DEBUG"))
+    errs() << "[split-symbols] " << FnName << " chunks=" << Idx << "\n";
+  if (SplitSymbolsSidecar.empty())
+    return;
+  static bool HeaderWritten = false;
+  std::ofstream Ofs(SplitSymbolsSidecar, std::ios::app);
+  if (!Ofs.is_open()) {
+    errs() << "[split-symbols] cannot open " << SplitSymbolsSidecar << "\n";
+    return;
+  }
+  if (!HeaderWritten) {
+    HeaderWritten = true;
+    Ofs << "polaris-split-symbols\t1\nseed\t" << std::hex << splitNameSeed()
+        << std::dec << "\n";
+  }
+  Ofs << "fn\t" << FnName << "\t" << Idx << "\n" << Records;
+}
+
 void AArch64RubbishCodePass::process(MachineFunction &MF, ObfuscateOption &OO) {
   obfuscateControlFlow(MF);
-  if (getenv("ARMRC_NO_DATAFLOW"))
-    return;
-  obfuscateDataFlow(MF);
+  if (!getenv("ARMRC_NO_DATAFLOW"))
+    obfuscateDataFlow(MF);
+  // Labels go in last, so they sit at the chunk's true first instruction.
+  emitChunkSymbols(MF);
   for (MachineBasicBlock &MBB : MF) {
     MBB.setMachineBlockAddressTaken();
     MBB.setLabelMustBeEmitted();
@@ -974,6 +1114,7 @@ bool AArch64RubbishCodePass::runOnMachineFunction(MachineFunction &MF) {
   // Block numbers restart at 0 for every function. A merged block in one
   // function must not suppress splits in a later function.
   MergedMBBs.clear();
+  ChunkBlocks.clear();
   MRI = &MF.getRegInfo();
   TII = MF.getSubtarget<AArch64Subtarget>().getInstrInfo();
   TRI = MF.getSubtarget().getRegisterInfo();
