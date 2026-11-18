@@ -12,8 +12,8 @@ implementation: it takes a 16-byte block, runs it through a 70 MB table program
 |---|---|---|
 | `wbaes_f4_max` | 70,707,184 | `4d72a95a48d6ce99b3ac4bf0a088b98b87dee8700ed17611ea2c27d1db35dba3` |
 | `wbaes_vm2_max` | 70,707,184 | `a68e3c7c713fd1f1f59935df1f84a18ee85e857d04072b8abbf2e8b9455cd9b3` |
-| `wbaes_f4_hard` | 70,296,208 | `84117df40bd992dc7cff13b2d03bedf0dc018756d3789626709381fdd3151a1f` |
-| `wbaes_f4_strip` | 70,295,280 | `6252749ec3bab56f722b6c39f09be1c127fcf10626715b785b9f25c7eff0685d` |
+| `wbaes_f4_hard` | 70,296,208 | `e752afb6362102ae5614a5d4520ad4d375a9147dbc5e5910c7b66f26d8dc2c29` |
+| `wbaes_f4_strip` | 70,295,280 | `5c6ff453464b8a172d24b344d39e35d0da1c0602c2394ffc72077bc88cd3a9bc` |
 
 `sha256.txt` repeats the hashes for checking the copies survived transfer.
 
@@ -22,6 +22,14 @@ ciphertext, byte-identical table — built with the de-symbolisation pass descri
 below. It is a third target, not a harder one; read that section before choosing
 what to attack.
 
+`wbaes_f4_hard` and `wbaes_f4_strip` share **the same key and the same table**,
+not just the same source: the 70,090,816-byte section hashes to
+`d5c57b33…91e269` in both, and to the same value in `wbaes_f4_max` and in
+`hy_table.bin`. They differ only in link flags (`-Wl,-x,-S` for the strip build),
+which is 928 bytes of symbol/debug metadata — 70,296,208 vs 70,295,280 B. Nothing
+an attacker does to one fails on the other for a reason that has to do with the
+cipher; the difference is entirely what the file says about itself.
+
 ## What is given
 
 - The four binaries, runnable as-is (`./wbaes_f4_max` prints a known-answer check;
@@ -29,7 +37,7 @@ what to attack.
   against the pairs below plus `openssl`).
 - `wbaes_f4_strip` is `wbaes_f4_hard` linked with `-Wl,-x,-S`: no local symbols, no
   debug map, and the remaining globals carry seeded names (`_44p2mt7gzt` style). Its
-  detectability score is 0 on the same scan that gives `wbaes_f4_max` 100. It runs the
+  detectability score is 0 on the same scan that gives `wbaes_f4_max` 160. It runs the
   same table and the same VM, and key extraction on it costs the same as on the other
   F4 builds - symbol stripping changes what a reader sees first, not what the tables
   contain.
@@ -72,9 +80,19 @@ changed, all of them metadata or test vectors; no code and no table byte moved:
 - **Section names.** `__DATA,__hytab` (the 70 MB table) and `__DATA,__hsvm` (the
   bytecode) are now `__DATA,__rpw3sxyhfp` and `__DATA,__r77nbreolp`.
 - **Symbols.** All 16 defined symbols are per-build seeded names
-  (`__hsvm_entry` → `_mrtisyvda7`, `_hsvm_table` → `_r2wqkkzdie`), local and debug
-  symbols are dropped, and the string table that named them is rewritten. `nm -a`
-  matches nothing for `aes|wbaes|hsvm|hytab|sbox|mixcol|rcon|test_pt|test_ct`.
+  (`__hsvm_entry` → `_mrtisyvda7`, `_hsvm_table` → `_r2wqkkzdie`, `_hsvm_bytecode`
+  → `_nqs7izwuif`), local and debug symbols are dropped, and the string table that
+  named them is rewritten. `nm -a` matches nothing for
+  `aes|wbaes|hsvm|hytab|sbox|mixcol|rcon|test_pt|test_ct`.
+- **The export trie.** ld64 writes a second copy of every defined name into
+  `LC_DYLD_EXPORTS_TRIE`, and the first builds shipped here left it alone: `nm`
+  showed `_mrtisyvda7` while `dyld_info -exports` still printed
+  `__ZN5WBAES8enc_coreERK11WBAESTablesS2_PKhPh`, `_hsvm_entry`, `_hy_vm_plan`,
+  `_main` — the addresses in the trie then line up with the renamed sections, so
+  the rename bought nothing. The trie is now the minimal empty trie (2 B, region
+  zeroed); a main executable does not consult exports at load time (`LC_MAIN`
+  gives the entry point) and dyld loads both builds. `dyld_info -exports` on
+  `wbaes_f4_hard` and `wbaes_f4_strip` prints no entries.
 - **The known-answer vector.** The NIST plaintext/ciphertext pair is gone from
   `__const`, along with the `plaintext :` / `vector-match` printf strings. The
   self-check now derives a plaintext from a 32-bit build seed and compares an
@@ -94,8 +112,11 @@ of by name — puts it back on the same key in the same time:
 | of which: the algebra itself | 0.19 s | 0.20 s |
 
 Detectability score (`tools/m1_detect.py`, what `nm`/`otool`/`strings` give you):
-**100 → 0** against `wbaes_f4_max`, and 155 → 0 against the debug build that still
-carries the vector and the printf strings.
+**160 → 0** against `wbaes_f4_max`, and 215 → 0 against the debug build that still
+carries the vector and the printf strings. The scan now has a signal for the export
+trie (S8); without it the two previous builds scored **0** while their tries carried
+16 original names each — the score was measuring one of the artifact's two name
+tables.
 
 The honest reading: this build removes the name tag, the section hint and the free
 known-answer block. It does not change what the algebra costs, and the table is
